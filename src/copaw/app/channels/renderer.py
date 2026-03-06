@@ -254,6 +254,13 @@ class MessageRenderer:
             MessageType.MCP_TOOL_CALL_OUTPUT,
         ):
             if s.filter_tool_messages:
+                # 定义媒体类型常量（移到循环外以提高性能）
+                media_types = (
+                    ContentType.IMAGE,
+                    ContentType.AUDIO,
+                    ContentType.VIDEO,
+                    ContentType.FILE,
+                )
                 media_parts = []
                 for c in content:
                     if getattr(c, "type", None) != ContentType.DATA:
@@ -266,17 +273,11 @@ class MessageRenderer:
                         pass
                     if isinstance(output, list):
                         block_parts = _blocks_to_parts(output)
-                        media_types = (
-                            ContentType.IMAGE,
-                            ContentType.AUDIO,
-                            ContentType.VIDEO,
-                            ContentType.FILE,
-                        )
                         media_parts.extend([
                             p for p in block_parts
                             if getattr(p, "type", None) in media_types
                         ])
-                return media_parts if media_parts else []
+                return media_parts  # 简化返回语句
             parts = _parts_for_tool_output(content)
             if not parts:
                 parts = [TextContent(text=f"[{msg_type}]")]
