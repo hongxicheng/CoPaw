@@ -1049,11 +1049,12 @@ class FeishuChannel(BaseChannel):
             "xlsx",
             "ppt",
             "pptx",
-            "mp4",
         ):
             file_type = "doc" if ext == "docx" else ext
             file_type = "xls" if ext == "xlsx" else file_type
             file_type = "ppt" if ext == "pptx" else file_type
+        elif ext in ("mp4", "mov", "avi", "mkv", "wmv", "flv", "webm"):
+            file_type = ext
         mime = mimetypes.guess_type(str(path))[0] or "application/octet-stream"
         url = "https://open.feishu.cn/open-apis/im/v1/files"
         form = aiohttp.FormData()
