@@ -1049,12 +1049,11 @@ class FeishuChannel(BaseChannel):
             "xlsx",
             "ppt",
             "pptx",
+            "mp4",
         ):
             file_type = "doc" if ext == "docx" else ext
             file_type = "xls" if ext == "xlsx" else file_type
             file_type = "ppt" if ext == "pptx" else file_type
-        elif ext in ("mp4", "mov", "avi", "mkv", "wmv", "flv", "webm"):
-            file_type = ext
         mime = mimetypes.guess_type(str(path))[0] or "application/octet-stream"
         url = "https://open.feishu.cn/open-apis/im/v1/files"
         form = aiohttp.FormData()
@@ -1307,14 +1306,6 @@ class FeishuChannel(BaseChannel):
                     e,
                 )
                 return None
-            # Extract media_type from data URI and infer extension
-            media_type = "application/octet-stream"
-            if b64.startswith("data:") and ";" in b64:
-                media_type = b64[5:].split(";", 1)[0]
-            ext = mimetypes.guess_extension(media_type) or ""
-            # Use inferred extension if filename is generic
-            if filename == "file.bin" and ext:
-                filename = f"file{ext}"
             self._media_dir.mkdir(parents=True, exist_ok=True)
             path = self._media_dir / f"upload_{id(part)}_{filename}"
             path.write_bytes(data)
@@ -1343,11 +1334,10 @@ class FeishuChannel(BaseChannel):
         receive_id: str,
         part: OutgoingContentPart,
     ) -> bool:
-        """Upload file and send file/video/audio message."""
-        part_type = getattr(part, "type", None)
+        """Upload file and send file message (msg_type=file, file_key)."""
         logger.info(
             "feishu _send_file: part type=%s",
-            part_type,
+            getattr(part, "type", None),
         )
         path_or_url = await self._part_to_file_path_or_url(part)
         if not path_or_url:
@@ -1365,45 +1355,14 @@ class FeishuChannel(BaseChannel):
             "feishu _send_file: upload ok file_key=%s",
             file_key[:24] if file_key else "",
         )
-        # Determine msg_type and content based on part type
-        if part_type == ContentType.VIDEO:
-            # Use post type with media tag for video
-            msg_type = "post"
-            # Get filename for title
-            filename = getattr(part, "filename", None)
-            # If no filename in part, try to extract from path_or_url
-            if not filename and path_or_url:
-                filename = Path(path_or_url).name
-            filename = filename or "视频文件"
-            post_content = {
-                "zh_cn": {
-                    "title": filename,
-                    "content": [
-                        [
-                            {
-                                "tag": "media",
-                                "file_key": file_key,
-                            },
-                        ],
-                    ],
-                },
-            }
-            content = json.dumps(post_content, ensure_ascii=False)
-        else:
-            msg_type = "file"
-            content = json.dumps({"file_key": file_key}, ensure_ascii=False)
-        logger.info(
-            "feishu _send_file: sending msg_type=%s content=%s...",
-            msg_type,
-            content[:50],
-        )
+        content = json.dumps({"file_key": file_key}, ensure_ascii=False)
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
             None,
             lambda: self._send_message_sync(
                 receive_id_type,
                 receive_id,
-                msg_type,
+                "file",
                 content,
             ),
         )
