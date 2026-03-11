@@ -63,6 +63,7 @@ class WecomChannel(BaseChannel):
         secret: str,
         bot_prefix: str = "[BOT] ",
         media_dir: str = "~/.copaw/media",
+        welcome_text: str = "",
         on_reply_sent: OnReplySent = None,
         show_tool_details: bool = True,
         filter_tool_messages: bool = False,
@@ -88,6 +89,7 @@ class WecomChannel(BaseChannel):
         self.bot_id = bot_id
         self.secret = secret
         self.bot_prefix = bot_prefix
+        self.welcome_text = welcome_text
         self._media_dir = Path(media_dir).expanduser()
         self._max_reconnect_attempts = max_reconnect_attempts
 
@@ -148,6 +150,7 @@ class WecomChannel(BaseChannel):
                 getattr(config, "media_dir", "~/.copaw/media")
                 or "~/.copaw/media"
             ),
+            welcome_text=getattr(config, "welcome_text", "") or "",
             on_reply_sent=on_reply_sent,
             show_tool_details=show_tool_details,
             filter_tool_messages=filter_tool_messages,
@@ -455,9 +458,15 @@ class WecomChannel(BaseChannel):
         except Exception:
             logger.exception("wecom _on_message failed")
 
-    def _on_enter_chat_sync(self, frame: Any) -> None:
-        """Handle enter_chat event (user enters the bot conversation)."""
+    async def _on_enter_chat_sync(self, frame: Any) -> None:
+        """Handle enter_chat event; send welcome reply if configured."""
         logger.info("wecom enter_chat event")
+        if not self.welcome_text or not self._client:
+            return
+        await self._client.reply_welcome(
+            frame,
+            {"msgtype": "text", "text": {"content": self.welcome_text}},
+        )
 
     # ------------------------------------------------------------------
     # File download helper

@@ -97,6 +97,7 @@ class WecomConfig(BaseChannelConfig):
     bot_id: str = ""
     secret: str = ""
     media_dir: str = "~/.copaw/media"
+    welcome_text: str = ""
     max_reconnect_attempts: int = -1
 
 

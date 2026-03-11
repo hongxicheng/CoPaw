@@ -382,6 +382,9 @@ export function ChannelDrawer({
             >
               <Input.Password placeholder="Secret from WeCom backend" />
             </Form.Item>
+            <Form.Item name="welcome_text" label="Welcome Message">
+              <Input placeholder="e.g. Hello! How can I help you?" />
+            </Form.Item>
             <Form.Item name="media_dir" label="Media Dir">
               <Input placeholder="~/.copaw/media" />
             </Form.Item>
