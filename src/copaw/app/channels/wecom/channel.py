@@ -16,12 +16,14 @@ import json
 import logging
 import mimetypes
 import os
+import sys
 import threading
 from collections import OrderedDict
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from agentscope_runtime.engine.schemas.agent_schemas import (
+    AgentRequest,
     FileContent,
     ImageContent,
     TextContent,
@@ -35,9 +37,8 @@ from ..base import (
     ProcessHandler,
 )
 from ..utils import file_url_to_local_path
-
-if TYPE_CHECKING:
-    from agentscope_runtime.engine.schemas.agent_schemas import AgentRequest
+from .aibot import WSClient, WSClientOptions, generate_req_id
+from .utils import format_markdown_tables
 
 logger = logging.getLogger(__name__)
 
@@ -178,10 +179,24 @@ class WecomChannel(BaseChannel):
         chatid = (meta.get("wecom_chatid") or "").strip()
         chat_type = (meta.get("wecom_chat_type") or "single").strip()
         if chat_type == "group" and chatid:
-            return f"wecom:group:{chatid[-12:]}"
+            return f"wecom:group:{chatid}"
         if sender_id:
             return f"wecom:{sender_id}"
         return f"wecom:{chatid or 'unknown'}"
+
+    @staticmethod
+    def _parse_chatid_from_handle(to_handle: str) -> str:
+        """Extract chatid/userid from a to_handle string.
+
+        - ``wecom:group:<chatid>`` → ``<chatid>``
+        - ``wecom:<userid>``       → ``<userid>``
+        """
+        h = (to_handle or "").strip()
+        if h.startswith("wecom:group:"):
+            return h[len("wecom:group:"):]
+        if h.startswith("wecom:"):
+            return h[len("wecom:"):]
+        return h
 
     def to_handle_from_target(self, *, user_id: str, session_id: str) -> str:
         """Return send handle; session_id takes priority."""
@@ -207,10 +222,6 @@ class WecomChannel(BaseChannel):
         native_payload: Any,
     ) -> "AgentRequest":
         """Build AgentRequest from a wecom native dict."""
-        from agentscope_runtime.engine.schemas.agent_schemas import (
-            AgentRequest,
-        )
-
         payload = native_payload if isinstance(native_payload, dict) else {}
         channel_id = payload.get("channel_id") or self.channel
         sender_id = payload.get("sender_id") or ""
@@ -309,7 +320,7 @@ class WecomChannel(BaseChannel):
 
             elif msgtype == "image":
                 img_info = body.get("image") or {}
-                url = img_info.get("cdn_url") or img_info.get("url") or ""
+                url = img_info.get("url") or ""
                 aes_key = img_info.get("aeskey") or ""
                 if url:
                     path = await self._download_media(
@@ -331,29 +342,16 @@ class WecomChannel(BaseChannel):
 
             elif msgtype == "voice":
                 voice_info = body.get("voice") or {}
-                url = voice_info.get("cdn_url") or voice_info.get("url") or ""
-                aes_key = voice_info.get("aeskey") or ""
-                if url:
-                    path = await self._download_media(
-                        url,
-                        aes_key=aes_key,
-                        filename_hint="voice.amr",
-                    )
-                    if path:
-                        content_parts.append(
-                            FileContent(
-                                type=ContentType.FILE,
-                                file_url=path,
-                            )
-                        )
-                    else:
-                        text_parts.append("[voice: download failed]")
+                # Use ASR text from WeCom; no need to download audio
+                asr_text = voice_info.get("content", "").strip()
+                if asr_text:
+                    text_parts.append(asr_text)
                 else:
-                    text_parts.append("[voice: no url]")
+                    text_parts.append("[voice: no text]")
 
             elif msgtype == "file":
                 file_info = body.get("file") or {}
-                url = file_info.get("cdn_url") or file_info.get("url") or ""
+                url = file_info.get("url") or ""
                 aes_key = file_info.get("aeskey") or ""
                 filename = file_info.get("filename") or "file.bin"
                 if url:
@@ -385,9 +383,7 @@ class WecomChannel(BaseChannel):
                             text_parts.append(t)
                     elif itype == "image":
                         img = item.get("image") or {}
-                        url = (
-                            img.get("cdn_url") or img.get("url") or ""
-                        )
+                        url = img.get("url") or ""
                         aes_key = img.get("aeskey") or ""
                         if url:
                             path = await self._download_media(
@@ -437,7 +433,23 @@ class WecomChannel(BaseChannel):
                 )
                 return
 
+            # Send "processing" indicator only if message has text content
+            processing_stream_id = ""
+            if text_parts and self._client:
+                processing_stream_id = generate_req_id("stream")
+                try:
+                    await self._client.reply_stream(
+                        frame,
+                        stream_id=processing_stream_id,
+                        content="🤔 思考中...",
+                        finish=False,
+                    )
+                except Exception:
+                    logger.debug("wecom failed to send processing indicator")
+
             session_id = self.resolve_session_id(sender_id, meta)
+            if processing_stream_id:
+                meta["wecom_processing_stream_id"] = processing_stream_id
             native = {
                 "channel_id": self.channel,
                 "sender_id": sender_id,
@@ -484,7 +496,6 @@ class WecomChannel(BaseChannel):
         try:
             data, filename = await self._client.download_file(url, aes_key or None)
             fn = filename or filename_hint
-            fn = Path(fn).name or filename_hint
             # Determine extension from hint if file has none
             hint_ext = Path(filename_hint).suffix
             if hint_ext and Path(fn).suffix in ("", ".bin", ".file"):
@@ -504,17 +515,24 @@ class WecomChannel(BaseChannel):
     # Send helpers
     # ------------------------------------------------------------------
 
-    async def _send_text_via_frame(self, frame: Any, text: str) -> None:
-        """Send a text reply using the SDK reply method (stream finish)."""
+    async def _send_text_via_frame(
+        self, frame: Any, text: str, stream_id: str = ""
+    ) -> None:
+        """Send a text reply using the SDK reply method (stream finish).
+
+        Args:
+            frame: WebSocket frame from the incoming message.
+            text: Content to send.
+            stream_id: Optional stream ID to overwrite existing message.
+                       If empty, a new UUID is generated.
+        """
         if not self._client or not text:
             return
         try:
-            import uuid
-
-            stream_id = str(uuid.uuid4())
+            sid = stream_id or generate_req_id("stream")
             await self._client.reply_stream(
                 frame,
-                stream_id=stream_id,
+                stream_id=sid,
                 content=text,
                 finish=True,
             )
@@ -555,7 +573,11 @@ class WecomChannel(BaseChannel):
             return
         m = meta or {}
         frame = m.get("wecom_frame")
-        chatid = m.get("wecom_chatid") or ""
+        chatid = (
+            m.get("wecom_chatid")
+            or self._parse_chatid_from_handle(to_handle)
+            or ""
+        )
 
         prefix = m.get("bot_prefix", "") or self.bot_prefix or ""
         text_parts: List[str] = []
@@ -587,8 +609,15 @@ class WecomChannel(BaseChannel):
         if prefix and body:
             body = prefix + body
 
+        # Format markdown tables for WeCom compatibility
+        body = format_markdown_tables(body)
+
+        # Use processing stream_id to overwrite "thinking..." indicator
+        # Only first reply uses it; subsequent replies get new stream_id
+        processing_sid = m.pop("wecom_processing_stream_id", "")
+
         if body and frame:
-            await self._send_text_via_frame(frame, body)
+            await self._send_text_via_frame(frame, body, processing_sid)
         elif body and chatid:
             # Proactive send without an inbound frame
             try:
@@ -641,7 +670,11 @@ class WecomChannel(BaseChannel):
         if not self.enabled:
             return
         m = meta or {}
-        chatid = m.get("wecom_chatid") or ""
+        chatid = (
+            m.get("wecom_chatid")
+            or self._parse_chatid_from_handle(to_handle)
+            or ""
+        )
         frame = m.get("wecom_frame")
         prefix = m.get("bot_prefix", "") or self.bot_prefix or ""
         body = (prefix + text) if text else prefix
@@ -675,8 +708,6 @@ class WecomChannel(BaseChannel):
     def _run_ws_forever(self) -> None:
         """Background thread: run SDK event loop forever."""
         # macOS/Python 3.12+ fix: use SelectorEventLoop explicitly
-        import sys
-
         if sys.platform == "darwin":
             ws_loop = asyncio.SelectorEventLoop()
         else:
@@ -711,14 +742,6 @@ class WecomChannel(BaseChannel):
         if not self.enabled:
             logger.debug("wecom channel disabled")
             return
-
-        try:
-            from .aibot import WSClient, WSClientOptions
-        except ImportError:
-            raise RuntimeError(
-                "WeCom channel enabled but aibot SDK is not available. "
-                "Ensure the aibot package is present under the wecom dir."
-            )
 
         if not self.bot_id or not self.secret:
             raise RuntimeError(
