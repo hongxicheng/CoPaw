@@ -693,7 +693,7 @@ Matrix 频道通过 [matrix-nio](https://github.com/poljar/matrix-nio) 库将 Co
 | iMessage   | imessage   | db_path, poll_sec（仅 macOS）                                       |
 | Discord    | discord    | bot_token；可选 http_proxy, http_proxy_auth                         |
 | QQ         | qq         | app_id, client_secret                                               |
-| 企业微信     | wecom      | bot_id, secret；可选 media_dir, max_reconnect_attempts              |
+| 企业微信   | wecom      | bot_id, secret；可选 media_dir, max_reconnect_attempts              |
 | Telegram   | telegram   | bot_token；可选 http_proxy, http_proxy_auth                         |
 | Mattermost | mattermost | url, bot_token; 可选 show_typing, dm_policy, allow_from             |
 | Matrix     | matrix     | homeserver, user_id, access_token                                   |
@@ -712,7 +712,7 @@ Matrix 频道通过 [matrix-nio](https://github.com/poljar/matrix-nio) 库将 Co
 | Discord    | ✓        | ✓        | ✓        | ✓        | ✓        | ✓        | 🚧       | 🚧       | 🚧       | 🚧       |
 | iMessage   | ✓        | ✗        | ✗        | ✗        | ✗        | ✓        | ✗        | ✗        | ✗        | ✗        |
 | QQ         | ✓        | 🚧       | 🚧       | 🚧       | 🚧       | ✓        | 🚧       | 🚧       | 🚧       | 🚧       |
-| 企业微信     | ✓        | ✓        | 🚧       | ✓        | ✓        | ✓        | 🚧       | 🚧       | 🚧       | 🚧       |
+| 企业微信   | ✓        | ✓        | 🚧       | ✓        | ✓        | ✓        | 🚧       | 🚧       | 🚧       | 🚧       |
 | Telegram   | ✓        | ✓        | ✓        | ✓        | ✓        | ✓        | ✓        | ✓        | ✓        | ✓        |
 | Mattermost | ✓        | ✓        | 🚧       | 🚧       | ✓        | ✓        | ✓        | 🚧       | 🚧       | ✓        |
 | Matrix     | ✓        | ✓        | ✓        | ✓        | ✓        | ✓        | ✓        | ✓        | ✓        | ✓        |

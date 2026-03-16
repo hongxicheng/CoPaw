@@ -110,8 +110,8 @@ class WecomConfig(BaseChannelConfig):
     media_dir: str = "~/.copaw/media"
     welcome_text: str = ""
     max_reconnect_attempts: int = -1
-      
-      
+
+
 class MatrixConfig(BaseChannelConfig):
     """Matrix channel configuration."""
 
