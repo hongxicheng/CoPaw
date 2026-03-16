@@ -70,10 +70,28 @@ MAX_QUICK_DISCONNECT_COUNT = 3
 DEFAULT_API_BASE = "https://api.sgroup.qq.com"
 TOKEN_URL = "https://bots.qq.com/app/getAppAccessToken"
 _URL_PATTERN = re.compile(r"https?://[^\s]+", re.IGNORECASE)
-_IMAGE_TAG_PATTERN = re.compile(r"\[Image: (https?://[^\]]+)\]", re.IGNORECASE)
+_IMAGE_TAG_PATTERN = re.compile(r"\[Image: ([^\]]+)\]", re.IGNORECASE)
+_VIDEO_TAG_PATTERN = re.compile(r"\[Video: ([^\]]+)\]", re.IGNORECASE)
+_AUDIO_TAG_PATTERN = re.compile(r"\[Audio: ([^\]]+)\]", re.IGNORECASE)
+_FILE_TAG_PATTERN = re.compile(r"\[File: ([^\]]+)\]", re.IGNORECASE)
 
 # Rich media paths
 _DEFAULT_MEDIA_DIR = Path("~/.copaw/media/qq").expanduser()
+
+# QQ media_type: 1 image, 2 video, 3 audio(silk only), 4 file
+# mp3/wav/flac are sent as file (type=4) since QQ voice requires silk format
+_EXT_TO_QQ_MEDIA_TYPE: Dict[str, int] = {
+    ".jpg": 1,
+    ".jpeg": 1,
+    ".png": 1,
+    ".gif": 1,
+    ".webp": 1,
+    ".mp4": 2,
+    ".silk": 3,
+    ".wav": 4,
+    ".mp3": 4,
+    ".flac": 4,
+}
 
 
 class QQApiError(RuntimeError):
@@ -304,6 +322,15 @@ async def _send_group_message_async(
     )
 
 
+def _get_qq_media_type(path_or_url: str) -> int:
+    """Infer QQ media_type (1/2/3/4) from file extension.
+
+    Returns 4 (file) as fallback for unknown extensions.
+    """
+    ext = Path(path_or_url.split("?")[0]).suffix.lower()
+    return _EXT_TO_QQ_MEDIA_TYPE.get(ext, 4)
+
+
 async def _upload_media_async(
     session: Any,
     access_token: str,
@@ -319,12 +346,14 @@ async def _upload_media_async(
         access_token: QQ access token
         openid: user openid or group openid
         media_type: 1 image, 2 video, 3 audio, 4 file
-        url: media url
+        url: media url or local file path
         message_type: "c2c" or "group"
 
     Returns:
         file_info if success, None otherwise
     """
+    import base64
+
     try:
         if message_type == "c2c":
             path = f"/v2/users/{openid}/files"
@@ -336,11 +365,29 @@ async def _upload_media_async(
             )
             return None
 
-        body = {
-            "file_type": media_type,
-            "url": url,
-            "srv_send_msg": False,
-        }
+        is_local = not url.startswith("http://") and not url.startswith(
+            "https://",
+        )
+        if is_local:
+            if url.startswith("file://"):
+                from urllib.request import url2pathname
+                from urllib.parse import urlparse
+
+                local_path = Path(url2pathname(urlparse(url).path))
+            else:
+                local_path = Path(url).expanduser().resolve()
+            file_data = base64.b64encode(local_path.read_bytes()).decode()
+            body: Dict[str, Any] = {
+                "file_type": media_type,
+                "file_data": file_data,
+                "srv_send_msg": False,
+            }
+        else:
+            body = {
+                "file_type": media_type,
+                "url": url,
+                "srv_send_msg": False,
+            }
         response = await _api_request_async(
             session,
             access_token,
@@ -675,10 +722,29 @@ class QQChannel(BaseChannel):
                     use_markdown=markdown,
                 )
 
-        # Extract and process [Image: ] tags
+        # Extract and process media tags
         image_urls = _IMAGE_TAG_PATTERN.findall(text)
-        # Remove [Image: ] tags from text
-        clean_text = _IMAGE_TAG_PATTERN.sub("", text).strip()
+        video_urls = _VIDEO_TAG_PATTERN.findall(text)
+        audio_urls = _AUDIO_TAG_PATTERN.findall(text)
+        file_urls = _FILE_TAG_PATTERN.findall(text)
+
+        # Remove all media tags from text
+        clean_text = _IMAGE_TAG_PATTERN.sub("", text)
+        clean_text = _VIDEO_TAG_PATTERN.sub("", clean_text)
+        clean_text = _AUDIO_TAG_PATTERN.sub("", clean_text)
+        clean_text = _FILE_TAG_PATTERN.sub("", clean_text)
+        clean_text = clean_text.strip()
+
+        # Build ordered media list: (url, media_type)
+        media_items: List[tuple] = []
+        for u in image_urls:
+            media_items.append((u, 1))
+        for u in video_urls:
+            media_items.append((u, 2))
+        for u in audio_urls:
+            media_items.append((u, _get_qq_media_type(u)))
+        for u in file_urls:
+            media_items.append((u, _get_qq_media_type(u)))
 
         # Send text content if not empty
         text_sent = False
@@ -711,46 +777,50 @@ class QQChannel(BaseChannel):
                     except Exception:
                         logger.exception("send text fallback failed")
 
-        # Send images if any
-        if image_urls and message_type in ("c2c", "group"):
-            # Determine target openid
+        # Send media if any (only c2c and group support rich media)
+        if media_items and message_type in ("c2c", "group"):
             target_openid = (
                 sender_id if message_type == "c2c" else group_openid
             )
             if target_openid:
-                for image_url in image_urls:
+                for media_url, media_type_int in media_items:
                     try:
-                        # Upload image to QQ rich media
                         file_info = await _upload_media_async(
                             self._http,
                             token,
                             target_openid,
-                            media_type=1,  # 1 for image
-                            url=image_url,
+                            media_type=media_type_int,
+                            url=media_url,
                             message_type=message_type,
                         )
                         if file_info:
-                            # Send media message
                             await _send_media_message_async(
                                 self._http,
                                 token,
                                 target_openid,
                                 file_info,
-                                msg_id if not text_sent
-                                # Only reply with msg_id for first message
-                                else None,
+                                msg_id if not text_sent else None,
                                 message_type=message_type,
                             )
+                            text_sent = (
+                                True  # subsequent media also skip msg_id
+                            )
                             logger.info(
-                                f"Successfully sent image: {image_url}",
+                                "qq send: media sent type=%s url=%s",
+                                media_type_int,
+                                media_url,
                             )
                         else:
                             logger.warning(
-                                f"Failed to upload image,"
-                                f" skipping: {image_url}",
+                                "qq send: failed to upload media,"
+                                " skipping: %s",
+                                media_url,
                             )
                     except Exception:
-                        logger.exception(f"Failed to send image: {image_url}")
+                        logger.exception(
+                            "qq send: failed to send media: %s",
+                            media_url,
+                        )
 
     def _resolve_attachment_type(self, att_type: str, file_name: str) -> str:
         # pylint: disable=too-many-return-statements
