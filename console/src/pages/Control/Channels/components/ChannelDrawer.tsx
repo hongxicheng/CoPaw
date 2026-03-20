@@ -397,8 +397,12 @@ export function ChannelDrawer({
               tooltip={t("channels.feishuRegionTooltip")}
             >
               <Select>
-                <Select.Option value="feishu">{t("channels.feishuChina")}</Select.Option>
-                <Select.Option value="lark">{t("channels.feishuInternational")}</Select.Option>
+                <Select.Option value="feishu">
+                  {t("channels.feishuChina")}
+                </Select.Option>
+                <Select.Option value="lark">
+                  {t("channels.feishuInternational")}
+                </Select.Option>
               </Select>
             </Form.Item>
             <Form.Item
