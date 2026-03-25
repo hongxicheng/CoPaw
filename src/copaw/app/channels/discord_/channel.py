@@ -42,6 +42,7 @@ class DiscordChannel(BaseChannel):
     channel = "discord"
     uses_manager_queue = True
     _DISCORD_MAX_LEN: int = 2000
+    _MAX_CACHED_MESSAGE_IDS: int = 500
 
     def __init__(
         self,
@@ -80,9 +81,8 @@ class DiscordChannel(BaseChannel):
         self.bot_prefix = bot_prefix
         self._task: Optional[asyncio.Task] = None
         self._client = None
-        self._processed_message_ids: set = set()
-        self._processed_message_id_queue: deque = deque()
-        self._max_cached_message_ids: int = 500
+        self._processed_message_ids: set[str] = set()
+        self._processed_message_id_queue: deque[str] = deque()
 
         if self.enabled:
             import discord  # type: ignore
@@ -117,7 +117,7 @@ class DiscordChannel(BaseChannel):
                     return
                 if (
                     len(self._processed_message_ids)
-                    >= self._max_cached_message_ids
+                    >= self._MAX_CACHED_MESSAGE_IDS
                 ):
                     oldest = self._processed_message_id_queue.popleft()
                     self._processed_message_ids.discard(oldest)
