@@ -19,6 +19,7 @@ import logging
 import re
 import sys
 import threading
+import time
 import types
 from collections import OrderedDict
 from pathlib import Path
@@ -542,6 +543,21 @@ class FeishuChannel(BaseChannel):
                 self.app_id,
             )
             return
+
+        # Drop stale messages from Feishu retry mechanism.
+        # Feishu retries failed deliveries at 5s, 5min, 1h, 6h intervals.
+        # Messages older than 20 seconds are likely stale retries.
+        create_time = getattr(header, "create_time", None)
+        if create_time:
+            now_ms = int(time.time() * 1000)
+            age_ms = now_ms - create_time
+            if age_ms > 20000:  # 20 seconds
+                logger.debug(
+                    "feishu: drop stale message age=%.1fs (retry)",
+                    age_ms / 1000,
+                )
+                return
+
         if not self._loop:
             logger.warning("feishu: main loop not set, drop message")
             return
@@ -1801,10 +1817,11 @@ class FeishuChannel(BaseChannel):
                     pass
 
                 async def _patched_select() -> None:
-                    nonlocal lock_released
+                    nonlocal lock_released, connection_started
                     if not lock_released:
                         _WS_START_LOCK.release()
                         lock_released = True
+                        connection_started = True
                     if _orig_select is not None:
                         await _orig_select()
 
@@ -1814,15 +1831,13 @@ class FeishuChannel(BaseChannel):
                         logger.info(
                             "feishu WebSocket connecting (long connection)...",
                         )
-                        connection_started = True
                         self._ws_client.start()
                         # If start() returns normally, connection was closed
                         # by server; reset retry delay and reconnect
                         if not self._stop_event.is_set() and not self._closed:
                             logger.info(
                                 "feishu WebSocket disconnected, "
-                                "reconnecting in %.1fs...",
-                                retry_delay,
+                                "reconnecting immediately...",
                             )
                 except RuntimeError as e:
                     # Normal shutdown: loop.stop() causes run_until_complete
