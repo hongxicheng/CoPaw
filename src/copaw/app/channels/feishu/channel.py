@@ -49,6 +49,10 @@ from .constants import (
     FEISHU_FILE_MAX_BYTES,
     FEISHU_NICKNAME_CACHE_MAX,
     FEISHU_PROCESSED_IDS_MAX,
+    FEISHU_STALE_MSG_THRESHOLD_MS,
+    FEISHU_WS_BACKOFF_FACTOR,
+    FEISHU_WS_INITIAL_RETRY_DELAY,
+    FEISHU_WS_MAX_RETRY_DELAY,
 )
 from .utils import (
     build_interactive_content_chunks,
@@ -551,7 +555,7 @@ class FeishuChannel(BaseChannel):
         if create_time:
             now_ms = int(time.time() * 1000)
             age_ms = now_ms - create_time
-            if age_ms > 20000:  # 20 seconds
+            if age_ms > FEISHU_STALE_MSG_THRESHOLD_MS:
                 logger.debug(
                     "feishu: drop stale message age=%.1fs (retry)",
                     age_ms / 1000,
@@ -1787,11 +1791,7 @@ class FeishuChannel(BaseChannel):
         - _closed is True (channel closed)
         """
         # Reconnection settings
-        INITIAL_RETRY_DELAY = 1.0  # seconds
-        MAX_RETRY_DELAY = 60.0  # seconds
-        BACKOFF_FACTOR = 2
-
-        retry_delay = INITIAL_RETRY_DELAY
+        retry_delay = FEISHU_WS_INITIAL_RETRY_DELAY
 
         while not self._stop_event.is_set() and not self._closed:
             self._ws_loop = asyncio.new_event_loop()
@@ -1822,8 +1822,24 @@ class FeishuChannel(BaseChannel):
                         _WS_START_LOCK.release()
                         lock_released = True
                         connection_started = True
-                    if _orig_select is not None:
-                        await _orig_select()
+                    # Monitor connection health: if SDK's internal reconnect
+                    # gives up (conn is None and no active reconnect task),
+                    # stop the loop so the outer while triggers a fresh start.
+                    while not self._stop_event.is_set() and not self._closed:
+                        await asyncio.sleep(30)
+                        if self._stop_event.is_set() or self._closed:
+                            break
+                        ws = self._ws_client
+                        if (
+                            ws is not None
+                            and getattr(ws, "_conn", True) is None
+                        ):
+                            logger.warning(
+                                "feishu WebSocket conn lost, "
+                                "forcing reconnect...",
+                            )
+                            self._ws_loop.stop()
+                            break
 
                 _ws_mod._select = _patched_select
                 try:
@@ -1940,7 +1956,7 @@ class FeishuChannel(BaseChannel):
             if not self._stop_event.is_set() and not self._closed:
                 if connection_started:
                     # Connection was established, reset retry delay
-                    retry_delay = INITIAL_RETRY_DELAY
+                    retry_delay = FEISHU_WS_INITIAL_RETRY_DELAY
                 else:
                     # Connection failed to establish, use exponential backoff
                     logger.info(
@@ -1951,8 +1967,8 @@ class FeishuChannel(BaseChannel):
                     self._stop_event.wait(timeout=retry_delay)
                     # Increase delay for next attempt
                     retry_delay = min(
-                        retry_delay * BACKOFF_FACTOR,
-                        MAX_RETRY_DELAY,
+                        retry_delay * FEISHU_WS_BACKOFF_FACTOR,
+                        FEISHU_WS_MAX_RETRY_DELAY,
                     )
 
         # Final cleanup signal
