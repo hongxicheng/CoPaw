@@ -640,7 +640,7 @@ class WecomChannel(BaseChannel):
 
         # Split into chunks
         chunks: List[bytes] = [
-            data[i:i + _UPLOAD_CHUNK_SIZE]
+            data[i : i + _UPLOAD_CHUNK_SIZE]
             for i in range(0, total_size, _UPLOAD_CHUNK_SIZE)
         ]
         total_chunks = len(chunks)
