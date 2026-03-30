@@ -293,14 +293,47 @@ class DingTalkChannel(BaseChannel):
             content_parts=content_parts,
             channel_meta=meta,
         )
-        if hasattr(request, "channel_meta"):
-            request.channel_meta = meta
+        # Set serializable channel_meta (exclude non-JSON-serializable objects)
+        serializable_meta = {
+            k: v
+            for k, v in meta.items()
+            if k not in ("incoming_message", "reply_future", "reply_loop")
+        }
+        setattr(request, "channel_meta", serializable_meta)
         return request
 
     def to_handle_from_target(self, *, user_id: str, session_id: str) -> str:
         # Key by session_id (short suffix of conversation_id) so cron can
         # use the same session_id to look up stored sessionWebhook.
         return f"dingtalk:sw:{session_id}"
+
+    async def _before_consume_process(self, request: Any) -> None:
+        """Save session_webhook from meta for cron/proactive send."""
+        meta = getattr(request, "channel_meta", None) or {}
+        session_webhook = self._get_session_webhook(meta)
+        if not session_webhook:
+            return
+        session_id = getattr(request, "session_id", None)
+        if not session_id:
+            return
+        webhook_key = self.to_handle_from_target(
+            user_id=getattr(request, "user_id", None) or "",
+            session_id=session_id,
+        )
+        logger.info(
+            "dingtalk _before_consume_process: storing webhook "
+            "session_id=%s conversation_id=%s",
+            session_id,
+            meta.get("conversation_id"),
+        )
+        await self._save_session_webhook(
+            webhook_key,
+            session_webhook,
+            expired_time=meta.get("session_webhook_expired_time"),
+            conversation_id=meta.get("conversation_id"),
+            conversation_type=meta.get("conversation_type"),
+            sender_staff_id=meta.get("sender_staff_id"),
+        )
 
     def _route_from_handle(self, to_handle: str) -> dict:
         # to_handle:
@@ -807,13 +840,11 @@ class DingTalkChannel(BaseChannel):
 
         if is_group:
             url = "https://api.dingtalk.com/v1.0/robot/groupMessages/send"
-            payload = {
+            payload: Dict[str, Any] = {
                 "robotCode": self.robot_code,
-                "groupOpenId": conversation_id,
-                "msg": {
-                    "msgType": "text",
-                    "text": {"content": text},
-                },
+                "openConversationId": conversation_id,
+                "msgKey": "sampleText",
+                "msgParam": json.dumps({"content": text}),
             }
         else:
             if not sender_staff_id:
@@ -826,10 +857,8 @@ class DingTalkChannel(BaseChannel):
             payload = {
                 "robotCode": self.robot_code,
                 "userIds": [sender_staff_id],
-                "msg": {
-                    "msgType": "text",
-                    "text": {"content": text},
-                },
+                "msgKey": "sampleText",
+                "msgParam": json.dumps({"content": text}),
             }
 
         headers = {
