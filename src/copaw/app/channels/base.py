@@ -501,6 +501,12 @@ class BaseChannel(ABC):
                     to_handle,
                     f"Error: {err_msg}",
                 )
+            else:
+                await self._on_process_completed(
+                    request,
+                    to_handle,
+                    send_meta,
+                )
 
             if self._on_reply_sent:
                 args = self.get_on_reply_sent_args(request, to_handle)
@@ -833,6 +839,12 @@ class BaseChannel(ABC):
                     to_handle,
                     f"Error: {err_msg}",
                 )
+            else:
+                await self._on_process_completed(
+                    request,
+                    to_handle,
+                    send_meta,
+                )
             if self._on_reply_sent:
                 args = self.get_on_reply_sent_args(request, to_handle)
                 self._on_reply_sent(self.channel, *args)
@@ -890,6 +902,17 @@ class BaseChannel(ABC):
         event: Any,
     ) -> None:
         """Hook: response event received. Default: no-op."""
+
+    async def _on_process_completed(
+        self,
+        request: "AgentRequest",
+        to_handle: str,
+        send_meta: Dict[str, Any],
+    ) -> None:
+        """Hook called after all events processed without error.
+
+        Override for post-processing (e.g. Feishu DONE reaction).
+        """
 
     async def _on_consume_error(
         self,

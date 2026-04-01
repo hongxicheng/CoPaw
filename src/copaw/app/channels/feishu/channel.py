@@ -31,7 +31,6 @@ from agentscope_runtime.engine.schemas.agent_schemas import (
     AudioContent,
     FileContent,
     ImageContent,
-    RunStatus,
     TextContent,
 )
 
@@ -242,6 +241,8 @@ class FeishuChannel(BaseChannel):
         # open_id -> nickname (from Contact API) for sender display
         self._nickname_cache: Dict[str, str] = {}
         self._nickname_cache_lock = asyncio.Lock()
+        # Track last sent message_id for DONE reaction
+        self._last_sent_message_id: Optional[str] = None
 
     @classmethod
     def from_env(
@@ -1689,55 +1690,22 @@ class FeishuChannel(BaseChannel):
                 )
                 if msg_id:
                     last_message_id = msg_id
+        self._last_sent_message_id = last_message_id
         return last_message_id
 
-    async def _run_process_loop(
+    async def _on_process_completed(
         self,
         request: Any,
         to_handle: str,
         send_meta: Dict[str, Any],
     ) -> None:
-        """Override to track the last sent message_id across all events
-        and add a DONE reaction after the full reply is complete.
-        """
-        last_message_id: Optional[str] = None
-        last_response = None
-        try:
-            async for event in self._process(request):
-                obj = getattr(event, "object", None)
-                status = getattr(event, "status", None)
-                if obj == "message" and status == RunStatus.Completed:
-                    parts = self._message_to_content_parts(event)
-                    if parts:
-                        msg_id = await self.send_content_parts(
-                            to_handle,
-                            parts,
-                            send_meta,
-                        )
-                        if msg_id:
-                            last_message_id = msg_id
-                elif obj == "response":
-                    last_response = event
-                    await self.on_event_response(request, event)
-            err_msg = self._get_response_error_message(last_response)
-            if err_msg:
-                await self._on_consume_error(
-                    request,
-                    to_handle,
-                    f"Error: {err_msg}",
-                )
-            elif last_message_id:
-                await self._add_reaction(last_message_id, "DONE")
-            if self._on_reply_sent:
-                args = self.get_on_reply_sent_args(request, to_handle)
-                self._on_reply_sent(self.channel, *args)
-        except Exception:
-            logger.exception("channel consume_one failed")
-            await self._on_consume_error(
-                request,
-                to_handle,
-                "An error occurred while processing your request.",
+        """Add DONE reaction to the last sent message."""
+        if self._last_sent_message_id:
+            await self._add_reaction(
+                self._last_sent_message_id,
+                "DONE",
             )
+            self._last_sent_message_id = None
 
     async def send(
         self,
