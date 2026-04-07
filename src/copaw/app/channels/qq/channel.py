@@ -531,8 +531,13 @@ async def _send_guild_image_file_async(
     Used when the image is a local file rather than a URL.
     """
     api_url = f"{_get_api_base()}{path}"
-    with open(file_path, "rb") as fh:
-        file_bytes = fh.read()
+    loop = asyncio.get_running_loop()
+
+    def _read_file():
+        with open(file_path, "rb") as fh:
+            return fh.read()
+
+    file_bytes = await loop.run_in_executor(None, _read_file)
     data = aiohttp.FormData()
     if msg_id:
         data.add_field("msg_id", msg_id)
@@ -551,10 +556,19 @@ async def _send_guild_image_file_async(
             raise QQApiError(path=path, status=resp.status, data=resp_data)
 
 
-def _read_file_as_base64(file_path: str) -> str:
-    """Read a local file and return its base64-encoded content."""
-    with open(file_path, "rb") as fh:
-        return base64.b64encode(fh.read()).decode("ascii")
+async def _read_file_as_base64(file_path: str) -> str:
+    """Read a local file and return its base64-encoded content.
+
+    File I/O is offloaded to a thread pool to avoid blocking the
+    event loop.
+    """
+    loop = asyncio.get_running_loop()
+
+    def _read():
+        with open(file_path, "rb") as fh:
+            return base64.b64encode(fh.read()).decode("ascii")
+
+    return await loop.run_in_executor(None, _read)
 
 
 # QQ rich-media file_type constants
@@ -1812,7 +1826,7 @@ class QQChannel(BaseChannel):
         source_path = url or local_path or ""
         if local_path and not url:
             try:
-                file_data = _read_file_as_base64(local_path)
+                file_data = await _read_file_as_base64(local_path)
                 display_filename = Path(local_path).name
             except Exception:
                 logger.exception(
@@ -1876,10 +1890,9 @@ class QQChannel(BaseChannel):
     ) -> None:
         """Send media for guild (text channel) or dm scenarios.
 
-        Only images and videos are supported by the guild/dm API.
-        Images use the ``image`` field (URL) or ``file_image`` (form-data).
-        Audio and file types are not supported and will be skipped with
-        a warning.
+        Per QQ official docs, guild/dm supports sending images and
+        videos via the ``image`` field (URL) or ``file_image``
+        (form-data upload).  Audio and file types are not supported.
         """
         if content_type not in (ContentType.IMAGE, ContentType.VIDEO):
             logger.warning(
