@@ -971,6 +971,253 @@ class DingTalkChannel(BaseChannel):
             bot_prefix="",
         )
 
+    def _resolve_open_api_params_from_handle(
+        self,
+        to_handle: str,
+        meta: Optional[Dict[str, Any]],
+    ) -> Dict[str, str]:
+        """Resolve Open API params from to_handle and meta (sync, no I/O).
+
+        Checks meta first, then in-memory webhook store for
+        conversation_id / conversation_type / sender_staff_id.
+        """
+        m = meta or {}
+        webhook_entry: Optional[Dict[str, Any]] = None
+        route = self._route_from_handle(to_handle)
+        webhook_key = route.get("webhook_key")
+        if webhook_key:
+            raw = self._session_webhook_store.get(webhook_key)
+            if raw is not None:
+                webhook_entry = (
+                    raw if isinstance(raw, dict) else {"webhook": raw}
+                )
+        return self._resolve_open_api_params(m, webhook_entry)
+
+    async def _send_media_part_via_open_api(
+        self,
+        part: OutgoingContentPart,
+        conversation_id: str,
+        conversation_type: str,
+        sender_staff_id: str,
+    ) -> bool:
+        """Upload and send one media part via DingTalk Open API.
+
+        Supports image (sampleImageMsg) and file (sampleFile) message
+        types. Falls back to sending a text placeholder if upload fails.
+        """
+        ptype = getattr(part, "type", None)
+        upload_type = self._map_upload_type(part)
+        if upload_type is None:
+            return True
+
+        default_name = {
+            "image": "image.png",
+            "voice": "audio.amr",
+            "video": "video.mp4",
+            "file": "file.bin",
+        }.get(upload_type, "file.bin")
+        filename, ext = self._guess_filename_and_ext(
+            part,
+            default=default_name,
+        )
+
+        # Resolve URL from part attributes
+        url = (
+            getattr(part, "file_url", None)
+            or getattr(part, "image_url", None)
+            or getattr(part, "video_url", None)
+            or ""
+        )
+        if not url and ptype == ContentType.AUDIO:
+            data_attr = getattr(part, "data", None)
+            if isinstance(data_attr, str) and (
+                data_attr.startswith("http") or data_attr.startswith("file:")
+            ):
+                url = data_attr
+        url = (url or "").strip() if isinstance(url, str) else ""
+
+        # AudioContent stores URL in "data"; derive real filename/ext
+        if ptype == ContentType.AUDIO:
+            data_attr = getattr(part, "data", None)
+            if isinstance(data_attr, str) and (
+                data_attr.startswith("http") or data_attr.startswith("file:")
+            ):
+                try:
+                    path = urlparse(data_attr).path
+                    base = os.path.basename(path)
+                    if base and "." in base:
+                        filename = base
+                        ext = base.rsplit(".", 1)[-1].lower()
+                except Exception:
+                    pass
+
+        # For images with public HTTP URLs, send directly via sampleImageMsg
+        if upload_type == "image" and self._is_public_http_url(url):
+            return await self._send_open_api_message(
+                msg_key="sampleImageMsg",
+                msg_param={"photoURL": url},
+                conversation_id=conversation_id,
+                conversation_type=conversation_type,
+                sender_staff_id=sender_staff_id,
+            )
+
+        # Load bytes from base64 or URL
+        data: Optional[bytes] = None
+        raw_b64 = None
+        if (
+            isinstance(url, str)
+            and url.startswith("data:")
+            and "base64," in url
+        ):
+            raw_b64 = url
+            url = ""
+        if not raw_b64:
+            raw_b64 = getattr(part, "base64", None)
+
+        if raw_b64:
+            if isinstance(raw_b64, str) and raw_b64.startswith("data:"):
+                data, _ = parse_data_url(raw_b64)
+            else:
+                data = base64.b64decode(raw_b64, validate=False)
+        if not data and url:
+            data = await self._fetch_bytes_from_url(url)
+
+        if not data:
+            logger.warning(
+                "dingtalk _send_media_part_via_open_api: no data, type=%s",
+                ptype,
+            )
+            return False
+
+        # Upload to get media_id
+        effective_upload_type = upload_type
+        if effective_upload_type == "voice":
+            effective_upload_type = "file"
+        if effective_upload_type == "video" and ext not in ("mp4",):
+            effective_upload_type = "file"
+
+        media_id = await self._upload_media(
+            data,
+            effective_upload_type,
+            filename=filename,
+        )
+        if not media_id:
+            logger.warning(
+                "dingtalk _send_media_part_via_open_api: upload failed, "
+                "type=%s",
+                ptype,
+            )
+            return False
+
+        # Send via Open API with appropriate msgKey
+        if upload_type == "image":
+            # sampleImageMsg does not support mediaId, send as file instead
+            return await self._send_open_api_message(
+                msg_key="sampleFile",
+                msg_param={
+                    "mediaId": media_id,
+                    "fileName": filename,
+                    "fileType": ext,
+                },
+                conversation_id=conversation_id,
+                conversation_type=conversation_type,
+                sender_staff_id=sender_staff_id,
+            )
+
+        return await self._send_open_api_message(
+            msg_key="sampleFile",
+            msg_param={
+                "mediaId": media_id,
+                "fileName": filename,
+                "fileType": ext,
+            },
+            conversation_id=conversation_id,
+            conversation_type=conversation_type,
+            sender_staff_id=sender_staff_id,
+        )
+
+    async def _send_open_api_message(
+        self,
+        *,
+        msg_key: str,
+        msg_param: Dict[str, Any],
+        conversation_id: str,
+        conversation_type: str,
+        sender_staff_id: str,
+    ) -> bool:
+        """Send a single message via DingTalk Open API with given msgKey."""
+        token = await self._get_access_token()
+        is_group = conversation_type == "group"
+
+        if is_group:
+            url = "https://api.dingtalk.com/v1.0/robot/groupMessages/send"
+            payload: Dict[str, Any] = {
+                "robotCode": self.robot_code,
+                "openConversationId": conversation_id,
+                "msgKey": msg_key,
+                "msgParam": json.dumps(msg_param),
+            }
+        else:
+            if not sender_staff_id:
+                logger.warning(
+                    "dingtalk _send_open_api_message: no sender_staff_id "
+                    "for DM, cannot send",
+                )
+                return False
+            url = "https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend"
+            payload = {
+                "robotCode": self.robot_code,
+                "userIds": [sender_staff_id],
+                "msgKey": msg_key,
+                "msgParam": json.dumps(msg_param),
+            }
+
+        headers = {
+            "Content-Type": "application/json",
+            "x-acs-dingtalk-access-token": token,
+        }
+        try:
+            async with self._http.post(
+                url,
+                json=payload,
+                headers=headers,
+            ) as resp:
+                body_text = await resp.text()
+                if resp.status >= 400:
+                    logger.warning(
+                        "dingtalk _send_open_api_message failed: "
+                        "msg_key=%s status=%s body=%s",
+                        msg_key,
+                        resp.status,
+                        body_text[:500],
+                    )
+                    return False
+                try:
+                    body_json = json.loads(body_text) if body_text else {}
+                except json.JSONDecodeError:
+                    body_json = {}
+                errcode = body_json.get("errcode", 0)
+                if errcode != 0:
+                    logger.warning(
+                        "dingtalk _send_open_api_message API error: "
+                        "msg_key=%s errcode=%s body=%s",
+                        msg_key,
+                        errcode,
+                        body_text[:300],
+                    )
+                    return False
+                logger.info(
+                    "dingtalk _send_open_api_message ok: msg_key=%s",
+                    msg_key,
+                )
+                return True
+        except Exception:
+            logger.exception(
+                "dingtalk _send_open_api_message failed: msg_key=%s",
+                msg_key,
+            )
+            return False
+
     async def _upload_media(
         self,
         data: bytes,
@@ -1580,24 +1827,45 @@ class DingTalkChannel(BaseChannel):
             if m.get("reply_loop") is not None and m.get("reply_future"):
                 self._reply_sync(m, SENT_VIA_WEBHOOK)
             return
-        if not body and media_parts:
-            for p in media_parts:
-                if getattr(p, "type", None) == ContentType.IMAGE and getattr(
-                    p,
-                    "image_url",
-                    None,
+        # Fallback path: no session_webhook available.
+        # Try sending media parts via Open API (upload + rich message)
+        # instead of degrading to plain-text file paths.
+        if media_parts:
+            params = self._resolve_open_api_params_from_handle(
+                to_handle,
+                meta,
+            )
+            if params["conversation_id"]:
+                # Send text body first via Open API if present
+                if body.strip():
+                    await self._send_via_open_api(
+                        body.strip(),
+                        conversation_id=params["conversation_id"],
+                        conversation_type=params["conversation_type"],
+                        sender_staff_id=params["sender_staff_id"],
+                        bot_prefix="",
+                    )
+                for i, part in enumerate(media_parts):
+                    logger.info(
+                        "dingtalk send_content_parts: "
+                        "sending media part %s/%s via Open API type=%s",
+                        i + 1,
+                        len(media_parts),
+                        getattr(part, "type", None),
+                    )
+                    await self._send_media_part_via_open_api(
+                        part,
+                        conversation_id=params["conversation_id"],
+                        conversation_type=params["conversation_type"],
+                        sender_staff_id=params["sender_staff_id"],
+                    )
+                if (
+                    m.get("reply_loop") is not None
+                    and m.get("reply_future") is not None
                 ):
-                    text_parts.append(f"[Image: {p.image_url}]")
-                elif getattr(p, "type", None) == ContentType.FILE and (
-                    getattr(p, "file_url", None) or getattr(p, "file_id", None)
-                ):
-                    furl = getattr(p, "file_url", None)
-                    fid = getattr(p, "file_id", None)
-                    url_or_id = furl or fid
-                    text_parts.append(f"[File: {url_or_id}]")
-            body = "\n".join(text_parts) if text_parts else ""
-            if prefix and body:
-                body = prefix + "  " + body
+                    self._reply_sync(m, SENT_VIA_WEBHOOK)
+                return
+
         if (
             m.get("reply_loop") is not None
             and m.get("reply_future") is not None
