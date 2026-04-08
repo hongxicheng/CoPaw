@@ -478,8 +478,8 @@ class DingTalkChannel(BaseChannel):
                 "clearing webhook for key=%s",
                 webhook_key,
             )
-            cleaned = {k: v for k, v in entry.items() if k != "webhook"}
-            self._session_webhook_store[webhook_key] = cleaned
+            entry["webhook"] = ""
+            self._session_webhook_store[webhook_key] = entry
             self._save_session_webhook_store_to_disk()
 
     async def _load_session_webhook(self, webhook_key: str) -> Optional[str]:
