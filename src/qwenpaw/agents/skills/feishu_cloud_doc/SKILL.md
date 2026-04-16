@@ -112,10 +112,20 @@ python scripts/doc_edit.py --workspace-dir {working_dir} --doc-id DOC_ID --block
 | Create spreadsheet | `python scripts/sheet_create.py --workspace-dir {working_dir} --title "Title" [--folder TOKEN]` |
 | Get info | `python scripts/sheet_read.py --workspace-dir {working_dir} --token TOKEN --info` |
 | List worksheets | `python scripts/sheet_read.py --workspace-dir {working_dir} --token TOKEN --list-sheets` |
-| Read range | `python scripts/sheet_read.py --workspace-dir {working_dir} --token TOKEN --range "Sheet1!A1:D10"` |
-| Write range | `python scripts/sheet_write.py --workspace-dir {working_dir} --token TOKEN --range "Sheet1!A1:B2" --values-json '[["a","b"],[1,2]]'` |
-| Append rows | `python scripts/sheet_write.py --workspace-dir {working_dir} --token TOKEN --range "Sheet1!A1" --append --values-json '[["c",3]]'` |
+| Read range | `python scripts/sheet_read.py --workspace-dir {working_dir} --token TOKEN --range "SHEET_ID!A1:D10"` |
+| Write range | `python scripts/sheet_write.py --workspace-dir {working_dir} --token TOKEN --range "SHEET_ID!A1:B2" --values-json '[["a","b"],[1,2]]'` |
+| Append rows | `python scripts/sheet_write.py --workspace-dir {working_dir} --token TOKEN --range "SHEET_ID!A1" --append --values-json '[["c",3]]'` |
 | Add worksheet | `python scripts/sheet_write.py --workspace-dir {working_dir} --token TOKEN --add-sheet --sheet-title "Sheet2"` |
+
+### Range Format
+
+The `--range` parameter uses the format `<sheet_identifier>!<cell_range>`.
+
+**Recommended**: Use the worksheet's internal `sheet_id` (e.g. `e4731c!A1:B2`). Get it via `--list-sheets`.
+
+Sheet title (e.g. `Sheet1!A1:B2`) is also accepted — the script auto-resolves it to `sheet_id`. However, using `sheet_id` directly is more reliable and avoids an extra API call.
+
+**Workflow**: Always run `--list-sheets` first to get the `sheet_id`, then use it in subsequent read/write commands.
 
 ### Value Types
 
@@ -125,8 +135,11 @@ python scripts/doc_edit.py --workspace-dir {working_dir} --doc-id DOC_ID --block
 
 ```bash
 python scripts/sheet_create.py --workspace-dir {working_dir} --title "Q1 Report"
-python scripts/sheet_write.py --workspace-dir {working_dir} --token TOKEN --range "Sheet1!A1:C1" --values-json '[["Date","Revenue","Cost"]]'
-python scripts/sheet_write.py --workspace-dir {working_dir} --token TOKEN --range "Sheet1!A2" --append --values-json '[["Jan",50000,30000],["Feb",55000,32000]]'
+# First, get the sheet_id
+python scripts/sheet_read.py --workspace-dir {working_dir} --token TOKEN --list-sheets
+# Use sheet_id (e.g. e4731c) from the output
+python scripts/sheet_write.py --workspace-dir {working_dir} --token TOKEN --range "e4731c!A1:C1" --values-json '[["Date","Revenue","Cost"]]'
+python scripts/sheet_write.py --workspace-dir {working_dir} --token TOKEN --range "e4731c!A2" --append --values-json '[["Jan",50000,30000],["Feb",55000,32000]]'
 ```
 
 ---

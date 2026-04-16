@@ -74,11 +74,31 @@ def list_sheets(token: str) -> dict:
     }
 
 
+def _resolve_range(token: str, range_str: str) -> str:
+    """Resolve range by converting sheet title to sheet_id if needed.
+
+    Feishu Sheets API only accepts sheet_id (e.g. 'e4731c!A1:B2'),
+    not sheet title (e.g. 'Sheet1!A1:B2'). This function auto-converts
+    title to sheet_id by querying the worksheet list.
+    """
+    if "!" not in range_str:
+        return range_str
+    sheet_part, cell_part = range_str.split("!", 1)
+    result = list_sheets(token)
+    if not result.get("success"):
+        return range_str
+    for sheet in result.get("sheets", []):
+        if sheet.get("title") == sheet_part:
+            return f"{sheet['sheet_id']}!{cell_part}"
+    return range_str
+
 def read_range(token: str, range_str: str) -> dict:
     """Read a range of cells from a spreadsheet.
 
-    Range format: "SheetName!A1:D10" or "sheet_id!A1:D10"
+    Range format: "sheet_id!A1:D10" (recommended) or "SheetTitle!A1:D10"
+    (auto-resolved to sheet_id).
     """
+    range_str = _resolve_range(token, range_str)
     base = get_base_url()
     url = f"{base}/open-apis/sheets/v2/spreadsheets/{token}/values/{range_str}"
     params = {

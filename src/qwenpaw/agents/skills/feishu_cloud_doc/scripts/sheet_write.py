@@ -20,8 +20,37 @@ import httpx
 from feishu_auth import auth_headers, get_base_url, init_workspace
 
 
+def _list_sheets_for_resolve(token: str) -> list[dict]:
+    """Fetch worksheet list for range resolution."""
+    base = get_base_url()
+    url = f"{base}/open-apis/sheets/v3/spreadsheets/{token}/sheets/query"
+    resp = httpx.get(url, headers=auth_headers(), timeout=30)
+    data = resp.json()
+    if data.get("code") != 0:
+        return []
+    return [
+        {"sheet_id": s.get("sheet_id", ""), "title": s.get("title", "")}
+        for s in data.get("data", {}).get("sheets", [])
+    ]
+
+def _resolve_range(token: str, range_str: str) -> str:
+    """Resolve range by converting sheet title to sheet_id if needed.
+
+    Feishu Sheets API only accepts sheet_id (e.g. 'e4731c!A1:B2'),
+    not sheet title (e.g. 'Sheet1!A1:B2'). This function auto-converts
+    title to sheet_id by querying the worksheet list.
+    """
+    if "!" not in range_str:
+        return range_str
+    sheet_part, cell_part = range_str.split("!", 1)
+    for sheet in _list_sheets_for_resolve(token):
+        if sheet.get("title") == sheet_part:
+            return f"{sheet['sheet_id']}!{cell_part}"
+    return range_str
+
 def write_range(token: str, range_str: str, values: list[list]) -> dict:
     """Write values to a specific range."""
+    range_str = _resolve_range(token, range_str)
     base = get_base_url()
     url = f"{base}/open-apis/sheets/v2/spreadsheets/{token}/values"
     body = {
@@ -52,6 +81,7 @@ def write_range(token: str, range_str: str, values: list[list]) -> dict:
 
 def append_data(token: str, range_str: str, values: list[list]) -> dict:
     """Append values after the last row in a range."""
+    range_str = _resolve_range(token, range_str)
     base = get_base_url()
     url = f"{base}/open-apis/sheets/v2/spreadsheets/{token}/values_append"
     params = {"insertDataOption": "INSERT_ROWS"}
