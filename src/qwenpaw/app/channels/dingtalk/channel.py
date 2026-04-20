@@ -889,20 +889,16 @@ class DingTalkChannel(BaseChannel):
         """
         text = (bot_prefix + "  " + body) if body else bot_prefix
 
-        # Build at payload
-        has_at = bool(at_user_ids or at_dingtalk_ids)
+        # Build at payload and prepend @mention text
         at_payload: Optional[Dict[str, Any]] = None
-        if has_at:
+        if at_user_ids or at_dingtalk_ids:
             at_payload = {}
-            if at_user_ids:
-                at_payload["atUserIds"] = at_user_ids
-            if at_dingtalk_ids:
-                at_payload["atDingtalkIds"] = at_dingtalk_ids
-            # Prepend @mention text (DingTalk requires it in body too)
             mentions = []
             if at_user_ids:
+                at_payload["atUserIds"] = at_user_ids
                 mentions.extend(f"@{uid}" for uid in at_user_ids)
             if at_dingtalk_ids:
+                at_payload["atDingtalkIds"] = at_dingtalk_ids
                 mentions.extend(f"@{did}" for did in at_dingtalk_ids)
             text = " ".join(mentions) + "\n" + text
 
