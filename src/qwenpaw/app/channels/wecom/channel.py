@@ -682,12 +682,15 @@ class WecomChannel(BaseChannel):
         # Use the main event loop for the future (response handling)
         main_loop = asyncio.get_running_loop()
         fut: asyncio.Future[Any] = main_loop.create_future()
-        self._upload_ack_futures[req_id] = fut
 
         # WebSocket operations must run in the WS thread's event loop
         ws_loop = self._ws_loop
         if ws_loop is None:
             raise RuntimeError("WebSocket loop not initialized")
+
+        # Register the future after the ws_loop check so it won't leak
+        # if the check raises.
+        self._upload_ack_futures[req_id] = fut
 
         async def _send() -> None:
             await self._client._ws_manager.send(
@@ -696,7 +699,10 @@ class WecomChannel(BaseChannel):
 
         try:
             # Schedule send in WS thread and wait for response
-            asyncio.run_coroutine_threadsafe(_send(), ws_loop)
+            send_future = asyncio.run_coroutine_threadsafe(_send(), ws_loop)
+            send_future.add_done_callback(
+                lambda f: f.result() if not f.cancelled() else None
+            )
             ack = await asyncio.wait_for(
                 asyncio.shield(fut),
                 timeout=_UPLOAD_ACK_TIMEOUT,
