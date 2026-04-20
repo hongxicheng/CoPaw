@@ -559,6 +559,8 @@
     "dingtalkAuthSuccess": "Бот DingTalk создан. Client ID и Client Secret заполнены автоматически.",
     "dingtalkQrcodeFailed": "Не удалось получить QR-код DingTalk. Попробуйте ещё раз.",
     "dingtalkQrcodeExpired": "QR-код истёк. Получите новый.",
+    "atSenderOnReply": "@ отправителя при ответе",
+    "atSenderOnReplyTooltip": "При включении бот будет упоминать отправителя в первом сообщении ответа в групповых чатах. Примечание: в режиме карточек @упоминание работает только для внутренних сотрудников организации.",
     "wecomCancelled": "Авторизация отменена",
     "wecomAuthFailed": "Ошибка авторизации: {{msg}}",
     "filterAll": "Все",

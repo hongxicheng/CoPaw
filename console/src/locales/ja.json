@@ -554,6 +554,8 @@
     "dingtalkAuthSuccess": "DingTalkボットが作成されました。Client IDとClient Secretが自動入力されました。",
     "dingtalkQrcodeFailed": "DingTalk QRコードの取得に失敗しました。もう一度お試しください。",
     "dingtalkQrcodeExpired": "QRコードの有効期限が切れました。再取得してください。",
+    "atSenderOnReply": "返信時に送信者を@メンション",
+    "atSenderOnReplyTooltip": "有効にすると、ボットはグループチャットでの返信の最初のメッセージで送信者を@メンションします。注意：カードモードでは、@メンションは企業内部メンバーのみ有効です。",
     "wecomCancelled": "認証がキャンセルされました",
     "wecomAuthFailed": "認証に失敗しました: {{msg}}",
     "filterAll": "すべて",

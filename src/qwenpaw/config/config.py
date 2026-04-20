@@ -224,6 +224,7 @@ class DingTalkConfig(BaseChannelConfig):
     robot_code: str = ""
     media_dir: Optional[str] = None
     card_auto_layout: bool = False
+    at_sender_on_reply: bool = False
 
 
 class FeishuConfig(BaseChannelConfig):
