@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Request/response schemas for config API endpoints."""
 
-from typing import Optional
+from typing import Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -26,7 +26,7 @@ class ChannelHealthResponse(BaseModel):
     """Response model for GET /config/channels/{channel_name}/health."""
 
     channel: str
-    status: str
+    status: Literal["healthy", "unhealthy", "disabled"]
     detail: str = ""
 
 
@@ -34,5 +34,5 @@ class ChannelRestartResponse(BaseModel):
     """Response model for POST /config/channels/{channel_name}/restart."""
 
     channel: str
-    status: str
+    status: Literal["restarted"]
     detail: str = ""
