@@ -117,6 +117,10 @@ if (Test-Path $CondaUnpack) {
     if ($LASTEXITCODE -ne 0) {
       throw "CRITICAL: huggingface_hub still has import errors after reinstall. See issue.md"
     }
+    & $pythonExe -c "import discord; print('✓ discord.py import OK')"
+    if ($LASTEXITCODE -ne 0) {
+      throw "CRITICAL: discord.py still has import errors after reinstall."
+    }
     Write-Host "[build_win] ✓ conda-unpack corruption fixed successfully."
   } else {
     Write-Host "[build_win] WARN: wheels_cache not found at $WheelsCache" -ForegroundColor Yellow
