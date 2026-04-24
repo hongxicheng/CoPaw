@@ -952,9 +952,17 @@ class DingTalkChannel(BaseChannel):
             len(text),
         )
 
+        if len(text) > 3500:
+            msg_key = "sampleText"
+            msg_param = json.dumps({"content": text})
+        else:
+            norm = dingtalk_markdown.normalize_dingtalk_markdown(text)
+            msg_key = "sampleMarkdown"
+            msg_param = json.dumps({"title": f"💬{norm[:10]}...", "text": norm})
+
         return await self._send_robot_message(
-            msg_key="sampleText",
-            msg_param=json.dumps({"content": text}),
+            msg_key=msg_key,
+            msg_param=msg_param,
             conversation_id=conversation_id,
             is_group=is_group,
             sender_staff_id=sender_staff_id,
