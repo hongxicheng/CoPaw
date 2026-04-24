@@ -740,15 +740,6 @@ class DingTalkChannel(BaseChannel):
             None,
         )
 
-    @staticmethod
-    def _is_base64_url(url: str) -> bool:
-        """True when *url* is a ``data:…;base64,`` URI."""
-        return (
-            isinstance(url, str)
-            and url.startswith("data:")
-            and "base64," in url
-        )
-
     def _parts_to_single_text(
         self,
         parts: List[OutgoingContentPart],
