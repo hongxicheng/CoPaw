@@ -1113,7 +1113,12 @@ export function ChannelDrawer({
             >
               <Switch />
             </Form.Item>
-            <Form.Item noStyle shouldUpdate={(prev, cur) => prev.message_merge_enabled !== cur.message_merge_enabled}>
+            <Form.Item
+              noStyle
+              shouldUpdate={(prev, cur) =>
+                prev.message_merge_enabled !== cur.message_merge_enabled
+              }
+            >
               {({ getFieldValue }) =>
                 getFieldValue("message_merge_enabled") ? (
                   <Form.Item
@@ -1124,13 +1129,21 @@ export function ChannelDrawer({
                     rules={[
                       {
                         validator: (_: unknown, value: unknown) => {
-                          if (value === null || value === undefined || value === "") {
+                          if (
+                            value === null ||
+                            value === undefined ||
+                            value === ""
+                          ) {
                             return Promise.resolve();
                           }
                           const num = Number(value);
                           if (!Number.isInteger(num) || num < 0) {
                             return Promise.reject(
-                              new Error(t("channels.weixinMessageMergeDelayMsValidation"))
+                              new Error(
+                                t(
+                                  "channels.weixinMessageMergeDelayMsValidation",
+                                ),
+                              ),
                             );
                           }
                           return Promise.resolve();
