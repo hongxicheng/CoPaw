@@ -399,17 +399,28 @@ class XiaoYiConfig(BaseChannelConfig):
 class WeixinConfig(BaseChannelConfig):
     """WeChat (iLink Bot) personal account channel config.
 
-    bot_token:      Bearer token obtained after QR code login.
-    bot_token_file: Path to persist/load the bot_token
-                    (default ~/.qwenpaw/weixin_bot_token).
-    base_url:       iLink API base URL (leave empty to use default).
-    media_dir:      Local directory for downloaded media files.
+    bot_token:              Bearer token obtained after QR code login.
+    bot_token_file:         Path to persist/load the bot_token
+                            (default ~/.qwenpaw/weixin_bot_token).
+    base_url:               iLink API base URL (leave empty to use default).
+    media_dir:              Local directory for downloaded media files.
+    message_merge_enabled:  When True, merge multiple outgoing text messages
+                            within a single request to reduce message count
+                            (mitigates the 10-message context_token limit).
+    message_merge_delay_ms: Controls merge behaviour when merging is enabled.
+                            0  → merge ALL text messages and send once at the
+                                 end of the request (maximum savings).
+                            >0 → buffer messages for this many milliseconds;
+                                 if no new message arrives within the window
+                                 the buffer is flushed (adjacent-merge mode).
     """
 
     bot_token: str = ""
     bot_token_file: str = ""
     base_url: str = ""
     media_dir: Optional[str] = None
+    message_merge_enabled: bool = False
+    message_merge_delay_ms: Optional[int] = 0
 
 
 class ChannelConfig(BaseModel):
