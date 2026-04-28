@@ -376,22 +376,24 @@ class WecomChannel(BaseChannel):
             if msgtype == "text":
                 text = (body.get("text") or {}).get("content", "").strip()
                 if text:
-                    # In group chat, strip leading/trailing @mention
+                    # In group chat, strip @mention only when it wraps a
+                    # slash command, to preserve normal conversation text.
                     if chat_type == "group":
                         text = re.sub(
-                            r"^@\S+\s*",
+                            r"^@\S+\s+(?=/)",
                             "",
                             text,
                         ).strip()
-                        text = re.sub(
-                            r"\s*@\S+$",
-                            "",
-                            text,
-                        ).strip()
-                        # If stripping @mention left nothing (bare @bot),
-                        # keep a placeholder so the message isn't dropped.
-                        if not text:
-                            text = "@"
+                        text = (
+                            re.sub(
+                                r"@\S+$",
+                                "",
+                                text,
+                            )
+                            if text.startswith("/")
+                            else text
+                        )
+                        text = text.strip()
                     text_parts.append(text)
 
             elif msgtype == "image":
