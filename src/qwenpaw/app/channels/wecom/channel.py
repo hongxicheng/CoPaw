@@ -106,7 +106,7 @@ class WecomChannel(BaseChannel):
         bot_prefix: str = "",
         media_dir: str = "",
         welcome_text: str = "",
-        share_session_in_group: bool = False,
+        share_session_in_group: bool = True,
         workspace_dir: Path | None = None,
         on_reply_sent: OnReplySent = None,
         show_tool_details: bool = True,
@@ -181,7 +181,7 @@ class WecomChannel(BaseChannel):
             media_dir=os.getenv("WECOM_MEDIA_DIR", ""),
             share_session_in_group=os.getenv(
                 "WECOM_SHARE_SESSION_IN_GROUP",
-                "0",
+                "1",
             )
             == "1",
             on_reply_sent=on_reply_sent,
@@ -214,7 +214,7 @@ class WecomChannel(BaseChannel):
             media_dir=getattr(config, "media_dir", None) or "",
             welcome_text=getattr(config, "welcome_text", "") or "",
             share_session_in_group=bool(
-                getattr(config, "share_session_in_group", False),
+                getattr(config, "share_session_in_group", True),
             ),
             workspace_dir=workspace_dir,
             on_reply_sent=on_reply_sent,
@@ -654,9 +654,9 @@ class WecomChannel(BaseChannel):
             native = {
                 "channel_id": self.channel,
                 "sender_id": sender_id,
-                # Group chats: isolate per member by default
-                # (user_id=sender_id); when share_session_in_group is
-                # True, use "group" so all members share one chat.
+                # Group chats: all members share one chat by default
+                # (user_id="group"); when share_session_in_group is
+                # False, use sender_id so each member is isolated.
                 # session_id stays group-level for reply routing.
                 "user_id": (
                     "group"
