@@ -278,6 +278,23 @@ class MultiAgentManager:
         Returns:
             bool: True if agent was reloaded, False if not running
         """
+        # Step 0: Per-agent reload lock. If another reload for this
+        # agent is already in progress, skip rather than queue up.
+        if agent_id not in self._reload_locks:
+            self._reload_locks[agent_id] = asyncio.Lock()
+        reload_lock = self._reload_locks[agent_id]
+
+        if reload_lock.locked():
+            logger.info(
+                f"Reload already in progress for {agent_id}, skipping",
+            )
+            return False
+
+        async with reload_lock:
+            return await self._do_reload_agent(agent_id)
+
+    async def _do_reload_agent(self, agent_id: str) -> bool:
+        """Execute the actual reload (called under per-agent lock)."""
         # Step 1: Check if agent exists (quick check with lock)
         async with self._lock:
             if agent_id not in self.agents:
@@ -289,6 +306,27 @@ class MultiAgentManager:
             old_instance = self.agents[agent_id]
 
         logger.info(f"Reloading agent (zero-downtime): {agent_id}")
+
+        # Step 1.5: Disable the old workspace's config watcher up front.
+        # Otherwise, while we are still spinning up the new workspace,
+        # the old watcher's poll loop can observe the same agent.json
+        # change that triggered THIS reload and fire a redundant
+        # reload of its own. Stopping it eagerly removes that race.
+        # Failure here is non-fatal: at worst we get one extra reload.
+        try:
+            # pylint: disable=protected-access
+            old_watcher = old_instance._service_manager.services.get(
+                "agent_config_watcher",
+            )
+            # pylint: enable=protected-access
+            if old_watcher is not None:
+                await old_watcher.stop()
+        except Exception as stop_err:
+            logger.warning(
+                f"Failed to stop old AgentConfigWatcher for "
+                f"{agent_id}: {stop_err}. A redundant reload may "
+                f"follow but functionality is unaffected.",
+            )
 
         # Step 2: Load configuration (outside lock)
         config = load_config()
