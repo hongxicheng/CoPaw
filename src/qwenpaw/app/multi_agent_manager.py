@@ -290,12 +290,8 @@ class MultiAgentManager:
 
         logger.info(f"Reloading agent (zero-downtime): {agent_id}")
 
-        # Step 1.5: Disable the old workspace's config watcher up front.
-        # Otherwise, while we are still spinning up the new workspace,
-        # the old watcher's poll loop can observe the same agent.json
-        # change that triggered THIS reload and fire a redundant
-        # reload of its own. Stopping it eagerly removes that race.
-        # Failure here is non-fatal: at worst we get one extra reload.
+        # Step 1.5: Stop old config watcher (no-op if it triggered
+        # this reload, since it already disabled itself).
         try:
             # pylint: disable=protected-access
             old_watcher = old_instance._service_manager.services.get(
@@ -307,8 +303,7 @@ class MultiAgentManager:
         except Exception as stop_err:
             logger.warning(
                 f"Failed to stop old AgentConfigWatcher for "
-                f"{agent_id}: {stop_err}. A redundant reload may "
-                f"follow but functionality is unaffected.",
+                f"{agent_id}: {stop_err}.",
             )
 
         # Step 2: Load configuration (outside lock)

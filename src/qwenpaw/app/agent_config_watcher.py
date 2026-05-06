@@ -72,9 +72,8 @@ class AgentConfigWatcher:
         self._last_channels_hash: Optional[int] = None
         self._last_heartbeat_hash: Optional[int] = None
 
-        # Skip ticks while a previous reload triggered by this watcher
-        # is still in flight, instead of queuing duplicate reloads.
-        self._reload_lock = asyncio.Lock()
+        # Set before triggering reload; poll loop checks this to stop.
+        self._disabled: bool = False
 
     async def start(self) -> None:
         """Take initial snapshot and start the polling task."""
@@ -89,7 +88,14 @@ class AgentConfigWatcher:
         )
 
     async def stop(self) -> None:
-        """Stop the polling task."""
+        """Stop the polling task (no-op if already disabled)."""
+        if self._disabled:
+            logger.info(
+                f"AgentConfigWatcher already disabled for agent "
+                f"{self._agent_id}, skipping cancel",
+            )
+            return
+        self._disabled = True
         if self._task:
             self._task.cancel()
             try:
@@ -135,9 +141,11 @@ class AgentConfigWatcher:
 
     async def _poll_loop(self) -> None:
         """Main polling loop."""
-        while True:
+        while not self._disabled:
             try:
                 await asyncio.sleep(self._poll_interval)
+                if self._disabled:
+                    break
                 await self._check()
             except Exception:
                 logger.exception(
@@ -193,28 +201,18 @@ class AgentConfigWatcher:
             )
             return
 
-        if self._reload_lock.locked():
-            logger.info(
-                f"AgentConfigWatcher ({self._agent_id}): "
-                f"reload already in progress, skipping this tick",
-            )
-            return
+        self._disabled = True
 
-        async with self._reload_lock:
-            logger.info(
+        logger.info(
+            f"AgentConfigWatcher ({self._agent_id}): "
+            f"config changed, triggering graceful reload "
+            f"(channels: {old_channels_hash} -> {new_channels_hash}, "
+            f"heartbeat: {old_heartbeat_hash} -> {new_heartbeat_hash})",
+        )
+        try:
+            await manager.reload_agent(self._agent_id)
+        except Exception:
+            logger.exception(
                 f"AgentConfigWatcher ({self._agent_id}): "
-                f"config changed, triggering graceful reload "
-                f"(channels: {old_channels_hash} -> {new_channels_hash}, "
-                f"heartbeat: {old_heartbeat_hash} -> {new_heartbeat_hash})",
+                f"reload_agent failed",
             )
-            try:
-                await manager.reload_agent(self._agent_id)
-            except Exception:
-                logger.exception(
-                    f"AgentConfigWatcher ({self._agent_id}): "
-                    f"reload_agent failed",
-                )
-            finally:
-                # Re-baseline so reload-induced rewrites do not look
-                # like a fresh change on the next tick.
-                self._snapshot()
