@@ -278,23 +278,6 @@ class MultiAgentManager:
         Returns:
             bool: True if agent was reloaded, False if not running
         """
-        # Step 0: Per-agent reload lock. If another reload for this
-        # agent is already in progress, skip rather than queue up.
-        if agent_id not in self._reload_locks:
-            self._reload_locks[agent_id] = asyncio.Lock()
-        reload_lock = self._reload_locks[agent_id]
-
-        if reload_lock.locked():
-            logger.info(
-                f"Reload already in progress for {agent_id}, skipping",
-            )
-            return False
-
-        async with reload_lock:
-            return await self._do_reload_agent(agent_id)
-
-    async def _do_reload_agent(self, agent_id: str) -> bool:
-        """Execute the actual reload (called under per-agent lock)."""
         # Step 1: Check if agent exists (quick check with lock)
         async with self._lock:
             if agent_id not in self.agents:
