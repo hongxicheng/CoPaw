@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from abc import ABC
 from typing import (
     Optional,
@@ -73,6 +74,20 @@ OutgoingContentPart = Union[
     FileContent,
     RefusalContent,
 ]
+
+
+class _StreamSessionState:
+    """Per-session state for streaming output throttle and accumulation."""
+
+    __slots__ = ("accumulated_text", "last_flush_time", "started", "message_handle")
+
+    def __init__(self) -> None:
+        self.accumulated_text: str = ""
+        self.last_flush_time: float = 0.0
+        self.started: bool = False
+        # Opaque handle returned by on_stream_start (e.g. message_id for
+        # editing an existing message). Passed to on_stream_delta/end.
+        self.message_handle: Any = None
 
 
 class BaseChannel(ABC):
@@ -156,6 +171,17 @@ class BaseChannel(ABC):
         self._debounce_seconds: float = 0.0
         self._debounce_pending: Dict[str, List[Any]] = {}
         self._debounce_timers: Dict[str, asyncio.Task[None]] = {}
+        # ── Streaming output ────────────────────────────────────────
+        # Subclasses set _streaming_enabled=True and override on_stream_*
+        # hooks to enable progressive message delivery to users.
+        self._streaming_enabled: bool = False
+        # Minimum seconds between on_stream_delta calls (throttle).
+        self._stream_throttle_interval: float = 1.0
+        # Per-session streaming accumulation state.
+        self._stream_state: Dict[str, _StreamSessionState] = {}
+        # Maps event msg_id -> message type ("reasoning"/"message") so
+        # content delta events know which phase they belong to.
+        self._stream_msg_type_map: Dict[str, str] = {}
 
     def _is_native_payload(self, payload: Any) -> bool:
         """True if payload is a native dict that can be time-debounced."""
@@ -498,6 +524,7 @@ class BaseChannel(ABC):
 
         last_response = None
         process_iterator = None
+        streaming_active = False
         try:
             process_iterator = self._process(request)
             async for event in process_iterator:
@@ -509,6 +536,20 @@ class BaseChannel(ABC):
                 status = getattr(event, "status", None)
 
                 if obj == "content":
+                    # Streaming: route text delta events to stream hooks
+                    if (
+                        self._streaming_enabled
+                        and getattr(event, "type", None) == "text"
+                        and getattr(event, "delta", False) is True
+                        and status == RunStatus.InProgress
+                    ):
+                        streaming_active = True
+                        await self._handle_stream_content_delta(
+                            request,
+                            to_handle,
+                            event,
+                            send_meta,
+                        )
                     if await self.on_event_content(
                         request,
                         to_handle,
@@ -517,13 +558,41 @@ class BaseChannel(ABC):
                     ):
                         continue
                 if obj == "message" and status == RunStatus.Completed:
+                    # Finalize streaming before sending the complete message
+                    if streaming_active:
+                        msg_id = getattr(event, "id", None) or ""
+                        msg_type = self._stream_msg_type_map.get(
+                            msg_id, "message",
+                        )
+                        await self._finalize_stream(
+                            request,
+                            to_handle,
+                            send_meta,
+                            is_reasoning=(msg_type == "reasoning"),
+                        )
+                        streaming_active = False
                     await self.on_event_message_completed(
                         request,
                         to_handle,
                         event,
                         send_meta,
                     )
+                elif obj == "message" and status != RunStatus.Completed:
+                    # Track msg_id -> type mapping for content deltas
+                    if self._streaming_enabled:
+                        ev_id = getattr(event, "id", None) or ""
+                        ev_type = getattr(event, "type", None) or ""
+                        if ev_id and ev_type:
+                            self._stream_msg_type_map[ev_id] = ev_type
                 elif obj == "response":
+                    # Finalize streaming if response arrives
+                    if streaming_active:
+                        await self._finalize_stream(
+                            request,
+                            to_handle,
+                            send_meta,
+                        )
+                        streaming_active = False
                     last_response = event
                     await self.on_event_response(request, event)
 
@@ -1056,6 +1125,178 @@ class BaseChannel(ABC):
         event: Any,
     ) -> None:
         """Hook: response event received. Default: no-op."""
+
+    # ── Streaming output hooks ──────────────────────────────────────
+
+    def _get_stream_session_key(
+        self,
+        request: "AgentRequest",
+        to_handle: str,
+    ) -> str:
+        """Key for per-session stream state. Default: session_id."""
+        return getattr(request, "session_id", "") or to_handle
+
+    async def on_stream_start(
+        self,
+        request: "AgentRequest",
+        to_handle: str,
+        send_meta: Dict[str, Any],
+        is_reasoning: bool = False,
+    ) -> Any:
+        """Called when streaming begins for a phase (reasoning or reply).
+
+        Subclasses override to e.g. create an updatable card or send a
+        placeholder message. Return an opaque handle (e.g. message_id)
+        that will be passed to on_stream_delta and on_stream_end.
+
+        Args:
+            request: The original agent request.
+            to_handle: Target recipient.
+            send_meta: Channel metadata.
+            is_reasoning: True if this is the reasoning/thinking phase.
+
+        Returns:
+            Opaque message handle (default: None).
+        """
+        return None
+
+    async def on_stream_delta(
+        self,
+        request: "AgentRequest",
+        to_handle: str,
+        accumulated_text: str,
+        send_meta: Dict[str, Any],
+        message_handle: Any = None,
+        is_reasoning: bool = False,
+    ) -> None:
+        """Called periodically with accumulated text during streaming.
+
+        Throttled by _stream_throttle_interval to avoid overwhelming APIs.
+        Subclasses override to update an existing message/card in-place.
+
+        Args:
+            request: The original agent request.
+            to_handle: Target recipient.
+            accumulated_text: Full text accumulated so far (snapshot).
+            send_meta: Channel metadata.
+            message_handle: Handle from on_stream_start.
+            is_reasoning: True if this is the reasoning/thinking phase.
+        """
+
+    async def on_stream_end(
+        self,
+        request: "AgentRequest",
+        to_handle: str,
+        final_text: str,
+        send_meta: Dict[str, Any],
+        message_handle: Any = None,
+        is_reasoning: bool = False,
+    ) -> None:
+        """Called when streaming ends for a phase (reasoning or reply).
+
+        Subclasses override to finalize the message (e.g. update card to
+        final state, remove "typing" indicator).
+
+        Args:
+            request: The original agent request.
+            to_handle: Target recipient.
+            final_text: Final complete text for this phase.
+            send_meta: Channel metadata.
+            message_handle: Handle from on_stream_start.
+            is_reasoning: True if this is the reasoning/thinking phase.
+        """
+
+    async def _handle_stream_content_delta(
+        self,
+        request: "AgentRequest",
+        to_handle: str,
+        event: Any,
+        send_meta: Dict[str, Any],
+    ) -> None:
+        """Process a content delta event for streaming output.
+
+        Applies _filter_thinking: if enabled, reasoning deltas are skipped.
+        Manages throttle timing and invokes on_stream_start/on_stream_delta.
+
+        Event structure: object="content", type="text", delta=True,
+        text="<incremental text>", msg_id="...", status="in_progress".
+        """
+        msg_id = getattr(event, "msg_id", None) or ""
+        msg_type = self._stream_msg_type_map.get(msg_id, "message")
+        is_reasoning = msg_type == "reasoning"
+
+        # Respect filter_thinking: skip reasoning deltas if enabled
+        if is_reasoning and self._filter_thinking:
+            return
+
+        delta_text = getattr(event, "text", None) or ""
+        if not delta_text:
+            return
+
+        session_key = self._get_stream_session_key(request, to_handle)
+        state = self._stream_state.get(session_key)
+        if state is None:
+            state = _StreamSessionState()
+            self._stream_state[session_key] = state
+
+        now = time.monotonic()
+        state.accumulated_text += delta_text
+
+        if not state.started:
+            state.started = True
+            state.last_flush_time = now
+            state.message_handle = await self.on_stream_start(
+                request,
+                to_handle,
+                send_meta,
+                is_reasoning=is_reasoning,
+            )
+            await self.on_stream_delta(
+                request,
+                to_handle,
+                state.accumulated_text,
+                send_meta,
+                state.message_handle,
+                is_reasoning=is_reasoning,
+            )
+            return
+
+        elapsed = now - state.last_flush_time
+        if elapsed >= self._stream_throttle_interval:
+            state.last_flush_time = now
+            await self.on_stream_delta(
+                request,
+                to_handle,
+                state.accumulated_text,
+                send_meta,
+                state.message_handle,
+                is_reasoning=is_reasoning,
+            )
+
+    async def _finalize_stream(
+        self,
+        request: "AgentRequest",
+        to_handle: str,
+        send_meta: Dict[str, Any],
+        is_reasoning: bool = False,
+    ) -> bool:
+        """Finalize streaming state for a session.
+
+        Returns True if streaming was active (and on_stream_end was called).
+        """
+        session_key = self._get_stream_session_key(request, to_handle)
+        state = self._stream_state.pop(session_key, None)
+        if state is None or not state.started:
+            return False
+        await self.on_stream_end(
+            request,
+            to_handle,
+            state.accumulated_text,
+            send_meta,
+            state.message_handle,
+            is_reasoning=is_reasoning,
+        )
+        return True
 
     async def _on_process_completed(
         self,
