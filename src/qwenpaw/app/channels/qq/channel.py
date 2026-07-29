@@ -418,6 +418,46 @@ async def _send_message_async(
     )
 
 
+async def _send_stream_message_async(
+    session: Any,
+    access_token: str,
+    openid: str,
+    *,
+    content: str,
+    input_state: int,
+    index: int,
+    stream_msg_id: str = "",
+    msg_id: Optional[str] = None,
+    content_type: str = "text",
+    msg_seq: int = 1,
+) -> Dict[str, Any]:
+    """Send one C2C stream_messages chunk (replace mode).
+
+    The first chunk omits ``stream_msg_id``; its response ``id`` is
+    the stream id that later chunks must carry. ``input_state`` is 1
+    while generating and 10 for the final chunk.
+    """
+    body: Dict[str, Any] = {
+        "input_mode": "replace",
+        "input_state": input_state,
+        "index": index,
+        "content_type": content_type,
+        "content_raw": content,
+        "msg_seq": msg_seq,
+    }
+    if stream_msg_id:
+        body["stream_msg_id"] = stream_msg_id
+    if msg_id:
+        body["msg_id"] = msg_id
+    return await _api_request_async(
+        session,
+        access_token,
+        "POST",
+        f"/v2/users/{openid}/stream_messages",
+        body,
+    )
+
+
 _MEDIA_PATH_PREFIX = {
     "c2c": "/v2/users",
     "group": "/v2/groups",
@@ -649,6 +689,9 @@ class QQChannel(BaseChannel):
 
     channel = "qq"
 
+    # Conservative throttle for stream_messages (50 QPS API limit).
+    _STREAM_DELTA_MIN_INTERVAL_S = 0.5
+
     def __init__(
         self,
         process: ProcessHandler,
@@ -666,6 +709,7 @@ class QQChannel(BaseChannel):
         ack_message: str = "",
         access_control_dm: bool = False,
         access_control_group: bool = False,
+        streaming_enabled: bool = False,
     ):
         super().__init__(
             process,
@@ -674,6 +718,7 @@ class QQChannel(BaseChannel):
             no_text_debounce=no_text_debounce,
             access_control_dm=access_control_dm,
             access_control_group=access_control_group,
+            streaming_enabled=streaming_enabled,
         )
         self.enabled = enabled
         self.app_id = app_id
@@ -840,6 +885,9 @@ class QQChannel(BaseChannel):
             ),
             access_control_group=bool(
                 getattr(config, "access_control_group", False),
+            ),
+            streaming_enabled=bool(
+                getattr(config, "streaming_enabled", False),
             ),
         )
 
@@ -1580,6 +1628,285 @@ class QQChannel(BaseChannel):
             event,
             send_meta,
         )
+
+    # ------------------------------------------------------------------
+    # Streaming output (C2C stream_messages, typewriter effect)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _build_stream_display_text(stream_type: str, text: str) -> str:
+        """Prefix reasoning segments so they differ from the answer."""
+        if stream_type == "reasoning" and text:
+            return f"💭 {text}"
+        return text
+
+    @staticmethod
+    def _stream_tail(sent: str, full: str) -> str:
+        """Return the part of *full* not yet delivered via the stream."""
+        if not sent:
+            return full
+        if full.startswith(sent):
+            return full[len(sent) :]
+        return full
+
+    def _get_qq_stream_state(
+        self,
+        send_meta: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Per-request stream states keyed by stream_type."""
+        state = send_meta.get("_qq_stream")
+        if state is None:
+            state = {}
+            send_meta["_qq_stream"] = state
+        return state
+
+    async def on_streaming_start(
+        self,
+        request: Any,
+        to_handle: str,
+        event: Any,
+        send_meta: Dict[str, Any],
+        stream_type: str,
+        accumulated_text: str = "",
+    ) -> None:
+        """Init stream state; C2C passive replies only."""
+        if not self.enabled or not self.streaming_enabled:
+            return
+        if send_meta.get("message_type") != "c2c":
+            return
+        msg_id = send_meta.get("message_id")
+        openid = send_meta.get("sender_id") or to_handle
+        if not msg_id or not openid:
+            return
+        use_markdown = _as_bool(
+            send_meta.get("markdown_enabled", self._markdown_enabled),
+        )
+        self._get_qq_stream_state(send_meta)[stream_type] = {
+            "openid": openid,
+            "msg_id": msg_id,
+            "content_type": "markdown" if use_markdown else "text",
+            "stream_msg_id": "",
+            "index": 0,
+            "msg_seq": 0,
+            "sent_text": "",
+            "remain_len": None,
+            "active": False,
+            "failed": False,
+            "url_failed": False,
+            "overflow": False,
+        }
+
+    async def on_streaming_delta(
+        self,
+        request: Any,
+        to_handle: str,
+        event: Any,
+        send_meta: Dict[str, Any],
+        stream_type: str,
+        accumulated_text: str = "",
+    ) -> None:
+        """Replace-mode update of the stream bubble."""
+        state = (send_meta.get("_qq_stream") or {}).get(stream_type)
+        if not state or state["failed"] or state["overflow"]:
+            return
+        display = self._build_stream_display_text(
+            stream_type,
+            accumulated_text,
+        )
+        if state["content_type"] == "text":
+            display, _ = _sanitize_qq_text(display)
+        display = display.strip()
+        if not display or display == state["sent_text"]:
+            return
+        # Prefix guard: replace mode forbids changing delivered text.
+        # Skip this refresh and wait for a stable prefix.
+        if state["sent_text"] and not display.startswith(
+            state["sent_text"],
+        ):
+            return
+        remain = state["remain_len"]
+        if remain is not None and (
+            len(display) - len(state["sent_text"]) > remain
+        ):
+            # Stream budget exhausted: close it here; the tail is
+            # delivered via the normal path in on_streaming_end.
+            await self._send_stream_chunk(
+                state,
+                state["sent_text"],
+                input_state=10,
+            )
+            state["overflow"] = True
+            return
+        await self._send_stream_chunk(state, display, input_state=1)
+
+    async def on_streaming_end(
+        self,
+        request: Any,
+        to_handle: str,
+        event: Any,
+        send_meta: Dict[str, Any],
+        stream_type: str,
+        accumulated_text: str = "",
+    ) -> None:
+        """Finalize the stream; fall back to normal send on failure."""
+        qq_state = send_meta.get("_qq_stream") or {}
+        state = qq_state.pop(stream_type, None)
+        display = self._build_stream_display_text(
+            stream_type,
+            accumulated_text,
+        ).strip()
+
+        if state is None or not state["active"] or state["failed"]:
+            # Stream never established or died mid-way: deliver the
+            # full text via the normal send path so the reply is not
+            # silently lost. URL-rejected streams go plain text so
+            # send() sanitizes instead of dropping a markdown retry.
+            if display:
+                meta = send_meta
+                if state is not None and state["url_failed"]:
+                    meta = {**send_meta, "markdown_enabled": False}
+                await self.send(to_handle, display, meta)
+            return
+
+        # Images cannot ride in the stream; send them separately.
+        image_urls = _IMAGE_TAG_PATTERN.findall(display)
+        final_text = _IMAGE_TAG_PATTERN.sub("", display).strip()
+        if state["content_type"] == "text":
+            final_text, _ = _sanitize_qq_text(final_text)
+            final_text = final_text.strip()
+
+        tail = ""
+        if state["overflow"]:
+            tail = self._stream_tail(state["sent_text"], final_text)
+        else:
+            remain = state["remain_len"]
+            fits = remain is None or (
+                len(final_text) - len(state["sent_text"]) <= remain
+            )
+            prefix_ok = not state["sent_text"] or final_text.startswith(
+                state["sent_text"],
+            )
+            if final_text and fits and prefix_ok:
+                if not await self._send_stream_chunk(
+                    state,
+                    final_text,
+                    input_state=10,
+                ):
+                    tail = self._stream_tail(
+                        state["sent_text"],
+                        final_text,
+                    )
+            else:
+                # Close the stream as-is; deliver the rest normally.
+                await self._send_stream_chunk(
+                    state,
+                    state["sent_text"],
+                    input_state=10,
+                )
+                tail = self._stream_tail(state["sent_text"], final_text)
+
+        if tail.strip():
+            meta = send_meta
+            if state["url_failed"]:
+                meta = {**send_meta, "markdown_enabled": False}
+            await self.send(to_handle, tail.strip(), meta)
+
+        if image_urls:
+            try:
+                token = await self._get_access_token_async()
+            except Exception:
+                logger.exception(
+                    "qq stream: get token for images failed",
+                )
+                return
+            await self._send_images(
+                image_urls,
+                "c2c",
+                state["openid"],
+                state["msg_id"],
+                token,
+                True,
+            )
+
+    async def _send_stream_chunk(
+        self,
+        state: Dict[str, Any],
+        content: str,
+        *,
+        input_state: int,
+    ) -> bool:
+        """Send one chunk, update state and classify failures."""
+        try:
+            token = await self._get_access_token_async()
+        except Exception:
+            logger.exception("qq stream: get access_token failed")
+            state["failed"] = True
+            return False
+        if not state["msg_seq"]:
+            # One msg_seq per stream; chunks are deduped by
+            # stream_msg_id + index (doc keeps msg_seq constant).
+            state["msg_seq"] = _get_next_msg_seq(state["msg_id"])
+        try:
+            resp = await _send_stream_message_async(
+                self._http,
+                token,
+                state["openid"],
+                content=content,
+                input_state=input_state,
+                index=state["index"],
+                stream_msg_id=state["stream_msg_id"],
+                msg_id=state["msg_id"],
+                content_type=state["content_type"],
+                msg_seq=state["msg_seq"],
+            )
+        except Exception as exc:
+            await self._on_stream_chunk_error(state, exc)
+            return False
+        state["index"] += 1
+        state["sent_text"] = content
+        state["active"] = True
+        if not state["stream_msg_id"]:
+            state["stream_msg_id"] = str(resp.get("id") or "")
+        remain = resp.get("remain_msg_len")
+        if isinstance(remain, int):
+            state["remain_len"] = remain
+        return True
+
+    async def _on_stream_chunk_error(
+        self,
+        state: Dict[str, Any],
+        exc: Exception,
+    ) -> None:
+        """Mark the stream failed and close the bubble best-effort.
+
+        The failure is scoped to *state* (this request's send_meta,
+        like wechat's _wechat_token_invalid): only the remaining
+        chunks of the current reply are skipped; concurrent chats
+        and later messages attempt streaming normally.
+        """
+        state["failed"] = True
+        if _is_url_content_error(exc):
+            state["url_failed"] = True
+        logger.warning("qq stream: chunk send failed: %s", exc)
+        if not (state["active"] and state["sent_text"]):
+            return
+        # Close the bubble so it does not hang in generating state.
+        try:
+            token = await self._get_access_token_async()
+            await _send_stream_message_async(
+                self._http,
+                token,
+                state["openid"],
+                content=state["sent_text"],
+                input_state=10,
+                index=state["index"],
+                stream_msg_id=state["stream_msg_id"],
+                msg_id=state["msg_id"],
+                content_type=state["content_type"],
+                msg_seq=state["msg_seq"],
+            )
+        except Exception:
+            logger.debug("qq stream: finalize after failure failed")
 
     # ------------------------------------------------------------------
     # WebSocket: payload dispatch

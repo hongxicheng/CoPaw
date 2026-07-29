@@ -1349,6 +1349,7 @@
     "streamingEnabled": "Streaming Output",
     "streamingEnabledDingtalkHint": "Only effective when message type is Card",
     "streamingEnabledFeishuHint": "Requires enabling cardkit:card:write permission in the Feishu Open Platform permission management page",
+    "streamingEnabledQqHint": "Only effective in QQ direct chats (C2C); group and guild messages are sent normally",
     "ackMessage": "Acknowledgment Message",
     "ackMessageTooltip": "Send an instant reply when a message is received, before agent processing begins. Leave empty to disable.",
     "ackMessagePlaceholder": "⏳ Processing...",

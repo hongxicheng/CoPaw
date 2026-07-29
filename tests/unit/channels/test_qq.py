@@ -2105,3 +2105,595 @@ class TestBuildAgentRequestFromNative:
         }
         qq_channel.build_agent_request_from_native(native)
         qq_channel._parse_qq_attachments.assert_called_once()
+
+
+# =============================================================================
+# Streaming output (C2C stream_messages)
+# =============================================================================
+
+
+@pytest.fixture
+def qq_stream_channel(mock_process_handler, tmp_path) -> Generator:
+    """QQChannel with streaming enabled and a cached token."""
+    from qwenpaw.app.channels.qq.channel import QQChannel
+
+    channel = QQChannel(
+        process=mock_process_handler,
+        enabled=True,
+        app_id="test_app_id",
+        client_secret="test_secret",
+        markdown_enabled=True,
+        media_dir=str(tmp_path / "media"),
+        streaming_enabled=True,
+    )
+    channel._http = MagicMock()
+    channel._token_cache = {
+        "token": "tok",
+        "expires_at": time.time() + 9999,
+    }
+    yield channel
+
+
+def _c2c_meta() -> dict:
+    return {
+        "message_type": "c2c",
+        "message_id": "m1",
+        "sender_id": "u1",
+    }
+
+
+async def _start_stream(channel, meta, stream_type="message"):
+    await channel.on_streaming_start(
+        None,
+        "u1",
+        None,
+        meta,
+        stream_type,
+    )
+    return meta["_qq_stream"][stream_type]
+
+
+class TestSendStreamMessageAsync:
+    """Tests for _send_stream_message_async body construction."""
+
+    @pytest.mark.asyncio
+    @patch("qwenpaw.app.channels.qq.channel._api_request_async")
+    async def test_first_chunk_omits_stream_msg_id(self, mock_api):
+        from qwenpaw.app.channels.qq.channel import (
+            _send_stream_message_async,
+        )
+
+        mock_api.return_value = {"id": "sid"}
+        await _send_stream_message_async(
+            MagicMock(),
+            "tok",
+            "u1",
+            content="Hello",
+            input_state=1,
+            index=0,
+            msg_id="m1",
+            content_type="markdown",
+            msg_seq=1,
+        )
+        path = mock_api.call_args[0][3]
+        body = mock_api.call_args[0][4]
+        assert path == "/v2/users/u1/stream_messages"
+        assert body["input_mode"] == "replace"
+        assert body["input_state"] == 1
+        assert body["index"] == 0
+        assert body["content_raw"] == "Hello"
+        assert body["content_type"] == "markdown"
+        assert body["msg_id"] == "m1"
+        assert "stream_msg_id" not in body
+
+    @pytest.mark.asyncio
+    @patch("qwenpaw.app.channels.qq.channel._api_request_async")
+    async def test_later_chunk_carries_stream_msg_id(self, mock_api):
+        from qwenpaw.app.channels.qq.channel import (
+            _send_stream_message_async,
+        )
+
+        mock_api.return_value = {"id": "sid"}
+        await _send_stream_message_async(
+            MagicMock(),
+            "tok",
+            "u1",
+            content="Hello world",
+            input_state=10,
+            index=2,
+            stream_msg_id="sid",
+            msg_id="m1",
+        )
+        body = mock_api.call_args[0][4]
+        assert body["stream_msg_id"] == "sid"
+        assert body["input_state"] == 10
+        assert body["index"] == 2
+
+
+class TestStreamingStart:
+    """Tests for on_streaming_start gating."""
+
+    @pytest.mark.asyncio
+    async def test_c2c_initializes_state(self, qq_stream_channel):
+        meta = _c2c_meta()
+        state = await _start_stream(qq_stream_channel, meta)
+        assert state["openid"] == "u1"
+        assert state["msg_id"] == "m1"
+        assert state["content_type"] == "markdown"
+        assert state["active"] is False
+
+    @pytest.mark.asyncio
+    async def test_group_is_skipped(self, qq_stream_channel):
+        meta = {
+            "message_type": "group",
+            "message_id": "m1",
+            "sender_id": "u1",
+        }
+        await qq_stream_channel.on_streaming_start(
+            None,
+            "u1",
+            None,
+            meta,
+            "message",
+        )
+        assert "_qq_stream" not in meta
+
+    @pytest.mark.asyncio
+    async def test_missing_msg_id_is_skipped(self, qq_stream_channel):
+        meta = {"message_type": "c2c", "sender_id": "u1"}
+        await qq_stream_channel.on_streaming_start(
+            None,
+            "u1",
+            None,
+            meta,
+            "message",
+        )
+        assert "_qq_stream" not in meta
+
+
+class TestStreamingDelta:
+    """Tests for on_streaming_delta chunk sending."""
+
+    @pytest.mark.asyncio
+    @patch(
+        "qwenpaw.app.channels.qq.channel._send_stream_message_async",
+        new_callable=AsyncMock,
+    )
+    async def test_first_chunk_creates_stream(
+        self,
+        mock_send,
+        qq_stream_channel,
+    ):
+        mock_send.return_value = {"id": "sid", "remain_msg_len": 100}
+        meta = _c2c_meta()
+        state = await _start_stream(qq_stream_channel, meta)
+        await qq_stream_channel.on_streaming_delta(
+            None,
+            "u1",
+            None,
+            meta,
+            "message",
+            accumulated_text="Hello",
+        )
+        kwargs = mock_send.call_args.kwargs
+        assert kwargs["content"] == "Hello"
+        assert kwargs["input_state"] == 1
+        assert kwargs["index"] == 0
+        assert kwargs["stream_msg_id"] == ""
+        assert state["stream_msg_id"] == "sid"
+        assert state["index"] == 1
+        assert state["sent_text"] == "Hello"
+        assert state["remain_len"] == 100
+        assert state["active"] is True
+
+    @pytest.mark.asyncio
+    @patch(
+        "qwenpaw.app.channels.qq.channel._send_stream_message_async",
+        new_callable=AsyncMock,
+    )
+    async def test_replace_full_text_and_index(
+        self,
+        mock_send,
+        qq_stream_channel,
+    ):
+        mock_send.return_value = {"id": "sid"}
+        meta = _c2c_meta()
+        state = await _start_stream(qq_stream_channel, meta)
+        state.update(
+            {
+                "stream_msg_id": "sid",
+                "index": 1,
+                "sent_text": "Hello",
+                "msg_seq": 7,
+                "active": True,
+            },
+        )
+        await qq_stream_channel.on_streaming_delta(
+            None,
+            "u1",
+            None,
+            meta,
+            "message",
+            accumulated_text="Hello world",
+        )
+        kwargs = mock_send.call_args.kwargs
+        assert kwargs["content"] == "Hello world"
+        assert kwargs["index"] == 1
+        assert kwargs["stream_msg_id"] == "sid"
+        assert kwargs["msg_seq"] == 7
+        assert state["index"] == 2
+
+    @pytest.mark.asyncio
+    @patch(
+        "qwenpaw.app.channels.qq.channel._send_stream_message_async",
+        new_callable=AsyncMock,
+    )
+    async def test_prefix_mismatch_skips_refresh(
+        self,
+        mock_send,
+        qq_stream_channel,
+    ):
+        meta = _c2c_meta()
+        state = await _start_stream(qq_stream_channel, meta)
+        state.update({"sent_text": "Hello", "active": True})
+        await qq_stream_channel.on_streaming_delta(
+            None,
+            "u1",
+            None,
+            meta,
+            "message",
+            accumulated_text="Bye",
+        )
+        mock_send.assert_not_called()
+        assert state["failed"] is False
+
+    @pytest.mark.asyncio
+    @patch(
+        "qwenpaw.app.channels.qq.channel._send_stream_message_async",
+        new_callable=AsyncMock,
+    )
+    async def test_text_mode_sanitizes_urls(
+        self,
+        mock_send,
+        qq_stream_channel,
+    ):
+        mock_send.return_value = {"id": "sid"}
+        qq_stream_channel._markdown_enabled = False
+        meta = _c2c_meta()
+        await _start_stream(qq_stream_channel, meta)
+        await qq_stream_channel.on_streaming_delta(
+            None,
+            "u1",
+            None,
+            meta,
+            "message",
+            accumulated_text="see https://example.com ok",
+        )
+        content = mock_send.call_args.kwargs["content"]
+        assert "https://" not in content
+        assert "链接已省略" in content
+
+    @pytest.mark.asyncio
+    @patch(
+        "qwenpaw.app.channels.qq.channel._send_stream_message_async",
+        new_callable=AsyncMock,
+    )
+    async def test_url_error_marks_failed(
+        self,
+        mock_send,
+        qq_stream_channel,
+    ):
+        from qwenpaw.exceptions import QQApiError
+
+        mock_send.side_effect = QQApiError(
+            path="/p",
+            status=400,
+            data={"code": 304003, "message": "不允许包含url"},
+        )
+        meta = _c2c_meta()
+        state = await _start_stream(qq_stream_channel, meta)
+        await qq_stream_channel.on_streaming_delta(
+            None,
+            "u1",
+            None,
+            meta,
+            "message",
+            accumulated_text="http://x.com",
+        )
+        assert state["failed"] is True
+        assert state["url_failed"] is True
+        # later deltas are no-ops
+        mock_send.reset_mock()
+        await qq_stream_channel.on_streaming_delta(
+            None,
+            "u1",
+            None,
+            meta,
+            "message",
+            accumulated_text="http://x.com more",
+        )
+        mock_send.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch(
+        "qwenpaw.app.channels.qq.channel._send_stream_message_async",
+        new_callable=AsyncMock,
+    )
+    async def test_failure_scoped_to_current_reply(
+        self,
+        mock_send,
+        qq_stream_channel,
+    ):
+        """A failed stream skips its own chunks only; other chats
+        and later messages still attempt streaming."""
+        from qwenpaw.exceptions import QQApiError
+
+        mock_send.side_effect = QQApiError(
+            path="/p",
+            status=404,
+            data={},
+        )
+        meta = _c2c_meta()
+        state = await _start_stream(qq_stream_channel, meta)
+        await qq_stream_channel.on_streaming_delta(
+            None,
+            "u1",
+            None,
+            meta,
+            "message",
+            accumulated_text="Hello",
+        )
+        assert state["failed"] is True
+        # a concurrent/later message still initializes streaming
+        meta2 = _c2c_meta()
+        state2 = await _start_stream(qq_stream_channel, meta2)
+        assert state2["failed"] is False
+        mock_send.reset_mock()
+        mock_send.side_effect = None
+        mock_send.return_value = {"id": "sid2"}
+        await qq_stream_channel.on_streaming_delta(
+            None,
+            "u1",
+            None,
+            meta2,
+            "message",
+            accumulated_text="Hi",
+        )
+        assert state2["active"] is True
+
+    @pytest.mark.asyncio
+    @patch(
+        "qwenpaw.app.channels.qq.channel._send_stream_message_async",
+        new_callable=AsyncMock,
+    )
+    async def test_remain_len_overflow_finalizes_early(
+        self,
+        mock_send,
+        qq_stream_channel,
+    ):
+        mock_send.return_value = {"id": "sid"}
+        meta = _c2c_meta()
+        state = await _start_stream(qq_stream_channel, meta)
+        state.update(
+            {
+                "stream_msg_id": "sid",
+                "index": 1,
+                "sent_text": "Hello",
+                "msg_seq": 1,
+                "active": True,
+                "remain_len": 3,
+            },
+        )
+        await qq_stream_channel.on_streaming_delta(
+            None,
+            "u1",
+            None,
+            meta,
+            "message",
+            accumulated_text="Hello world and more",
+        )
+        kwargs = mock_send.call_args.kwargs
+        assert kwargs["input_state"] == 10
+        assert kwargs["content"] == "Hello"
+        assert state["overflow"] is True
+
+
+class TestStreamingEnd:
+    """Tests for on_streaming_end finalize and fallback."""
+
+    @pytest.mark.asyncio
+    @patch(
+        "qwenpaw.app.channels.qq.channel._send_stream_message_async",
+        new_callable=AsyncMock,
+    )
+    async def test_final_chunk_state_10(
+        self,
+        mock_send,
+        qq_stream_channel,
+    ):
+        mock_send.return_value = {"id": "sid"}
+        meta = _c2c_meta()
+        state = await _start_stream(qq_stream_channel, meta)
+        state.update(
+            {
+                "stream_msg_id": "sid",
+                "index": 1,
+                "sent_text": "Hell",
+                "msg_seq": 1,
+                "active": True,
+            },
+        )
+        await qq_stream_channel.on_streaming_end(
+            None,
+            "u1",
+            None,
+            meta,
+            "message",
+            accumulated_text="Hello",
+        )
+        kwargs = mock_send.call_args.kwargs
+        assert kwargs["input_state"] == 10
+        assert kwargs["content"] == "Hello"
+        assert "message" not in meta["_qq_stream"]
+
+    @pytest.mark.asyncio
+    async def test_fallback_when_stream_never_started(
+        self,
+        qq_stream_channel,
+    ):
+        qq_stream_channel.send = AsyncMock()
+        meta = {
+            "message_type": "group",
+            "message_id": "m1",
+            "sender_id": "u1",
+        }
+        await qq_stream_channel.on_streaming_end(
+            None,
+            "u1",
+            None,
+            meta,
+            "message",
+            accumulated_text="Hello",
+        )
+        qq_stream_channel.send.assert_awaited_once()
+        assert qq_stream_channel.send.call_args[0][1] == "Hello"
+
+    @pytest.mark.asyncio
+    async def test_fallback_reasoning_prefix(self, qq_stream_channel):
+        qq_stream_channel.send = AsyncMock()
+        meta = {
+            "message_type": "group",
+            "message_id": "m1",
+            "sender_id": "u1",
+        }
+        await qq_stream_channel.on_streaming_end(
+            None,
+            "u1",
+            None,
+            meta,
+            "reasoning",
+            accumulated_text="thinking",
+        )
+        sent_text = qq_stream_channel.send.call_args[0][1]
+        assert sent_text.startswith("💭")
+
+    @pytest.mark.asyncio
+    async def test_fallback_url_failed_goes_plain(
+        self,
+        qq_stream_channel,
+    ):
+        qq_stream_channel.send = AsyncMock()
+        meta = _c2c_meta()
+        state = await _start_stream(qq_stream_channel, meta)
+        state.update(
+            {
+                "active": True,
+                "failed": True,
+                "url_failed": True,
+                "sent_text": "Hel",
+            },
+        )
+        await qq_stream_channel.on_streaming_end(
+            None,
+            "u1",
+            None,
+            meta,
+            "message",
+            accumulated_text="Hello http://x.com",
+        )
+        send_meta = qq_stream_channel.send.call_args[0][2]
+        assert send_meta["markdown_enabled"] is False
+
+    @pytest.mark.asyncio
+    @patch(
+        "qwenpaw.app.channels.qq.channel._send_stream_message_async",
+        new_callable=AsyncMock,
+    )
+    async def test_overflow_tail_sent_normally(
+        self,
+        mock_send,
+        qq_stream_channel,
+    ):
+        qq_stream_channel.send = AsyncMock()
+        meta = _c2c_meta()
+        state = await _start_stream(qq_stream_channel, meta)
+        state.update(
+            {
+                "stream_msg_id": "sid",
+                "index": 2,
+                "sent_text": "Hello",
+                "msg_seq": 1,
+                "active": True,
+                "overflow": True,
+            },
+        )
+        await qq_stream_channel.on_streaming_end(
+            None,
+            "u1",
+            None,
+            meta,
+            "message",
+            accumulated_text="Hello world",
+        )
+        # stream already closed: no more chunk calls
+        mock_send.assert_not_called()
+        tail = qq_stream_channel.send.call_args[0][1]
+        assert tail == "world"
+
+    @pytest.mark.asyncio
+    @patch(
+        "qwenpaw.app.channels.qq.channel._send_stream_message_async",
+        new_callable=AsyncMock,
+    )
+    async def test_image_tags_stripped_and_sent(
+        self,
+        mock_send,
+        qq_stream_channel,
+    ):
+        mock_send.return_value = {"id": "sid"}
+        qq_stream_channel._send_images = AsyncMock()
+        meta = _c2c_meta()
+        state = await _start_stream(qq_stream_channel, meta)
+        state.update(
+            {
+                "stream_msg_id": "sid",
+                "index": 1,
+                "sent_text": "",
+                "msg_seq": 1,
+                "active": True,
+            },
+        )
+        await qq_stream_channel.on_streaming_end(
+            None,
+            "u1",
+            None,
+            meta,
+            "message",
+            accumulated_text="Hi [Image: http://x/y.png]",
+        )
+        content = mock_send.call_args.kwargs["content"]
+        assert "[Image:" not in content
+        qq_stream_channel._send_images.assert_awaited_once()
+        image_urls = qq_stream_channel._send_images.call_args[0][0]
+        assert image_urls == ["http://x/y.png"]
+
+
+class TestStreamingFromConfig:
+    """from_config must forward streaming_enabled."""
+
+    def test_streaming_enabled_forwarded(self, mock_process_handler):
+        from qwenpaw.app.channels.qq.channel import QQChannel
+
+        class MockConfig:
+            enabled = True
+            app_id = "a"
+            client_secret = "s"
+            bot_prefix = ""
+            markdown_enabled = True
+            streaming_enabled = True
+
+        channel = QQChannel.from_config(
+            process=mock_process_handler,
+            config=MockConfig(),
+        )
+        assert channel.streaming_enabled is True

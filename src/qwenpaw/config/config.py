@@ -290,6 +290,7 @@ class QQConfig(BaseChannelConfig):
     markdown_enabled: bool = True
     max_reconnect_attempts: int = 100
     ack_message: str = ""
+    streaming_enabled: bool = False
 
 
 class OneBotConfig(BaseChannelConfig):

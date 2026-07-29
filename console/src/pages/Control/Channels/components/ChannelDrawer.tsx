@@ -1681,6 +1681,7 @@ export function ChannelDrawer({
             activeKey === "feishu" ||
             activeKey === "discord" ||
             activeKey === "slack" ||
+            activeKey === "qq" ||
             activeKey === "matrix") && (
             <Form.Item
               name="streaming_enabled"
@@ -1691,6 +1692,8 @@ export function ChannelDrawer({
                   ? t("channels.streamingEnabledDingtalkHint")
                   : activeKey === "feishu"
                   ? t("channels.streamingEnabledFeishuHint")
+                  : activeKey === "qq"
+                  ? t("channels.streamingEnabledQqHint")
                   : undefined
               }
             >

@@ -626,6 +626,7 @@
     "toolMaxLengthTooltip": "Atur ke 0 agar tidak dibatasi",
     "showThinking": "Tampilkan Proses Berpikir",
     "showThinkingTooltip": "Tampilkan proses berpikir/penalaran model kepada pengguna (nonaktifkan untuk menyembunyikan)",
+    "streamingEnabledQqHint": "Hanya berlaku di obrolan langsung QQ (C2C); pesan grup dan kanal tetap dikirim secara normal",
     "settings": "Pengaturan",
     "channelSettings": "Pengaturan Saluran",
     "notSet": "Belum diatur",
