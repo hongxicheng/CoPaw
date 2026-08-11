@@ -37,6 +37,47 @@ OnLastDispatch = Optional[Callable[[str, str, str], None]]
 _CHANNEL_QUEUE_MAXSIZE = 1000
 
 
+def _acl_identity_of(payload: Any) -> str:
+    """Return the ACL identity a payload would be judged by.
+
+    Mirrors the preference order in ``BaseChannel._access_control_gate``
+    so grouping and gating never disagree.
+    """
+    if isinstance(payload, dict):
+        return str(
+            payload.get("acl_sender_id") or payload.get("sender_id") or "",
+        )
+    return str(
+        getattr(payload, "acl_sender_id", "")
+        or getattr(payload, "user_id", "")
+        or "",
+    )
+
+
+def _split_batch_by_acl_identity(batch: List[Any]) -> List[List[Any]]:
+    """Split a drained batch into runs that share one ACL identity.
+
+    A shared-session group chat (``share_session_in_group=True``) routes
+    every member to the same queue key, so a drained batch can hold
+    messages from different senders. Merging those would concatenate all
+    senders' content while keeping only the first sender's
+    ``acl_sender_id``, letting one member's message be judged by another
+    member's access-control decision. Grouping first keeps the original
+    intent (merge one sender's rapid-fire messages) without ever merging
+    across senders. Arrival order is preserved.
+    """
+    groups: List[List[Any]] = []
+    current_identity: Optional[str] = None
+    for payload in batch:
+        identity = _acl_identity_of(payload)
+        if groups and identity == current_identity:
+            groups[-1].append(payload)
+        else:
+            groups.append([payload])
+            current_identity = identity
+    return groups
+
+
 async def _process_batch(ch: BaseChannel, batch: List[Any]) -> None:
     """Merge if needed and process one payload (native or request)."""
     if ch.channel == "dingtalk" and batch and ch._is_native_payload(batch[0]):
@@ -416,8 +457,11 @@ class ChannelManager:
                     except asyncio.QueueEmpty:
                         break
 
-                # Process batch (with merge logic)
-                await _process_batch(ch, batch)
+                # Process batch (with merge logic). A shared-session
+                # group chat can put several senders in one queue key, so
+                # never merge across ACL identities.
+                for group in _split_batch_by_acl_identity(batch):
+                    await _process_batch(ch, group)
 
                 # Update processed count
                 if self._queue_manager is not None:
