@@ -60,8 +60,16 @@
   运行对象。接受命中范围由“正在运行”扩大为“已配置”。
 - [x] 环境/依赖校验命令为 `channels verify-env`，不占用 `doctor` 名称；既有
   `qwenpaw doctor`（平台连通性）保持不变。
-- [x] descriptor 声明环境变量透传白名单，`minimal_env` 按白名单构造；仅靠环境变量覆盖
-  端点的 Channel 不得在隔离后静默失效。
+- [x] descriptor 声明环境变量透传白名单，`minimal_env` 按白名单构造；代理
+  （`TELEGRAM_HTTP_PROXY`、`DISCORD_HTTP_PROXY`、`HTTP_PROXY`/`HTTPS_PROXY`）和 TLS
+  （`SSL_CERT_FILE`）等真实部署约束必须能到达 Runner。
+- [x] 平台网关地址注入（Feishu `domain` 的 URL 形态、WeCom/XiaoYi/Yuanbao 的 `ws_url`、
+  QQ 的端点环境变量）是测试 mock 注入点，不是产品功能，不作为兼容目标，也不得为其调整
+  架构实现；失效由测试侧处理。Feishu `domain` 的 `feishu`/`lark` 枚举值除外（ADR-033）。
+- [x] Voice 重构后与 OneBot 一致：自行维护生命周期、监听和平台事件，Core 只处理传过来的
+  数据。Core-owned ingress 是后备选项，只在 Runner-owned 经原型证明不可行时启用。
+- [x] bot 查重两侧都要求 `enabled=true`：提交配置为禁用时跳过检查，比较时只看其他 Agent
+  中已启用的配置段。
 - [x] ACL 身份不得跨发送者合并。Core 已在 merge 前按 ACL 身份切分批次，隔离后 Runner
   逐事件携带 `acl_sender_id`，该不变量必须保持。
 - [x] `media_work_dir` 是新增的 Core 侧解析能力，不是既有实现的搬迁；收敛时保留各
@@ -390,9 +398,9 @@ environment。
 - [ ] 实现协议 FD、日志 FD 和后代句柄白名单。
 - [ ] 实现最小环境变量和一次性 secret pipe/handle 注入；SDK 必须读取环境变量时临时
   设置并在初始化后清除。
-- [ ] 按 descriptor 的透传白名单构造 `minimal_env`，不从 Core 环境无条件继承。验证仅靠
-  环境变量覆盖平台端点的 Channel（QQ 的 `QQ_TOKEN_URL`/`QQ_API_BASE`）在隔离后不静默
-  失效（ADR-030）。
+- [ ] 按 descriptor 的透传白名单构造 `minimal_env`，不从 Core 环境无条件继承，也不把代理
+  和证书变量一并清掉。验证 Telegram/Discord/Slack 的代理变量和 `SSL_CERT_FILE` 在隔离后
+  仍生效（ADR-030）。
 - [ ] 证明 secret value 不进入 JSON-RPC、hello、日志或命令行。
 
 ### G1 Gate
@@ -583,8 +591,10 @@ descriptor，并根据 `process_mode` 返回正确 Channel 实例和驱动接口
   流量路由到 committed active generation，切换窗口暂停新连接准入或返回明确 busy/error。
 - [ ] 确认迁移后 Runner 不直接复用 Core 的 `ProcessHandler`、ChannelManager 或数据库；
   保持 Voice 的 `direct_session` 行为和 ConversationRelay 文本状态机。
-- [ ] 仅当部署边界证明 Runner-owned ingress 不可行时，才按独立 ADR 实现 Core-owned 兼容
-  入口；不得把 Core socket 对象或原始 HTTP/WebSocket 帧传给 Runner。
+- [ ] 目标形态与 OneBot 一致：Voice 自行维护生命周期、监听和平台事件，Core 只处理传过来
+  的数据，不再持有 socket 对象。仅当原型证明 Runner-owned 确实不可行时，才按独立 ADR 启用
+  Core-owned 后备方案；即便如此平台 SDK 仍留在 Runner，不得把 Core socket 对象或原始
+  HTTP/WebSocket 帧传给 Runner。
 - [ ] 验证签名、TwiML、token、ConversationRelay WebSocket 文本消息、断线和旧 generation
   fencing、endpoint 切换、有界背压和结果不明确的发送；不把当前 Voice 标记为 raw media
   pipe 使用者。
@@ -610,8 +620,7 @@ endpoint 切换和故障矩阵达到发布标准；Core-owned 兼容实现仅按
 
 - [ ] 迁移 WeCom、DingTalk、QQ、WeChat 和 Mattermost。
 - [ ] 逐个盘点企业鉴权、token 刷新、群聊/私聊、mention、卡片、媒体和平台限流。
-- [ ] 自定义网关端点逐个处理（Design §14.6）：WeCom 的 `ws_url` 随配置快照进 Runner；
-  QQ 的 `QQ_TOKEN_URL`/`QQ_API_BASE` 仅环境变量，必须进 descriptor 透传白名单；WeChat
+- [ ] 不为 WeCom `ws_url`、QQ 端点环境变量等 mock 注入点做兼容设计（ADR-033）；WeChat
   迁移时解除 §14.5 扫码模块对 `wechat.client` 私有符号的引用。
 - [ ] WeCom 默认 `share_session_in_group=true`，是 ACL 身份不跨发送者合并的主要压力场景，
   必须有针对性回归（ADR-031）。
@@ -628,8 +637,8 @@ endpoint 切换和故障矩阵达到发布标准；Core-owned 兼容实现仅按
 
 - [ ] 评估并迁移 XiaoYi、Yuanbao、iMessage 和 SIP；不适合隔离的必须明确保留
   `process_mode=in_process`。
-- [ ] XiaoYi 的 `ws_url` 会同时关闭备用连接，属地址覆盖之外的拓扑副作用，必须写入行为
-  回归项；Yuanbao 的 `ws_url`/`api_domain` 一并盘点（Design §14.6）。
+- [ ] XiaoYi/Yuanbao 的 `ws_url` 属 mock 注入点，不做兼容设计（ADR-033）；迁移时以官方
+  网关路径为准，不保留其附带的备用连接关闭行为作为回归项。
 - [ ] SIP 与 Voice 同为 `direct_session`，保持当前不经过 Core ACL gate 与 TaskTracker 的
   行为（ADR-026）。
 - [ ] 逐个评估私有 SDK、协议差异、本机权限、系统服务、实时媒体和入口所有权。
@@ -776,6 +785,8 @@ endpoint 切换和故障矩阵达到发布标准；Core-owned 兼容实现仅按
 - [ ] 覆盖现有实现遗漏的内置 Channel 与 Plugin Channel；descriptor 未声明该字段表示
   “不参与查重”，与漏配区分并可被校验发现。
 - [ ] 保持告警式语义：命中不阻塞保存也不阻塞启动，Console 仍可选择继续。
+- [ ] 两侧都要求 `enabled=true`：提交配置为禁用时跳过检查（沿用现有行为），比较时只看
+  其他 Agent 中已启用的配置段，取代现有存活探测。禁用配置不参与，不产生无意义告警。
 - [ ] 响应附带对方的 enabled/instance 状态，使 Console 能区分“已配置”与“正在运行”两种
   文案；状态取自 Core 侧 instance 注册信息，不反射其他 Agent 的对象。
 - [ ] 保持 secret 不回显：响应只含 `agent_id` 和 Agent 名称，不含身份字段值；沿用现有

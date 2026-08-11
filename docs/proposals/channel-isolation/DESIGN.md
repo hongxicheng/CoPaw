@@ -3,8 +3,7 @@
 ## 1. 文档信息
 
 - 状态：重新设计，已按 main 最新代码复核，待实施
-- 基线代码：`main`（2026-08-11），复核覆盖 bot 身份查重、自定义网关端点、OneBot 重构
-  与 Voice 入口现状
+- 基线代码：`main`（2026-08-11），复核覆盖 bot 身份查重、OneBot 重构与 Voice 入口现状
 - 范围：QwenPaw Channel，包括官方内置 Channel 和第三方 Channel 插件兼容路径
 - 目标：在不破坏现有 Core Channel 与 legacy Plugin Channel 行为的前提下，隔离
   第三方 SDK、连接、状态和故障域
@@ -52,7 +51,7 @@ per-channel 硬编码表中（见 §11.1），且部分信息只能通过 import
 - [ ] 冻结 Channel 来源、进程位置及其对应的驱动接口规则
 - [ ] 冻结扫码/设备码登录保留在 Core 的例外边界及其依赖约束
 - [ ] 冻结 bot 身份查重的 descriptor 字段和 config 级比较规则
-- [ ] 冻结自定义网关端点的 Runner 边界和环境变量透传白名单
+- [ ] 冻结环境变量透传白名单的范围（代理、TLS）和 mock 注入点的排除边界
 - [ ] 完成 per-channel 硬编码表到 descriptor 的收敛清单
 - [ ] 完成飞书、OneBot、Voice/Twilio 三条纵向原型
 - [ ] 完成 Windows、Linux、macOS 和 frozen desktop 验证
@@ -615,6 +614,18 @@ Voice 当前恰好相反，**入口完全由 Core 持有**：
 的既有实现**；Runner-owned 才是需要新建的目标。CH-4-003 的完成定义必须显式包含删除
 `routers/voice.py` 的三条路由及其在 Core app 上的挂载，并从 Core 默认依赖中移除
 `twilio`；只要这些还在 Core，就不能声称 Voice 已完成隔离。
+
+重构后的 Voice 目标形态与 OneBot 一致：**Voice 自己维护自己的生命周期、监听和平台事件，
+Core 只处理传过来的数据，和其他 Channel 一样。** Voice 不是需要特殊对待的 Channel，它
+现在看起来特殊只是历史实现的结果。具体说，Runner 侧持有 Webhook 与 ConversationRelay
+的监听、签名校验、TwiML、一次性 token 的 mint 与 validate、tunnel 生命周期和
+ConversationRelay 状态机；Core 侧只通过 `event.batch` 收稳定事件、通过 `channel.send`
+回出站操作，不接触原始 HTTP body、headers 或 WebSocket 帧，也不再持有 socket 对象。
+
+Core-owned ingress 只在 Runner-owned 经原型证明确实无法成立时才启用，属于后备选项而非
+并列方案。若走到那一步，必须有独立 ADR，并单独冻结最小 DTO、顺序、背压、关闭和
+generation fencing；即便如此，平台 SDK 仍必须留在 Runner，Core socket 对象不得跨进程
+传递。
 
 这里还有一个依赖声明问题需要在 lock 阶段解决：`fastapi` 和 `aiohttp` 目前都**不是**
 `pyproject.toml` 中声明的直接依赖，而是传递依赖。Voice Runner 若继续以 FastAPI 语义实现
@@ -1205,9 +1216,22 @@ Core 已有“同一个 bot 被多个 Agent 使用”的查重能力：Console �
 - **secret 不出响应体。** 查重只返回命中的 `agent_id` 和 Agent 名称，不回显身份字段值本身；
   现有实现已有对应回归测试，隔离后必须保持。
 
+**`enabled` 的判定规则**：两侧都要求 `enabled=true` 才参与查重。
+
+- 被保存的一侧：若提交的配置 `enabled=false`，直接跳过检查。这与当前实现一致
+  （现有接口在 `enabled` 为假时立即返回 `conflict=false`），保留即可。理由是禁用的
+  Channel 不会连接平台，不构成实际冲突；用户之后把它启用时会再次经过保存流程，那时
+  才需要告警。
+- 被比较的一侧：只比较其他 Agent 中 `enabled=true` 的 `channels.<key>` 配置段。这一点
+  取代了现有的存活探测，且与现有效果等价——`ChannelManager` 只启动 `enabled` 的
+  Channel，所以“存在活跃实例”本身就已隐含 `enabled=true`。
+
+因此这次改动只把“是否正在运行”换成“是否已启用”，不改变 `enabled` 语义本身。禁用的
+配置两侧都不参与，不会因为改成 config 级比较而产生一批无意义告警。
+
 这带来一处需要接受的语义变化：去掉存活过滤后，命中范围从“对方正在运行”扩大为“对方已
-配置”。这个方向是更正确的，因为配置冲突在对方启动的那一刻就会实际发生，提前告警比启动
-后才暴露更有价值；同时也修掉了现有实现的一个盲区——只有已加载的 Agent 才可见，未启动的
+配置且已启用”。这个方向是更正确的，因为配置冲突在对方启动的那一刻就会实际发生，提前告警比启动
+后才暴露更有价值；同时也修掉了现有实现的一个盲区：只有已加载的 Agent 才可见，未启动的
 Agent 即使配了同一个 bot 也不会被发现。为了让文案准确，响应中应附带对方的
 enabled/instance 状态，由 Console 区分“已配置”和“正在运行”两种措辞。该状态取自 Core 侧的
 instance 注册信息（§14.3 的 `instance_status`），不是反射其他 Agent 的对象。
@@ -1240,37 +1264,29 @@ Core，作为“Core 不承载平台逻辑”这条原则的显式例外。**
 Catalog 与 Console 的 Channel 存在性、状态和配置表单仍以 descriptor 为准；扫码登录只是
 配置阶段的辅助入口，不构成第二套 Channel 事实来源。
 
-### 14.6 自定义网关端点
+### 14.6 环境变量透传白名单
 
-部分 Channel 支持把平台网关指向非官方地址，主要用于测试和自建网关。字段并不统一，
-迁移时必须逐个处理：
+`minimal_env` 原则上只包含 Runner 启动必需的变量（§6.4）。但有一类环境变量是 Channel
+真实功能所依赖的，隔离后必须能够到达 Runner，否则属于功能回归：
 
-| Channel | 字段 | 形态 |
-| --- | --- | --- |
-| Feishu | `domain` | 配置字段，取 `feishu`、`lark` 或完整 base URL |
-| WeCom | `ws_url` | 配置字段 |
-| XiaoYi | `ws_url` | 配置字段 |
-| Yuanbao | `ws_url`、`api_domain` | 配置字段 |
-| QQ | `QQ_TOKEN_URL`、`QQ_API_BASE` | **仅环境变量**，无配置字段 |
+- 代理：`TELEGRAM_HTTP_PROXY`、`TELEGRAM_HTTP_PROXY_AUTH`、`DISCORD_HTTP_PROXY`、
+  `DISCORD_HTTP_PROXY_AUTH`，以及 Slack 使用的通用 `HTTP_PROXY`/`HTTPS_PROXY`；
+- TLS：`SSL_CERT_FILE` 等证书路径变量。
 
-绝大多数情况下这只是一个在 SDK 初始化时消费的配置字符串，天然属于 Runner，随配置快照
-传入即可，Core 无需感知。但有三处例外必须在设计层记录：
+这些是部署环境的真实约束（例如国内访问 Telegram/Discord 依赖代理），不是可选装饰。
+因此 descriptor 必须支持声明**环境变量透传白名单**，`minimal_env` 按白名单构造：既不
+从 Core 进程环境无条件继承，也不因为“最小化”而把代理和证书配置一并清掉。白名单是
+descriptor 的一部分，逐 Channel 声明并可审计。
 
-1. **QQ 的覆盖只走环境变量。** 这与 §6.4 的“清除未声明的环境变量”和 RunnerSpec 的
-   `minimal_env` 直接冲突：若不显式透传，QQ 的端点覆盖会在隔离后静默失效。因此 descriptor
-   必须支持声明**环境变量透传白名单**，`minimal_env` 按该白名单构造。白名单是 descriptor
-   的一部分，不允许从 Core 进程环境无条件继承。
-2. **Feishu 的 `domain` 同时被 Core 消费。** §14.5 的扫码登录会读取它以选择
-   accounts 域名，而当前实现只识别 `feishu`/`lark` 两个枚举值，遇到自定义 URL 会回落到官方
-   Feishu accounts 域名。这意味着自定义网关下扫码流程会指向错误的域，属于现存缺陷。
-   迁移 Feishu 时必须一并明确该字段在 Core 与 Runner 两侧的解释规则，不能假设“端点配置只
-   属于 Runner”。
-3. **XiaoYi 的 `ws_url` 附带拓扑副作用。** 设置该字段会同时关闭备用连接，因此它不只是
-   地址覆盖，还改变连接数和容灾行为。迁移 XiaoYi 时必须把这一点写入行为回归项。
+需要明确排除的一类：仓库中还存在若干把平台网关指向非官方地址的开关（Feishu `domain`
+接受完整 URL、WeCom/XiaoYi/Yuanbao 的 `ws_url`、QQ 的 `QQ_TOKEN_URL`/`QQ_API_BASE`）。
+这些是测试为方便 mock 而加入的注入点，**不是 Channel 的产品功能，也不是本设计的兼容
+目标**。不得为保住这些注入路径而调整架构实现、协议 DTO 或 descriptor 字段。隔离过程中
+若某条 mock 路径失效，由测试侧自行调整，不计入 Channel 迁移的行为回归项。
 
-这些字段目前几乎没有校验：只有 Feishu 的 `domain` 校验 `http(s)://` 前缀，三个 `ws_url`
-没有 scheme 校验、没有 allowlist、也不做尾斜杠归一。隔离本身不修复这一点，但 descriptor
-的配置字段声明应为它们预留校验位置，避免把未校验的地址直接交给 Runner 的 SDK 初始化。
+Feishu 的 `domain` 需要单独区分：`feishu` 与 `lark` 两个枚举值是真实产品能力（国内版与
+国际版），必须保留，且 §14.5 的扫码登录在 Core 侧同样需要读取它来选择 accounts 域名；
+被放宽为接受任意 URL 的那部分才属于上述 mock 注入，不予兼容。
 
 ## 15. 安全边界
 
@@ -1328,8 +1344,8 @@ Console Channel 是 Core 内部控制面入口，明确保留 `process_mode=in_p
 2. 明确 ingress owner、`process_mode`、capability、checkpoint 和 secret 边界；
 3. 建立静态 descriptor、lock/manifest、Runner entrypoint 和 Core proxy 映射；
 3.1 从 §11.1 的硬编码表中移除该 Channel 的条目，并补齐 descriptor 的
-   `bot_identity_fields` 与环境变量透传白名单；该 Channel 若涉及自定义网关端点或扫码
-   登录，按 §14.5、§14.6 逐条确认边界；
+   `bot_identity_fields` 与环境变量透传白名单；该 Channel 若涉及扫码登录或 mock 注入点，
+   按 §14.5、§14.6 逐条确认边界；
 4. 保持 `BaseChannel` 外部 contract，包括 ACL 的 `acl_sender_id`、session、群聊/私聊、
    `uses_manager_queue`/dispatch、mention、streaming、approval、卡片、媒体、
    typing/reaction 和主动发送中实际支持的项；
@@ -1381,7 +1397,8 @@ Console Channel 是 Core 内部控制面入口，明确保留 `process_mode=in_p
   窗口发言时，各自按自身身份判定，通过测试；
 - bot 身份查重不访问其他 Agent 的运行对象，未启动 Agent 的配置冲突同样可被发现，且响应
   不回显身份字段值；
-- 环境变量透传白名单生效：仅靠环境变量覆盖端点的 Channel（QQ）在隔离后行为不变；
+- 环境变量透传白名单生效：Telegram/Discord/Slack 的代理变量和 `SSL_CERT_FILE` 在隔离后
+  仍然生效；
 - `channels verify-env` 不产生网络 I/O，与 `qwenpaw doctor` 的平台连通性结果互不混淆；
 - 各 Channel 入站落盘目录与迁移前一致，包含各自的默认子目录；
 - 所有相关 Python 单测通过率 100%，改动文件通过 pre-commit。
@@ -1435,6 +1452,7 @@ Core Channel、runner-process Channel 和 legacy Plugin Channel 混合运行、�
 | ADR-027 | 扫码/设备码登录保留在 Core，作为显式且有界的例外；不得导入平台 SDK，也不得引用 Channel 内部符号 | 已确认 |
 | ADR-028 | bot 身份查重改为 config 级比较，身份字段由 descriptor 声明；不访问其他 Agent 的运行对象，命中范围由“正在运行”扩大为“已配置” | 已确认 |
 | ADR-029 | 环境/依赖校验命令命名为 `channels verify-env`，与既有平台连通性 `qwenpaw doctor` 并存且语义分离 | 已确认 |
-| ADR-030 | descriptor 声明环境变量透传白名单；`minimal_env` 按白名单构造，不从 Core 环境无条件继承 | 已确认 |
+| ADR-030 | descriptor 声明环境变量透传白名单，用于代理和 TLS 等真实部署约束；`minimal_env` 按白名单构造，既不无条件继承 Core 环境，也不清掉这些变量 | 已确认 |
 | ADR-031 | ACL 身份不得跨发送者合并；Core 在 merge 前按 ACL 身份切分批次，隔离后 Runner 逐事件携带 `acl_sender_id` | 已确认 |
 | ADR-032 | `media_work_dir` 是新增的 Core 侧解析能力，不是既有实现的迁移；收敛时保留各 Channel 现有默认子目录 | 已确认 |
+| ADR-033 | 平台网关地址注入（Feishu `domain` 的 URL 形态、WeCom/XiaoYi/Yuanbao 的 `ws_url`、QQ 的端点环境变量）是测试 mock 注入点，不是产品功能，不作为兼容目标；失效由测试侧处理。Feishu `domain` 的 `feishu`/`lark` 枚举值除外，属真实能力 | 已确认 |
