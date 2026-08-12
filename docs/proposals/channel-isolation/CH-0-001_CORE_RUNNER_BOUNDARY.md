@@ -8,7 +8,7 @@
 
 ## 1. 范围和决策引用
 
-本文件落实 `DESIGN.md` §1.1、§4、§4.1、§4.3、§5.1--§5.3、§8.3--§8.4、
+本文件落实 `DESIGN.md` §1.1、§4、§4.1、§4.3、§5.1--§5.3、§7.3、§8.3--§8.4、
 §9.1、§11--§11.1、§12.1、§14.1--§14.2、§16 和 §17 中与
 Core/Runner 边界直接相关的内容。适用 ADR 为 ADR-004、ADR-011、ADR-013、
 ADR-014、ADR-018、ADR-021、ADR-022、ADR-023、ADR-024、ADR-025、ADR-026、
@@ -25,7 +25,7 @@ ADR-031 和 ADR-034。ADR-032 已被 ADR-034 替代，本任务不采用 ADR-032
 | --- | --- | --- |
 | 配置和密钥 | 读取 schema、权限策略和 secret 引用；生成快照 | 只消费受控快照和 secret handle；不保存 Core 配置对象 |
 | 入站事件 | 持久化 Inbox、去重、ACK、session、debounce、队列和 AgentRequest | 连接平台、解析原生事件，逐事件产生稳定 DTO |
-| ACL | 计算 `acl_sender_id`、执行 ACL gate、处理 approval | 原样携带真实发送者的 `acl_sender_id`，不合并发送者 |
+| ACL | 校验、保留和持久化 `acl_sender_id`，按身份分批并执行 ACL gate、处理 approval | 从平台原生事件提取稳定的真实发送者身份，逐事件写入 `acl_sender_id`，不合并发送者 |
 | Agent 编排 | AgentRequest/Event、TaskTracker、Workspace、streaming 聚合和 usage | 不导入 Agent、Workspace、TaskTracker 或数据库 |
 | 渲染语义 | 平台无关 ContentParts、fallback 文本和出站目标解析 | 将平台无关 DTO 编码为平台文本、卡片、媒体、typing 和 reaction |
 | Approval | 状态、决策和统一策略属于 Core | 仅解析平台按钮回调并调用平台 API 呈现结果 |
@@ -94,21 +94,21 @@ Core 语义和 Runner 平台操作各保留一半，`Compatibility` 表示只为
 | `_consume_one_request` | async/protected | Core | Host consumer | ACL、Workspace、Agent 调度 |
 | `_run_process_loop` | async/protected | Core | Host consumer | Agent process loop |
 | `_get_response_error_message` | sync/protected | Core | Host helper | Agent 错误语义 |
-| `_before_consume_process` | async/protected | Core | Host hook | Agent 调度前 hook |
-| `on_event_content` | async/public | Core | Host hook | Event 内容消费 |
+| `_before_consume_process` | async/protected | Split | Host lifecycle + Driver effect | Core 保留调用时机；平台预处理在 Runner |
+| `on_event_content` | async/public | Split | Host dispatch + Driver render | Core 保留 Event/fallback；平台发送在 Runner |
 | `_get_stream_flush_meta` | sync/protected | Core | Host helper | streaming meta |
 | `_safe_streaming_delta` | async/protected | Core | Host helper | streaming 安全处理 |
-| `on_streaming_start` | async/public | Core | Host hook | streaming 公开 hook |
-| `on_streaming_delta` | async/public | Core | Host hook | streaming 公开 hook |
-| `on_streaming_end` | async/public | Core | Host hook | streaming 公开 hook |
-| `on_event_message_completed` | async/public | Core | Host hook | completed message |
+| `on_streaming_start` | async/public | Split | Host lifecycle + Driver effect | Core 保留时机；平台卡片/typing/reaction 在 Runner |
+| `on_streaming_delta` | async/public | Split | Host lifecycle + Driver effect | Core 保留聚合；平台消息更新在 Runner |
+| `on_streaming_end` | async/public | Split | Host lifecycle + Driver effect | Core 保留收束；平台状态恢复在 Runner |
+| `on_event_message_completed` | async/public | Split | Host fallback + Driver render | Core 保留 fallback；平台卡片/发送在 Runner |
 | `on_event_response` | async/public | Core | Host hook | Agent response |
-| `_on_process_completed` | async/protected | Core | Host hook | process 完成 |
+| `_on_process_completed` | async/protected | Split | Host lifecycle + Driver effect | Core 保留完成语义；平台清理在 Runner |
 | `_finish_response_cycle` | async/protected | Core | Host helper | response cycle |
 | `_clear_session_turn_usage` | sync/protected | Core | Host state | usage 清理 |
 | `_commit_turn_usage` | async/protected | Core | Host state | usage 提交 |
 | `_on_turn_usage_ready` | sync/protected | Core | Host hook | usage 回调 |
-| `_on_consume_error` | async/protected | Core | Host error path | 错误归一化 |
+| `_on_consume_error` | async/protected | Split | Host error path + Driver effect | Core 归一化错误；平台清理/提示在 Runner |
 | `send_response` | async/public | Split | `channel.send` + Host ledger | 响应语义与平台发送 |
 | `_message_to_content_parts` | sync/protected | Core | Host mapper | 平台无关 ContentParts |
 | `send_message_content` | async/public | Split | `channel.send` + Host ledger | 文本/卡片语义与发送 |
@@ -131,6 +131,39 @@ Core 语义和 Runner 平台操作各保留一半，`Compatibility` 表示只为
 `uses_manager_queue=False`，所以 direct session 继续绕过 manager queue、ACL gate 和
 TaskTracker；其它 16 个 registry key 使用 manager queue 的现有路径。
 
+上述 `Split` hook 冻结的是两侧语义，不是把现有 Python override 跨进程调用。Core
+保留 Base hook 的调用时机、Event 编排、fallback、approval、usage 和错误生命周期；
+Runner 接收平台无关操作 DTO，执行 SDK 调用、卡片创建/更新、typing、reaction、消息
+更新和平台状态恢复。`_safe_streaming_delta`、`_get_stream_flush_meta` 和
+`_finish_response_cycle` 等没有平台副作用的编排继续留在 Core。Console 的
+`_on_turn_usage_ready` 是 in-process Core 兼容行为。
+
+当前 builtin 和 legacy reference 的相关 override 基线如下。`none` 表示该类依赖
+BaseChannel fallback；清单用于后续迁移时保留已有平台行为，不要求无 override 的 Channel
+新增 hook。
+
+| channel_key | relevant hook overrides |
+| --- | --- |
+| `imessage` | `_on_consume_error` |
+| `discord` | `_before_consume_process`, `_on_consume_error`, `_on_process_completed`, `on_streaming_start`, `on_streaming_delta`, `on_streaming_end` |
+| `dingtalk` | `_before_consume_process`, `_on_consume_error`, `_on_process_completed`, `on_event_message_completed`, `on_streaming_start`, `on_streaming_delta`, `on_streaming_end` |
+| `feishu` | `_before_consume_process`, `_on_process_completed`, `on_event_message_completed`, `on_streaming_start`, `on_streaming_delta`, `on_streaming_end` |
+| `qq` | `on_event_message_completed` |
+| `telegram` | `_before_consume_process`, `_on_consume_error`, `_on_process_completed`, `on_event_message_completed`, `on_streaming_start`, `on_streaming_delta`, `on_streaming_end` |
+| `mattermost` | none |
+| `mqtt` | none |
+| `console` | `_on_turn_usage_ready` |
+| `matrix` | `on_streaming_start`, `on_streaming_delta`, `on_streaming_end` |
+| `slack` | `on_streaming_start`, `on_streaming_delta`, `on_streaming_end` |
+| `voice` | none |
+| `sip` | none |
+| `wecom` | `_before_consume_process`, `on_event_message_completed`, `on_streaming_start`, `on_streaming_delta`, `on_streaming_end` |
+| `xiaoyi` | `_on_process_completed`, `on_event_message_completed` |
+| `yuanbao` | `_before_consume_process`, `_on_consume_error`, `_on_process_completed` |
+| `wechat` | `_on_consume_error`, `_on_process_completed` |
+| `onebot` | none |
+| `azure_bot` | none |
+
 ## 4. 三个语义接口
 
 本节只冻结调用面，不新增实现类。所有 Runner 参数和返回值都是版本化 JSON DTO；
@@ -151,20 +184,49 @@ Future、loop、socket 和平台 SDK 对象不得出现在 Runner 方法签名�
 
 ### ChannelDriver（Runner）
 
-| operation | wire input | wire output | owner |
-| --- | --- | --- | --- |
-| `prepare` | config snapshot JSON, host context JSON | result JSON | Runner |
-| `activate` | generation + lease JSON | status JSON | Runner |
-| `commit` | generation + lease JSON | status JSON | Runner |
-| `event_batch` | inbound event DTO array | ACK DTO array | Runner/Core |
-| `send` | outbound operation DTO | delivery result DTO | Runner |
-| `health` | health request JSON | health result JSON | Runner |
-| `checkpoint` | checkpoint command JSON | checkpoint DTO JSON | Runner |
-| `stop` | stop command JSON | stopped status JSON | Runner |
+`ChannelDriver` 是 Runner 内部语义接口，不是 wire API，也不定义协议 method 名或
+payload schema。它可以在进程内使用平台原生 Python 对象，但 Core 只能通过
+`DESIGN.md` §7.3 的规范 RPC 与 Runner 交互；跨边界值只包含由协议 schema 校验的
+strings、numbers、booleans、null、arrays 和 objects。
 
-The `ChannelDriver` may use platform-native Python objects internally, but none cross the
-boundary. Its wire input/output consists only of strings, numbers, booleans, null, arrays and
-objects validated by the protocol schema.
+| internal operation | semantic input | semantic output | owner |
+| --- | --- | --- | --- |
+| prepare/activate/commit | validated lifecycle DTO | internal status DTO | Runner |
+| ingest | platform-native event | stable inbound event DTO | Runner |
+| send/typing/reaction | platform-independent operation DTO | internal delivery DTO | Runner |
+| health/quiesce/stop | validated lifecycle DTO | internal status/checkpoint DTO | Runner |
+| state | checkpoint value | JSON-compatible state value | Runner/Host API |
+
+完整 wire 映射如下；方法集合必须以 Design §7.3 为准，Driver 内部 operation 可以合并或
+拆分，但不能增加协议方法。
+
+| canonical RPC | direction | Driver / Host relation |
+| --- | --- | --- |
+| `runner.hello` | Runner -> Core request | Runner bootstrap identity and capabilities；非 Driver wire method |
+| `channel.prepare` | Core -> Runner request | validate context, initialize Driver and import checkpoint |
+| `channel.activate` | Core -> Runner request | grant provisional generation lease |
+| `channel.commit` | Core -> Runner request | commit the active Driver generation |
+| `channel.lease_renew` | Core -> Runner request | renew Driver generation lease |
+| `channel.generation_status` | Either side request | report or query generation state |
+| `channel.quiesce` | Core -> Runner request | stop admission, drain and export Driver checkpoint |
+| `channel.health` | Core -> Runner request | invoke Driver platform probe |
+| `channel.stop` | Core -> Runner request | stop Driver lifecycle and resources |
+| `channel.send` | Core -> Runner request | invoke Driver outbound operation |
+| `channel.typing` | Core -> Runner request, optional | invoke optional Driver typing operation |
+| `channel.reaction` | Core -> Runner request, optional | invoke optional Driver reaction operation |
+| `ingress.endpoint.register` | Runner -> Core request, optional | publish Runner-owned ingress readiness |
+| `ingress.endpoint.update` | Runner -> Core request, optional | update Runner-owned ingress endpoint state |
+| `ingress.endpoint.unregister` | Runner -> Core request, optional | withdraw Runner-owned ingress endpoint |
+| `event.batch` | Runner -> Core request | deliver stable Driver event DTOs to Host |
+| `delivery.update` | Runner -> Core request | update Host delivery ledger |
+| `host.state.get` | Runner -> Core request | read bounded instance state through Host API |
+| `host.state.put` | Runner -> Core request | persist bounded instance state through Host API |
+| `host.state.delete` | Runner -> Core request | delete bounded instance state through Host API |
+| `request.cancel` | Either side notification | cancel an in-flight protocol request |
+
+Checkpoint import/export is a Driver internal platform capability used during
+`channel.prepare` and `channel.quiesce`; durable checkpoint values use `host.state.*`. There is
+no separate `checkpoint` wire method.
 
 ### IsolatedChannelProxy（Core）
 
@@ -191,22 +253,51 @@ The proxy never exposes a raw `Workspace`, `Event`, socket, Future or SDK object
 | `conversation_id` / `message_id` | JSON scalar in controlled meta | preserve only when used by a Channel |
 | DingTalk `session_webhook` fields | JSON string/number | real usage is serializable and remains allowed |
 
-ACL mapping is explicit: each Runner event carries `acl_sender_id` for the real sender;
-Core maps `sender_name` to the existing `meta["user_name"]` compatibility key. Core performs
-debounce and merge only within one ACL identity and never combines two senders in one merged
+ACL mapping is explicit: Runner extracts the stable real sender identity from each platform-native
+event and writes it to that event DTO as `acl_sender_id`; it must not substitute a display name,
+shared session id or presentation id. Core validates, preserves and persists that field, maps
+`sender_name` to the existing `meta["user_name"]` compatibility key, groups batches by ACL
+identity and executes the ACL gate. Core never reconstructs `acl_sender_id` from display fields.
+Debounce and merge occur only within one ACL identity and never combine two senders in one merged
 payload, even when a group shares a session.
 
 ## 6. `media_work_dir` and inbound media modes
 
-The effective directory is frozen by ADR-034:
+The effective directory is frozen by ADR-034. `WORKING_DIR` and `workspace_dir` below are
+host-native absolute paths supplied by Core; neither Core cwd nor Runner cwd participates:
 
 ```text
-from_config: config.media_dir -> workspace_dir / "media" -> WORKING_DIR / "media"
-from_env:    <CHANNEL>_MEDIA_DIR -> WORKING_DIR / "media"
+from_config:
+  explicit config.media_dir -> expanduser -> if relative, workspace_dir else WORKING_DIR
+  unset config.media_dir     -> workspace_dir / "media" else WORKING_DIR / "media"
+from_env:
+  explicit <CHANNEL>_MEDIA_DIR -> expanduser -> if relative, WORKING_DIR
+  unset <CHANNEL>_MEDIA_DIR     -> WORKING_DIR / "media"
 ```
 
-Core performs this resolution, converts relative values using the Agent workspace rule, creates
-the directory when required, and passes the resulting absolute path as `host_context.media_work_dir`.
+For `from_config`, Core first applies host-native `expanduser` to an explicit `config.media_dir`;
+an absolute result remains absolute, while a relative result is joined to the absolute
+`workspace_dir`. If that entry has no workspace, the deterministic compatibility base is the
+absolute `WORKING_DIR`. When `config.media_dir` is unset, Core selects `workspace_dir / "media"`
+or, without a workspace, `WORKING_DIR / "media"`.
+
+For `from_env`, Core applies host-native `expanduser` to an explicit
+`<CHANNEL>_MEDIA_DIR`; an absolute result remains absolute and a relative result is joined to the
+absolute `WORKING_DIR`. An unset value resolves to `WORKING_DIR / "media"`. Core then performs
+host-native normalization/absolute conversion, creates the directory when required, and passes
+the final string as `host_context.media_work_dir`. Windows drive and UNC paths and POSIX absolute
+paths keep their host-native absolute semantics; `~` is expanded before the absolute/relative
+test. For example:
+
+| entry | host inputs | effective path |
+| --- | --- | --- |
+| `from_config`, `media_dir="attachments"` | POSIX `workspace_dir=/srv/agent-a` | `/srv/agent-a/attachments` |
+| `from_config`, `media_dir="attachments"`, no workspace | POSIX `WORKING_DIR=/var/lib/qwenpaw` | `/var/lib/qwenpaw/attachments` |
+| `from_config`, `media_dir="~/paw-media"` | POSIX home `/home/alice` | `/home/alice/paw-media` |
+| `from_env`, `SLACK_MEDIA_DIR="downloads"` | Windows `WORKING_DIR=C:\\QwenPaw` | `C:\\QwenPaw\\downloads` |
+| `from_env`, `SLACK_MEDIA_DIR="D:\\paw-media"` | Windows | `D:\\paw-media` |
+| `from_env`, unset | POSIX `WORKING_DIR=/var/lib/qwenpaw` | `/var/lib/qwenpaw/media` |
+
 The final directory is flat: Runner and Channel code must not append a Channel subdirectory.
 The directory is for inbound downloads only; it is not an outbound path allowlist. Existing
 download, naming, overwrite and cleanup behavior remains unchanged. This task records the rule
@@ -218,18 +309,18 @@ only; the parser belongs to `CH-2-004`.
 | `discord` |落盘 | effective directory | none |
 | `dingtalk` |落盘 | effective directory | none |
 | `feishu` |落盘 | effective directory | none |
-| `qq` |落盘 | effective directory | config field and env passthrough incomplete |
-| `telegram` |落盘 | effective directory | config field and env passthrough incomplete |
+| `qq` |落盘 | effective directory | `config schema`; `from_env` |
+| `telegram` |落盘 | effective directory | `config schema`; `from_config`; `from_env` |
 | `mattermost` |落盘 | effective directory | none |
 | `mqtt` |不提供 | not applicable | no inbound media directory |
 | `console` | not in contract | no inbound directory requirement | directory is console-specific |
-| `matrix` |落盘 | effective directory | config/constructor/env chain incomplete |
-| `slack` |落盘 | effective directory | `SLACK_MEDIA_DIR` env passthrough incomplete |
+| `matrix` |落盘 | effective directory | `config schema`; `constructor`; `from_config`; `from_env` |
+| `slack` |落盘 | effective directory | `from_env` |
 | `voice` |不提供 | not applicable | text ingress; no v1 media pipe |
 | `sip` |不提供 | not applicable | no inbound media directory |
 | `wecom` |落盘 | effective directory | none |
-| `xiaoyi` |落盘 | effective directory | config field incomplete; env exists |
-| `yuanbao` |落盘 | effective directory | `YUANBAO_MEDIA_DIR` env passthrough incomplete |
+| `xiaoyi` |落盘 | effective directory | `config schema` |
+| `yuanbao` |落盘 | effective directory | `from_env` |
 | `wechat` |落盘 | effective directory | none |
 | `onebot` |定位符直传 | no forced directory | platform locator formats stay in Runner |
 
@@ -282,4 +373,3 @@ stdio framing, JSON-RPC, process/environment management, checkpoint persistence,
 Runner-owned Voice ingress, or any individual Channel migration. It records the configuration
 gaps for QQ, Telegram, Matrix, XiaoYi, Slack and Yuanbao for later tasks; it does not repair them.
 The three dead merge-meta keys are recorded but not deleted. ADR-032 is not used.
-
