@@ -603,12 +603,12 @@ def test_boundary_invariants_and_media_rules_are_explicit() -> None:
     assert "ADR-034" in text
     assert "ADR-032 is not used" in text
     assert "parser belongs to `CH-2-004`" in text
-    assert "`[-] 等待独立 Review`" in text
+    assert "`[x] 独立 Review 和最终验证通过`" in text
     assert "does not implement `ChannelHostAdapter`" in text
 
 
 def test_plan_has_one_ch_0_001_status_record() -> None:
-    """The task status is maintained once and remains review-pending."""
+    """The task status is maintained once after review completion."""
     lines = PLAN_PATH.read_text(encoding="utf-8").splitlines()
     start = lines.index("### CH-0-001：Core/Runner 职责和兼容边界")
     end = next(
@@ -618,4 +618,5 @@ def test_plan_has_one_ch_0_001_status_record() -> None:
     )
     block = lines[start:end]
     statuses = [line for line in block if line.startswith("- 状态：")]
-    assert statuses == ["- 状态：[-] 等待独立 Review"]
+    assert statuses == ["- 状态：[x] 独立 Review 和最终验证通过"]
+    assert "证据：职责矩阵和 override 基线见" in block

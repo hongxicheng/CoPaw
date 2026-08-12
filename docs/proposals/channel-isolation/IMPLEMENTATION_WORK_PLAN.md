@@ -161,12 +161,12 @@
 
 ### CH-0-001：Core/Runner 职责和兼容边界
 
-- 状态：[-] 等待独立 Review
+- 状态：[x] 独立 Review 和最终验证通过
 
-- [ ] 盘点 `BaseChannel` 的 public/protected 接口。
-- [ ] 将 ACL、队列、AgentRequest/Event、Workspace、渲染和 approval 归入 Core。
-- [ ] 将平台 SDK、连接、原生事件解析、平台 API 和 checkpoint 归入 Runner。
-- [ ] 定义 effective `media_work_dir` 的解析规则、绝对化基准和 Channel 媒体模式清单。
+- [x] 盘点 `BaseChannel` 的 public/protected 接口。
+- [x] 将 ACL、队列、AgentRequest/Event、Workspace、渲染和 approval 归入 Core。
+- [x] 将平台 SDK、连接、原生事件解析、平台 API 和 checkpoint 归入 Runner。
+- [x] 定义 effective `media_work_dir` 的解析规则、绝对化基准和 Channel 媒体模式清单。
   正常 Agent 的 `from_config` 规则为 `config.media_dir` → `workspace_dir / "media"` →
   `WORKING_DIR / "media"`；无 Agent workspace 的 `from_env` 兼容入口规则为
   `<CHANNEL>_MEDIA_DIR` → `WORKING_DIR / "media"`。Core 解析后经 prepare host context
@@ -177,17 +177,22 @@
   入站媒体目录；Console/iMessage 的目录用途不属于该契约。最终目录统一平铺，不追加
   Channel 子目录（Design §9.1、ADR-034）。**本任务只冻结规则和清单，解析器实现属于
   `CH-2-004`；Phase 0 不实现 Core 侧基础设施。**
-- [ ] 盘点 `uses_manager_queue` 等调度差异；descriptor 显式声明 `dispatch_mode`，Voice 与
+- [x] 盘点 `uses_manager_queue` 等调度差异；descriptor 显式声明 `dispatch_mode`，Voice 与
   SIP 保持 `direct_session`，不得把所有 Channel 强制接入 manager queue。记录
   `direct_session` 当前同时绕过 ACL gate 和 TaskTracker，本期不改变该行为（ADR-026）。
-- [ ] 定义 `ChannelHostAdapter`、`ChannelDriver` 和 `IsolatedChannelProxy`。
-- [ ] 证明 Core 不需要把 Python 对象传给 Runner。范围按 Design §8.4 的清单：`Path`、
+- [x] 定义 `ChannelHostAdapter`、`ChannelDriver` 和 `IsolatedChannelProxy`。
+- [x] 证明 Core 不需要把 Python 对象传给 Runner。范围按 Design §8.4 的清单：`Path`、
   配置段、`Workspace`、`Event`；确认 `reply_future`/`reply_loop`/`incoming_message` 为死
   代码，`session_webhook` 系列为可序列化真实用法。
-- [ ] 确认 ACL 身份不跨发送者合并的不变量，并定义 Runner 逐事件携带 `acl_sender_id` 的
+- [x] 确认 ACL 身份不跨发送者合并的不变量，并定义 Runner 逐事件携带 `acl_sender_id` 的
   映射（ADR-031）。
-- [ ] 定义 Core Channel、runner-process Channel 和 legacy Plugin Channel 混合运行的
+- [x] 定义 Core Channel、runner-process Channel 和 legacy Plugin Channel 混合运行的
   兼容调用表。
+
+证据：职责矩阵和 override 基线见
+`docs/proposals/channel-isolation/CH-0-001_CORE_RUNNER_BOUNDARY.md`；契约、Telegram 和
+WeCom 测试共 `182 passed`；目标文件 `pre-commit` 全部通过，`git diff --check` 通过。
+独立 Review 已通过（用户确认）；实现与修复提交为 `34e691b8` 和 `3cdf8f9d`。
 
 验收：职责矩阵和接口边界可以覆盖现有内置 Channel、Voice 和 legacy Plugin。
 
