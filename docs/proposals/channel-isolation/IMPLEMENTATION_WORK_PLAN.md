@@ -162,10 +162,12 @@
 - [ ] 盘点 `BaseChannel` 的 public/protected 接口。
 - [ ] 将 ACL、队列、AgentRequest/Event、Workspace、渲染和 approval 归入 Core。
 - [ ] 将平台 SDK、连接、原生事件解析、平台 API 和 checkpoint 归入 Runner。
-- [ ] Core 解析 effective `media_work_dir` 并通过 prepare host context 传给 Runner；Runner
-  不依赖 Workspace 对象自行推断目录。注意当前**不存在**集中解析器，各 Channel 在自己的
-  `__init__` 中重复三级优先级，`workspace_dir` 是构造参数；本任务需新建解析器并保留各
-  Channel 现有默认子目录（Design §9.1、ADR-032）。
+- [ ] 定义 effective `media_work_dir` 的解析规则：三级优先级、绝对化基准、以及逐 Channel
+  的现有默认子目录清单（如 Telegram 的 `WORKING_DIR/media/telegram`）。确认它由 Core 解析
+  并经 prepare host context 传给 Runner，Runner 不依赖 Workspace 对象自行推断。注意当前
+  **不存在**集中解析器，各 Channel 在自己的 `__init__` 中重复该优先级，`workspace_dir` 是
+  构造参数，因此这是新增能力（Design §9.1、ADR-032）。
+  **本任务只产出规则和清单，解析器实现属于 `CH-2-004`**；Phase 0 不实现 Core 侧基础设施。
 - [ ] 盘点 `uses_manager_queue` 等调度差异；descriptor 显式声明 `dispatch_mode`，Voice 与
   SIP 保持 `direct_session`，不得把所有 Channel 强制接入 manager queue。记录
   `direct_session` 当前同时绕过 ACL gate 和 TaskTracker，本期不改变该行为（ADR-026）。
@@ -444,8 +446,9 @@ stderr。
 - [ ] Core 保留 ACL、队列、debounce、AgentRequest、Event、approval 和平台无关
   渲染语义；Runner 负责平台原生 payload 编码。
 - [ ] 定义 Core 侧配置、session、ACL、queue 和 Agent 生命周期适配。
-- [ ] Core 按现有 Channel 配置优先级解析并确保 `media_work_dir` 可用，通过 prepare
-  host context 传入 Runner。
+- [ ] 按 `CH-0-001` 定义的规则**实现** Core 侧 `media_work_dir` 解析器（当前无集中实现，
+  属新增代码），确保其可用并通过 prepare host context 传入 Runner。逐 Channel 保留现有
+  默认子目录，相对配置值按迁移前基准绝对化，不依赖 Runner cwd（Design §9.1、ADR-032）。
 - [ ] 将 `conversation` 映射为 Core `session_id`，将 `sender_name` 映射为兼容
   `meta["user_name"]`，并保证 merge 后保留实际 `acl_sender_id`。
 

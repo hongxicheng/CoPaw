@@ -803,8 +803,9 @@ Content 定位值传回 Runner，Channel 再按平台规则上传或发送。该
 `config.media_dir` → `workspace_dir / "media"` → 该 Channel 自己的模块级默认目录（例如
 Telegram 的 `WORKING_DIR/media/telegram`）；`workspace_dir` 是 `ChannelManager.from_config`
 按 `from_config` 签名过滤后注入的构造参数，不是从 Workspace 对象上取的。因此本设计的
-`media_work_dir` 是**新增能力**，不是把已有实现搬个位置：CH-2-004 必须先在 Core 侧建立
-这个解析器，再让 Runner 消费它。
+`media_work_dir` 是**新增能力**，不是把已有实现搬个位置。任务切分为：CH-0-001 定义解析
+规则、绝对化基准和逐 Channel 默认子目录清单；CH-2-004 在 Core 侧实现该解析器，再让 Runner
+消费它。Phase 0 只冻结规则，不实现 Core 侧基础设施。
 
 收敛时必须逐个保留各 Channel 现有的默认子目录名。若统一改成单一目录，已有部署的入站
 文件落盘位置会发生变化，属于用户可见行为回归。`media_dir` 是 per-channel 配置字段，
