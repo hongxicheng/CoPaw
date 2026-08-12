@@ -66,7 +66,7 @@ Core 语义和 Runner 平台操作各保留一半，`Compatibility` 表示只为
 | `set_enqueue` | sync/public | Core | Host adapter | manager queue callback |
 | `set_workspace` | sync/public | Core | Host adapter | 绑定 Core Workspace context |
 | `_extract_chat_name` | sync/protected | Core | Host helper | Core 展示字段 |
-| `_consume_with_tracker` | async/protected | Core | Host scheduler | TaskTracker 路由 |
+| `_consume_with_tracker` | async/protected | Split | Host scheduler + Driver cleanup | Core 保留 TaskTracker 和取消调度；Runner 清理平台状态 |
 | `_resolve_stream_type` | sync/protected | Core | Host helper | Event 类型归一化 |
 | `_dispatch_streaming_event` | async/protected | Core | Host dispatcher | streaming Event 分发 |
 | `_on_stream_msg_start` | async/protected | Core | Host hook | streaming 状态 |
@@ -134,9 +134,11 @@ TaskTracker；其它 16 个 registry key 使用 manager queue 的现有路径。
 上述 `Split` hook 冻结的是两侧语义，不是把现有 Python override 跨进程调用。Core
 保留 Base hook 的调用时机、Event 编排、fallback、approval、usage 和错误生命周期；
 Runner 接收平台无关操作 DTO，执行 SDK 调用、卡片创建/更新、typing、reaction、消息
-更新和平台状态恢复。`_safe_streaming_delta`、`_get_stream_flush_meta` 和
-`_finish_response_cycle` 等没有平台副作用的编排继续留在 Core。Console 的
-`_on_turn_usage_ready` 是 in-process Core 兼容行为。
+更新和平台状态恢复。`_consume_with_tracker` 的 Workspace、TaskTracker 和任务取消调度
+留在 Core；取消或消费退出后，Core 通过受控取消/清理语义让 Runner 清除 typing、
+processing 等 Driver-owned 平台状态。`_safe_streaming_delta`、
+`_get_stream_flush_meta` 和 `_finish_response_cycle` 等没有平台副作用的编排继续留在 Core。
+Console 的 `_on_turn_usage_ready` 是 in-process Core 兼容行为。
 
 当前 builtin 和 legacy reference 的相关 override 基线如下。`none` 表示该类依赖
 BaseChannel fallback；清单用于后续迁移时保留已有平台行为，不要求无 override 的 Channel
@@ -149,7 +151,7 @@ BaseChannel fallback；清单用于后续迁移时保留已有平台行为，不
 | `dingtalk` | `_before_consume_process`, `_on_consume_error`, `_on_process_completed`, `on_event_message_completed`, `on_streaming_start`, `on_streaming_delta`, `on_streaming_end` |
 | `feishu` | `_before_consume_process`, `_on_process_completed`, `on_event_message_completed`, `on_streaming_start`, `on_streaming_delta`, `on_streaming_end` |
 | `qq` | `on_event_message_completed` |
-| `telegram` | `_before_consume_process`, `_on_consume_error`, `_on_process_completed`, `on_event_message_completed`, `on_streaming_start`, `on_streaming_delta`, `on_streaming_end` |
+| `telegram` | `_consume_with_tracker`, `_before_consume_process`, `_on_consume_error`, `_on_process_completed`, `on_event_message_completed`, `on_streaming_start`, `on_streaming_delta`, `on_streaming_end` |
 | `mattermost` | none |
 | `mqtt` | none |
 | `console` | `_on_turn_usage_ready` |
@@ -157,7 +159,7 @@ BaseChannel fallback；清单用于后续迁移时保留已有平台行为，不
 | `slack` | `on_streaming_start`, `on_streaming_delta`, `on_streaming_end` |
 | `voice` | none |
 | `sip` | none |
-| `wecom` | `_before_consume_process`, `on_event_message_completed`, `on_streaming_start`, `on_streaming_delta`, `on_streaming_end` |
+| `wecom` | `_consume_with_tracker`, `_before_consume_process`, `on_event_message_completed`, `on_streaming_start`, `on_streaming_delta`, `on_streaming_end` |
 | `xiaoyi` | `_on_process_completed`, `on_event_message_completed` |
 | `yuanbao` | `_before_consume_process`, `_on_consume_error`, `_on_process_completed` |
 | `wechat` | `_on_consume_error`, `_on_process_completed` |

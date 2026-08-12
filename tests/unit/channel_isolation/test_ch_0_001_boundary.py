@@ -70,6 +70,19 @@ MEDIA_MODES = {
 DISPATCH_MODES = {key: "manager_queue" for key in EXPECTED_CHANNELS}
 DISPATCH_MODES.update({"voice": "direct_session", "sip": "direct_session"})
 
+BOUNDARY_HOOK_METHODS = {
+    "_consume_with_tracker",
+    "_before_consume_process",
+    "_on_consume_error",
+    "_on_process_completed",
+    "on_event_content",
+    "on_event_message_completed",
+    "on_streaming_start",
+    "on_streaming_delta",
+    "on_streaming_end",
+    "_on_turn_usage_ready",
+}
+
 
 def _table_rows(text: str, header: str) -> list[list[str]]:
     """Read a simple pipe table following an exact header."""
@@ -289,18 +302,10 @@ def _method_source_or_empty(
 def _documented_hook_overrides(text: str) -> dict[str, set[str]]:
     """Read the channel hook override table from the boundary document."""
     rows = _table_rows(text, "| channel_key | relevant hook overrides |")
-    hooks = {
-        "_before_consume_process",
-        "_on_consume_error",
-        "_on_process_completed",
-        "on_event_content",
-        "on_event_message_completed",
-        "on_streaming_start",
-        "on_streaming_delta",
-        "on_streaming_end",
-        "_on_turn_usage_ready",
+    return {
+        row[0]: {hook for hook in BOUNDARY_HOOK_METHODS if hook in row[1]}
+        for row in rows
     }
-    return {row[0]: {hook for hook in hooks if hook in row[1]} for row in rows}
 
 
 def test_base_channel_methods_have_one_matrix_row() -> None:
@@ -367,24 +372,15 @@ def test_hook_override_table_matches_real_builtin_and_plugin_sources() -> None:
     """Document every relevant override in all builtin and legacy classes."""
     text = DOC_PATH.read_text(encoding="utf-8")
     documented = _documented_hook_overrides(text)
-    relevant = {
-        "_before_consume_process",
-        "_on_consume_error",
-        "_on_process_completed",
-        "on_event_content",
-        "on_event_message_completed",
-        "on_streaming_start",
-        "on_streaming_delta",
-        "on_streaming_end",
-        "_on_turn_usage_ready",
-    }
     actual: dict[str, set[str]] = {}
     for key, (_, class_name) in _registry_specs().items():
         actual[key] = (
-            _class_methods(_channel_source(key), class_name) & relevant
+            _class_methods(_channel_source(key), class_name)
+            & BOUNDARY_HOOK_METHODS
         )
     actual["azure_bot"] = (
-        _class_methods(AZURE_CHANNEL_PATH, "AzureBotChannel") & relevant
+        _class_methods(AZURE_CHANNEL_PATH, "AzureBotChannel")
+        & BOUNDARY_HOOK_METHODS
     )
     assert documented == actual
     assert set(documented) == EXPECTED_CHANNELS | {"azure_bot"}
@@ -394,9 +390,39 @@ def test_hook_override_table_matches_real_builtin_and_plugin_sources() -> None:
         "| method | declaration | owner | isolated mapping | notes |",
     )
     owners = {row[0]: row[2] for row in rows}
-    for method in relevant - {"_on_turn_usage_ready", "on_event_content"}:
+    for method in BOUNDARY_HOOK_METHODS - {
+        "_on_turn_usage_ready",
+        "on_event_content",
+    }:
         assert owners[method] == "Split"
     assert owners["_on_turn_usage_ready"] == "Core"
+    assert documented["telegram"] >= {"_consume_with_tracker"}
+    assert documented["wecom"] >= {"_consume_with_tracker"}
+    assert "TaskTracker 和任务取消调度\n留在 Core" in text
+    runner_cleanup_semantics = "".join(
+        [
+            "Runner 清除 typing、\n",
+            "processing 等 Driver-owned 平台状态",
+        ],
+    )
+    assert runner_cleanup_semantics in text
+
+    telegram_cleanup = _method_source(
+        _channel_source("telegram"),
+        _registry_specs()["telegram"][1],
+        "_consume_with_tracker",
+    )
+    assert "except asyncio.CancelledError" in telegram_cleanup
+    assert "self._is_processing.pop" in telegram_cleanup
+    assert "self._stop_typing" in telegram_cleanup
+
+    wecom_cleanup = _method_source(
+        _channel_source("wecom"),
+        _registry_specs()["wecom"][1],
+        "_consume_with_tracker",
+    )
+    assert "finally:" in wecom_cleanup
+    assert "self._processing_sessions.discard" in wecom_cleanup
 
 
 def test_acl_identity_is_produced_by_runner_and_consumed_by_core() -> None:
