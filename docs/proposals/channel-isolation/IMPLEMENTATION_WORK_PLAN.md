@@ -161,6 +161,8 @@
 
 ### CH-0-001：Core/Runner 职责和兼容边界
 
+- 状态：[-] 等待独立 Review
+
 - [ ] 盘点 `BaseChannel` 的 public/protected 接口。
 - [ ] 将 ACL、队列、AgentRequest/Event、Workspace、渲染和 approval 归入 Core。
 - [ ] 将平台 SDK、连接、原生事件解析、平台 API 和 checkpoint 归入 Runner。
