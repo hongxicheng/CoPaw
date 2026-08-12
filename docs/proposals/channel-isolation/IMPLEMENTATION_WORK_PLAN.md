@@ -67,13 +67,15 @@
   QQ 的端点环境变量）是测试 mock 注入点，不是产品功能，不作为兼容目标，也不得为其调整
   架构实现；失效由测试侧处理。Feishu `domain` 的 `feishu`/`lark` 枚举值除外（ADR-033）。
 - [x] Voice 重构后与 OneBot 一致：自行维护生命周期、监听和平台事件，Core 只处理传过来的
-  数据。Core-owned ingress 是后备选项，只在 Runner-owned 经原型证明不可行时启用。
+  数据。若 Runner-owned 经原型证明不可行，必须由独立 ADR 决定是否保留当前 Core-owned
+  ingress，不将其作为自动后备选项。
 - [x] bot 查重两侧都要求 `enabled=true`：提交配置为禁用时跳过检查，比较时只看其他 Agent
   中已启用的配置段。
 - [x] ACL 身份不得跨发送者合并。Core 已在 merge 前按 ACL 身份切分批次，隔离后 Runner
   逐事件携带 `acl_sender_id`，该不变量必须保持。
-- [x] `media_work_dir` 是新增的 Core 侧解析能力，不是既有实现的搬迁；收敛时保留各
-  Channel 现有默认子目录。
+- [x] `media_work_dir` 是新增的 Core 侧解析能力，不是既有实现的搬迁；所有需要入站媒体
+  落盘的 Channel 使用统一的最终目录，不追加 Channel 子目录；各 Channel 的下载、命名、
+  覆盖和清理逻辑保持不变（ADR-034）。
 - [x] Voice 当前入口完全由 Core 持有；Runner-owned ingress 是新建目标，Core-owned 是
   现状而非“将来的备选”。
 - [x] `direct_session`（Voice、SIP）当前同时绕过 Core 的 ACL gate 和 TaskTracker；本期
@@ -162,12 +164,17 @@
 - [ ] 盘点 `BaseChannel` 的 public/protected 接口。
 - [ ] 将 ACL、队列、AgentRequest/Event、Workspace、渲染和 approval 归入 Core。
 - [ ] 将平台 SDK、连接、原生事件解析、平台 API 和 checkpoint 归入 Runner。
-- [ ] 定义 effective `media_work_dir` 的解析规则：三级优先级、绝对化基准、以及逐 Channel
-  的现有默认子目录清单（如 Telegram 的 `WORKING_DIR/media/telegram`）。确认它由 Core 解析
-  并经 prepare host context 传给 Runner，Runner 不依赖 Workspace 对象自行推断。注意当前
-  **不存在**集中解析器，各 Channel 在自己的 `__init__` 中重复该优先级，`workspace_dir` 是
-  构造参数，因此这是新增能力（Design §9.1、ADR-032）。
-  **本任务只产出规则和清单，解析器实现属于 `CH-2-004`**；Phase 0 不实现 Core 侧基础设施。
+- [ ] 定义 effective `media_work_dir` 的解析规则、绝对化基准和 Channel 媒体模式清单。
+  正常 Agent 的 `from_config` 规则为 `config.media_dir` → `workspace_dir / "media"` →
+  `WORKING_DIR / "media"`；无 Agent workspace 的 `from_env` 兼容入口规则为
+  `<CHANNEL>_MEDIA_DIR` → `WORKING_DIR / "media"`。Core 解析后经 prepare host context
+  传给 Runner，Runner 不依赖 Workspace 对象自行推断。注意当前**不存在**集中解析器，且
+  QQ、Telegram、Matrix、XiaoYi 的配置字段或透传链路不完整，因此本任务要记录补齐清单。
+  入站落盘型 Channel 为 Discord、DingTalk、Feishu、QQ、Telegram、Mattermost、WeCom、
+  Matrix、Slack、WeChat、XiaoYi、Yuanbao；OneBot 为定位符直传；MQTT、Voice、SIP 不提供
+  入站媒体目录；Console/iMessage 的目录用途不属于该契约。最终目录统一平铺，不追加
+  Channel 子目录（Design §9.1、ADR-034）。**本任务只冻结规则和清单，解析器实现属于
+  `CH-2-004`；Phase 0 不实现 Core 侧基础设施。**
 - [ ] 盘点 `uses_manager_queue` 等调度差异；descriptor 显式声明 `dispatch_mode`，Voice 与
   SIP 保持 `direct_session`，不得把所有 Channel 强制接入 manager queue。记录
   `direct_session` 当前同时绕过 ACL gate 和 TaskTracker，本期不改变该行为（ADR-026）。
@@ -224,8 +231,8 @@
   `channel.commit/lease_renew/generation_status`、`channel.send`、普通媒体定位符、
   `ingress.endpoint.register/update/unregister`、`host.state.*` 和 `request.cancel`
   的 schema。
-- [ ] `channel.prepare` 的 host context 定义跨平台绝对 `media_work_dir`；它只用于入站
-  落盘，不作为出站文件访问白名单。
+- [ ] `channel.prepare` 的 host context 定义跨平台绝对 `media_work_dir`；它只对需要
+  入站落盘的 Channel 生效，不作为出站文件访问白名单。
 - [ ] 定义 Runner-owned ingress endpoint 的 host、port/path、可选 `public_base_url`、
   protocol、readiness、generation、quiesce 和 unregister 语义；定义 Voice event 的稳定
   `event_kind`、`connection_id`、sequence、session binding 和稳定错误码。
@@ -447,8 +454,9 @@ stderr。
   渲染语义；Runner 负责平台原生 payload 编码。
 - [ ] 定义 Core 侧配置、session、ACL、queue 和 Agent 生命周期适配。
 - [ ] 按 `CH-0-001` 定义的规则**实现** Core 侧 `media_work_dir` 解析器（当前无集中实现，
-  属新增代码），确保其可用并通过 prepare host context 传入 Runner。逐 Channel 保留现有
-  默认子目录，相对配置值按迁移前基准绝对化，不依赖 Runner cwd（Design §9.1、ADR-032）。
+  属新增代码），确保其可用并通过 prepare host context 传入 Runner。配置启动统一解析为
+  `config.media_dir` → `workspace_dir/media` → `WORKING_DIR/media`，不追加 Channel 子目录；
+  相对配置值绝对化，不依赖 Runner cwd（Design §9.1、ADR-034）。
 - [ ] 将 `conversation` 映射为 Core `session_id`，将 `sender_name` 映射为兼容
   `meta["user_name"]`，并保证 merge 后保留实际 `acl_sender_id`。
 
@@ -516,10 +524,13 @@ descriptor，并根据 `process_mode` 返回正确 Channel 实例和驱动接口
   URI 或 `http(s)://` URL，并保留 `filename`、mime 等元数据。
 - [ ] 保持入站和出站现有流程；Core 不复制、下载或改写普通媒体定位符，Runner 继续按
   Channel 原有逻辑处理路径或 URL。
-- [ ] 保持现有入站落盘规则：Core 解析 effective `media_work_dir`，Runner 使用安全且
-  碰撞规避的文件名；分步下载在同目录原子发布后才把最终路径放入 Content。该解析器为新建
-  能力，必须逐 Channel 保留现有默认子目录（如 Telegram 的 `WORKING_DIR/media/telegram`），
-  并盘点 `config/utils.py` 的历史路径改写逻辑（ADR-032）。
+- [ ] 保持现有入站落盘流程：Core 解析 effective `media_work_dir`，Runner 将文件直接写入
+  该最终目录，不追加 Channel 子目录；Runner 继续使用各 Channel 现有的文件名、覆盖、
+  下载和 URL/路径处理逻辑。本任务不迁移既有文件、不引入新的下载算法，并盘点
+  `config/utils.py` 的历史路径改写逻辑（ADR-034）。
+- [ ] 为所有入站落盘型 Channel 补齐 `media_dir` 配置入口；保留 `from_env` 兼容入口的
+  `*_MEDIA_DIR` 设置，并补齐缺失的 QQ、Telegram、Matrix、Slack、Yuanbao 环境变量读取。
+  `from_config` 不读取环境变量，环境变量不覆盖显式配置。
 - [ ] 验证 Agent 出站的任意可访问路径不受 `media_work_dir` 限制；Runner stop、ACK 或
   generation 切换不新增自动删除行为。
 - [ ] 验证路径定位符兼容桌面等非 media 目录文件；验证 `file://`、Windows 路径和
@@ -595,9 +606,9 @@ descriptor，并根据 `process_mode` 返回正确 Channel 实例和驱动接口
 - [ ] 确认迁移后 Runner 不直接复用 Core 的 `ProcessHandler`、ChannelManager 或数据库；
   保持 Voice 的 `direct_session` 行为和 ConversationRelay 文本状态机。
 - [ ] 目标形态与 OneBot 一致：Voice 自行维护生命周期、监听和平台事件，Core 只处理传过来
-  的数据，不再持有 socket 对象。仅当原型证明 Runner-owned 确实不可行时，才按独立 ADR 启用
-  Core-owned 后备方案；即便如此平台 SDK 仍留在 Runner，不得把 Core socket 对象或原始
-  HTTP/WebSocket 帧传给 Runner。
+  的数据，不再持有 socket 对象。若原型证明 Runner-owned 确实不可行，必须由独立 ADR 决定
+  是否保留当前 Core-owned ingress；即便如此平台 SDK 仍留在 Runner，不得把 Core socket
+  对象或原始 HTTP/WebSocket 帧传给 Runner。
 - [ ] 验证签名、TwiML、token、ConversationRelay WebSocket 文本消息、断线和旧 generation
   fencing、endpoint 切换、有界背压和结果不明确的发送；不把当前 Voice 标记为 raw media
   pipe 使用者。
@@ -609,7 +620,8 @@ endpoint 切换和故障矩阵达到发布标准；Core-owned 兼容实现仅按
 
 - [ ] 迁移 Telegram、Discord、Slack、Matrix 和 MQTT。
 - [ ] 逐个盘点 polling/WebSocket/MQTT 连接、订阅、checkpoint、重连和 shutdown 语义。
-- [ ] 逐个确认入站落盘目录与迁移前一致，保留各自默认子目录（ADR-032）。
+- [ ] 逐个确认入站落盘 Channel 使用同一解析后的最终 `media_work_dir` 并平铺写入；各自
+  下载、命名、覆盖和清理逻辑与迁移前一致（ADR-034）。
 - [ ] 每个 Channel 分别建立 descriptor、lock/manifest、Runner entrypoint 和 capability。
 - [ ] 分别回归 ACL 身份、session、群聊/私聊、mention、streaming、媒体、typing/reaction
   和主动发送中原本支持的能力。
@@ -659,7 +671,8 @@ endpoint 切换和故障矩阵达到发布标准；Core-owned 兼容实现仅按
 - [ ] Core 不导入已迁移 Channel 的第三方 SDK；`routers/voice.py` 的路由与挂载已删除，
   `twilio` 不在 Core 默认依赖中。扫码登录模块按 ADR-027 是登记在案的例外，且不导入平台
   SDK、不引用 Channel 内部符号。
-- [ ] 各 Channel 入站落盘目录与迁移前一致；共享 session 群聊的 ACL 身份不跨发送者合并。
+- [ ] 所有入站落盘 Channel 的最终目录解析和配置/env 入口一致；共享 session 群聊的 ACL
+  身份不跨发送者合并。
 - [ ] Console 及明确保留 `process_mode=in_process` 的 Channel 行为和 Catalog 状态无回归。
 - [ ] Core Channel、runner-process Channel 和 legacy Plugin Channel 混合运行无回归。
 
@@ -860,7 +873,7 @@ endpoint 切换和故障矩阵达到发布标准；Core-owned 兼容实现仅按
 | 仅靠环境变量的平台端点覆盖静默失效 | descriptor 声明透传白名单，`minimal_env` 按白名单构造并回归验证 |
 | Core 侧遗留平台入口被误认为已隔离 | Voice 完成定义包含删除 Core 路由与 `twilio` 依赖；扫码登录作为登记例外单独约束 |
 | 硬编码表与 descriptor 并行生效导致漂移 | 逐表收敛归属；漏配即校验失败，不静默跳过 |
-| 入站落盘目录因收敛而变化 | 保留各 Channel 默认子目录，逐 Channel 回归落盘位置 |
+| 入站落盘目录解析不一致 | 统一 `config.media_dir` → `workspace_dir/media` → `WORKING_DIR/media`；`from_env` 使用 `<CHANNEL>_MEDIA_DIR` → `WORKING_DIR/media`，逐 Channel 回归配置和环境变量入口 |
 
 ## 15. 任务索引
 

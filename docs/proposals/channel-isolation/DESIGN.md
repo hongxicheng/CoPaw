@@ -261,7 +261,8 @@ value 默认通过一次性继承 pipe/handle 注入；只有第三方 SDK 在�
 Runner 也不自行推断 Agent Workspace 或全局默认媒体目录。Core 必须把解析后的
 `media_work_dir` 作为 `channel.prepare` 的 host context 传入；Runner 只把它当作平台入站
 附件的工作目录路径，不依赖 Workspace 类型或 Core 路径工具。该解析器目前尚不存在，需要
-按 §9.1 的现状说明新建，并保留各 Channel 现有默认子目录。
+按 §9.1 的现状说明新建。所有需要入站落盘的 Channel 使用解析后的最终目录本身，不再由
+Runner 或 Channel 追加 `channel_key` 子目录。
 
 Runner-owned ingress 的平台 HTTP/WebSocket 类型、签名校验和消息状态机必须只存在于
 Runner environment。Runner 可以使用 aiohttp、FastAPI/Starlette 或平台 SDK 要求的其他
@@ -622,10 +623,10 @@ Core 只处理传过来的数据，和其他 Channel 一样。** Voice 不是需
 ConversationRelay 状态机；Core 侧只通过 `event.batch` 收稳定事件、通过 `channel.send`
 回出站操作，不接触原始 HTTP body、headers 或 WebSocket 帧，也不再持有 socket 对象。
 
-Core-owned ingress 只在 Runner-owned 经原型证明确实无法成立时才启用，属于后备选项而非
-并列方案。若走到那一步，必须有独立 ADR，并单独冻结最小 DTO、顺序、背压、关闭和
-generation fencing；即便如此，平台 SDK 仍必须留在 Runner，Core socket 对象不得跨进程
-传递。
+当前的 Core-owned ingress 不作为 v1 迁移流程中的自动后备路径。若 Runner-owned 原型证明
+确实无法成立，必须先由独立 ADR 决定是否保留当前实现，并单独冻结最小 DTO、顺序、背压、
+关闭和 generation fencing；即便如此，平台 SDK 仍必须留在 Runner，Core socket 对象不得
+跨进程传递。
 
 这里还有一个依赖声明问题需要在 lock 阶段解决：`fastapi` 和 `aiohttp` 目前都**不是**
 `pyproject.toml` 中声明的直接依赖，而是传递依赖。Voice Runner 若继续以 FastAPI 语义实现
@@ -796,27 +797,36 @@ Content 定位值传回 Runner，Channel 再按平台规则上传或发送。该
 
 隔离后的 Runner 不能依赖 Workspace 对象来推断入站下载位置。Core 解析 effective
 `media_dir`，将平台原生、绝对的 `media_work_dir` 放入 `channel.prepare.host_context`。
-相对配置值由 Core 按迁移前相同的基准解析后再绝对化，不能改为依赖 Runner cwd。
+相对配置值由 Core 按当前 Agent 的工作目录规则绝对化，不能改为依赖 Runner cwd。
 
 必须注意：**当前代码没有集中的媒体目录解析器**，`media_work_dir` 这个名字在现有代码中
-也不存在。今天每个 Channel 在自己的 `__init__` 里重复同一套三级优先级：显式
-`config.media_dir` → `workspace_dir / "media"` → 该 Channel 自己的模块级默认目录（例如
-Telegram 的 `WORKING_DIR/media/telegram`）；`workspace_dir` 是 `ChannelManager.from_config`
-按 `from_config` 签名过滤后注入的构造参数，不是从 Workspace 对象上取的。因此本设计的
-`media_work_dir` 是**新增能力**，不是把已有实现搬个位置。任务切分为：CH-0-001 定义解析
-规则、绝对化基准和逐 Channel 默认子目录清单；CH-2-004 在 Core 侧实现该解析器，再让 Runner
-消费它。Phase 0 只冻结规则，不实现 Core 侧基础设施。
+也不存在。正常 Agent 的 `ChannelManager.from_config` 会注入 `workspace_dir`，多数 Channel
+在自己的 `__init__` 中重复以下优先级：显式 `config.media_dir` → `workspace_dir / "media"`
+→ Channel 自己的 fallback。后者目前有的使用 `WORKING_DIR/media`，有的使用
+`WORKING_DIR/media/<channel_key>`；这不是目标架构要求，也不应继续作为兼容约束。QQ、
+Telegram、Matrix 和 XiaoYi 当前还缺少完整的配置字段或透传链路，不能把它们描述为已经具备
+统一的 `media_dir` 配置。
 
-收敛时必须逐个保留各 Channel 现有的默认子目录名。若统一改成单一目录，已有部署的入站
-文件落盘位置会发生变化，属于用户可见行为回归。`media_dir` 是 per-channel 配置字段，
-`config/utils.py` 中还存在历史路径改写逻辑，迁移时一并盘点。Runner 在该目录内沿用各 Channel 现有的安全文件名、冲突规避
-和下载逻辑，并把最终实际路径写入 Content。写入应使用碰撞安全文件名；需要分步下载时
-使用同目录临时文件并原子发布最终文件，避免 Core 读到半文件。
+本设计的 `media_work_dir` 是**新增的 Core 侧解析能力**，不是把现有下载函数搬到 Core。
+对于需要入站落盘的 Channel，目标解析规则统一为：
 
-`media_work_dir` 只决定 Runner 自己创建的入站文件放在哪里，不是出站路径白名单；Agent
-传来的桌面文件等其他路径仍按上面的普通定位符规则处理。Core 负责目录选择、创建条件和
-实例配置生命周期，Runner 负责其下载操作产生的文件；v1 保持现有保留/清理行为，不在
-ACK、Runner stop 或 generation 切换时自动删除已交给 Agent 的文件。
+```text
+from_config: config.media_dir → workspace_dir / "media" → WORKING_DIR / "media"
+from_env:    <CHANNEL>_MEDIA_DIR → WORKING_DIR / "media"
+```
+
+`from_config` 是正常 Agent 路径；`from_env` 是没有 Agent workspace 上下文的独立兼容入口，
+两者不叠加，也不互相覆盖。显式 `media_dir` 为空时，最终目录就是 `workspace_dir/media` 或
+`WORKING_DIR/media`，不再追加 Channel 子目录。所有落盘型 Channel 共用这个最终目录；
+Runner 继续使用各 Channel 现有的下载、文件名、覆盖和 URL/路径处理逻辑，本次不引入文件迁移、
+跨 Channel 子目录或新的下载算法。`media_dir` 配置入口和对应 `*_MEDIA_DIR` 环境变量只对
+实际需要入站落盘的 Channel 统一提供；OneBot 的定位符直传以及 MQTT、Voice、SIP 的非落盘
+媒体行为不适用。Console 和 iMessage 的现有目录用途属于上传引用或出站暂存，不纳入该契约。
+
+`config/utils.py` 中仍存在历史 `~/.copaw` 路径改写逻辑，迁移时一并盘点。`media_work_dir`
+只决定 Runner 自己创建的入站文件放在哪里，不是出站路径白名单；Agent 传来的桌面文件等
+其他路径仍按普通定位符规则处理。Core 负责目录选择、创建条件和实例配置生命周期，Runner
+负责调用平台下载逻辑；v1 保持现有文件保留和清理行为。
 
 ### 9.2 可选原始实时媒体流
 
@@ -970,7 +980,7 @@ legacy Plugin descriptor 在插件完成既有注册后合成，依赖管理标�
 | 位置 | 当前内容 | 收敛方向 |
 | --- | --- | --- |
 | `app/channels/registry.py` 的 `_BUILTIN_SPECS` | 18 个内置 Channel 的模块路径与类名 | descriptor 的 entrypoint |
-| `app/channels/schema.py` 的 `ChannelType` 字面量 | Channel key 枚举 | descriptor 的 `channel_key` 集合 |
+| `app/channels/schema.py` 的 `ChannelType` 与 `BUILTIN_CHANNEL_TYPES` | `ChannelType` 为开放的 `str`；独立维护的 `BUILTIN_CHANNEL_TYPES` 仅列 13 个内置 key | descriptor 的 `channel_key` 集合 |
 | `app/channels/conflict.py` 的 `_CHANNEL_IDENTITY_FIELDS` | 14 个 Channel 的 bot 身份字段名 | descriptor 的 `bot_identity_fields`（见 §14.4） |
 | `app/channels/qrcode_auth_handler.py` 的 `QRCODE_AUTH_HANDLERS` | 5 个平台的扫码登录实现 | 保留在 Core，但按 §14.5 显式登记为例外 |
 | `cli/doctor_connectivity.py` 的探测分派表 | 13 个 Channel 的平台连通性探测 | 保留在 Core CLI，按 §14.3 与环境校验区分命名 |
@@ -980,10 +990,14 @@ legacy Plugin descriptor 在插件完成既有注册后合成，依赖管理标�
 Core 侧 per-channel 特例，迁移 DingTalk 时必须一并移除；Core 的通用编排层不得保留按
 `channel_key` 的行为分支。
 
-`schema.py` 的 `ChannelType` 与 `registry.py` 的 `_BUILTIN_SPECS` 目前互相独立维护，
-`conflict.py` 覆盖 14 个 Channel、遗漏 `imessage`、`mqtt`、`console`、`sip`、`onebot` 及全部
-Plugin Channel。这类漂移正是收敛到单一 descriptor 的直接动机，实施时应把“漏配即报错”
-作为 descriptor 校验的一部分，而不是像现在这样静默跳过。
+`schema.py` 的 `ChannelType` 当前不是内置 Channel 枚举，而是允许 Plugin 使用任意 key 的
+`str`。`BUILTIN_CHANNEL_TYPES` 与 `registry.py` 的 `_BUILTIN_SPECS` 也独立维护：前者只列出
+13 个 key，遗漏 `mattermost`、`matrix`、`wecom`、`wechat` 和 `onebot`；后者的 18 个 key 才是
+当前内置 Channel 的发现和加载基线。CH-0-001 的职责矩阵必须覆盖这 18 个 registry key，
+不得以 13 项 `BUILTIN_CHANNEL_TYPES` 缩小范围。`conflict.py` 覆盖 14 个 Channel、遗漏
+`imessage`、`mqtt`、`console`、`sip`、`onebot` 及全部 Plugin Channel。这类漂移正是收敛到
+单一 descriptor 的直接动机：最终由 descriptor 的 `channel_key` 集合统一这些事实来源，
+实施时应把“漏配即报错”作为 descriptor 校验的一部分，而不是像现在这样静默跳过。
 
 ## 12. Plugin 兼容和 isolated Plugin SDK
 
@@ -1401,7 +1415,8 @@ Console Channel 是 Core 内部控制面入口，明确保留 `process_mode=in_p
 - 环境变量透传白名单生效：Telegram/Discord/Slack 的代理变量和 `SSL_CERT_FILE` 在隔离后
   仍然生效；
 - `channels verify-env` 不产生网络 I/O，与 `qwenpaw doctor` 的平台连通性结果互不混淆；
-- 各 Channel 入站落盘目录与迁移前一致，包含各自的默认子目录；
+- 所有落盘型 Channel 使用 Core 解析的最终 `media_work_dir`，文件平铺在该目录中；各 Channel
+  现有下载、文件名和发送行为无回归；
 - 所有相关 Python 单测通过率 100%，改动文件通过 pre-commit。
 
 ### 测试矩阵
@@ -1455,5 +1470,6 @@ Core Channel、runner-process Channel 和 legacy Plugin Channel 混合运行、�
 | ADR-029 | 环境/依赖校验命令命名为 `channels verify-env`，与既有平台连通性 `qwenpaw doctor` 并存且语义分离 | 已确认 |
 | ADR-030 | descriptor 声明环境变量透传白名单，用于代理和 TLS 等真实部署约束；`minimal_env` 按白名单构造，既不无条件继承 Core 环境，也不清掉这些变量 | 已确认 |
 | ADR-031 | ACL 身份不得跨发送者合并；Core 在 merge 前按 ACL 身份切分批次，隔离后 Runner 逐事件携带 `acl_sender_id` | 已确认 |
-| ADR-032 | `media_work_dir` 是新增的 Core 侧解析能力，不是既有实现的迁移；收敛时保留各 Channel 现有默认子目录 | 已确认 |
+| ADR-032 | `media_work_dir` 是新增的 Core 侧解析能力，不是既有实现的迁移；收敛时保留各 Channel 现有默认子目录 | 被 ADR-034 替代 |
 | ADR-033 | 平台网关地址注入（Feishu `domain` 的 URL 形态、WeCom/XiaoYi/Yuanbao 的 `ws_url`、QQ 的端点环境变量）是测试 mock 注入点，不是产品功能，不作为兼容目标；失效由测试侧处理。Feishu `domain` 的 `feishu`/`lark` 枚举值除外，属真实能力 | 已确认 |
+| ADR-034 | 对需要入站媒体落盘的 Channel，Core 统一解析 `config.media_dir` → `workspace_dir/media` → `WORKING_DIR/media`；`from_env` 使用 `<CHANNEL>_MEDIA_DIR` → `WORKING_DIR/media`。最终目录平铺，不追加 Channel 子目录；各 Channel 保留现有下载、命名、覆盖和清理行为，不迁移既有文件 | 已确认；替代 ADR-032 |
