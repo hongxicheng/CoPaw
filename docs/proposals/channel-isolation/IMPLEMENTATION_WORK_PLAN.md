@@ -146,7 +146,8 @@
   行为无回归。
 - [ ] Core 侧不保留平台入口：`routers/voice.py` 已删除，`twilio` 不在 Core 默认依赖；
   扫码登录是登记在案的有界例外。
-- [ ] Channel 的存在性、身份字段、配置字段和环境变量透传均以 descriptor 为唯一事实来源。
+- [ ] Channel 的存在性、身份字段、配置字段展示投影和环境变量透传均以 descriptor 为唯一
+  事实来源；完整配置 value schema 仍按 Design §11.0 的 Pydantic/JSON Schema 边界校验。
 - [ ] pip/source/conda、frozen desktop 和容器语义一致。
 - [ ] Windows、Linux、macOS 验证通过。
 - [ ] 相关 Python 单测通过率 100%，pre-commit 和 diff check 通过。
@@ -198,25 +199,86 @@ WeCom 测试共 `182 passed`；目标文件 `pre-commit` 全部通过，`git dif
 
 ### CH-0-002：标识、descriptor 和单实例模型
 
-- [ ] 定义 `channel_key`、`instance_id`、`environment_spec_id`、`environment_id`。
-- [ ] 定义 canonical Python ABI、platform tag 和 condition set digest。
-- [ ] 定义 descriptor 的 source kind、process mode、`ingress_owner=none|runner_owned|core_owned`
-  和 capabilities。
-- [ ] 定义 `dispatch_mode=manager_queue|direct_session`，并将其纳入 descriptor/schema
-  和 Core proxy 解析。
-- [ ] 定义 `process_mode` 到 `BaseChannel` 或 `ChannelDriver` 的唯一映射，不建立重复的
-  driver kind 字段。
-- [ ] 定义 core requirements 与 isolated dependencies 的边界，Core 不保留平台 SDK。
-- [ ] 定义静态 descriptor 不 import 平台模块的规则。
-- [ ] 定义 `bot_identity_fields`（含归一化规则）和环境变量透传白名单两个 descriptor
-  字段（ADR-028、ADR-030）。
-- [ ] 盘点 Design §11.1 的六张 per-channel 硬编码表，给出逐表收敛归属，并明确
-  descriptor 未声明时是“不参与”而非“静默跳过”。
-- [ ] 保持 `channels.<channel_key>`、CLI、API 和前端单实例外部行为。
-- [ ] 证明内部按 `instance_id` 管理，不把 `channel_key` 写死为全局 singleton。
+- 状态：[-] 初始实现与验证通过，等待独立 Review。
 
-验收：同一输入在三平台得到稳定合法 ID；descriptor 可作为 Catalog/lock/installer
-的单一事实来源。
+本任务先冻结 `DESIGN.md` §10.1、§10.4、§11.0、§11.1 的 v1 契约；在同一任务内
+实现 canonical encoder、Requirement canonicalizer、ID/目录键模型和 descriptor v1 validator，
+并完成聚焦单测。直接依赖为 `CH-0-001`（已独立 Review 通过）；所属 Gate 为 `G0`。
+`CH-2-006` 只负责消费这些模型并实现 Registry/实例解析，`CH-1-001`/`CH-1-002` 消费 lock、
+condition 和 environment spec，`CH-6-001`/`CH-6-003` 消费配置字段展示投影，
+`CH-6-007`/`CH-6-008` 分别收敛查重和扫码例外。
+
+契约交付：
+
+- [x] `channel_key`、`instance_id`、`environment_spec_id`、`environment_id` 的前缀、payload、
+  canonical JSON、domain separator、SHA-256、安装 ID 持久化和 `dir1_` 目录键规则见 Design
+  §10.1.1--§10.1.2；目录布局映射见 §10.4；跨平台 hash 向量见 §11.0.1、ADR-035。
+- [x] Python ABI、release target registry 的 platform tag 成员校验、有限 condition domain、
+  默认值展开和 digest 规则见 Design §10.1.3。
+- [x] Requirement 的 project name、extras、specifier、marker、URL、排序和去重 canonical
+  算法见 Design §10.1.4。
+- [x] descriptor v1 closed object、required/nullable/empty 语义、entrypoint、依赖、条件、
+  targets、capabilities、bot identity、secret default、配置投影边界和环境透传字段见 Design
+  §11.0、§11.0.1、ADR-036。
+- [x] `source_kind`、`process_mode`、`dispatch_mode`、`ingress_owner` 及从 process mode
+  派生 `BaseChannel`/`ChannelDriver`/`IsolatedChannelProxy` 的唯一映射见 Design §4.1、
+  §5.1--§5.3、§11.0。
+- [x] Core/isolated dependency boundary、静态 descriptor 不 import 平台模块和 legacy Plugin
+  合成限制见 Design §6.4、§10.3、§11.0、§12.1--§12.2。
+- [x] Design §11.1 六张硬编码表的 owner、后续任务和本任务不做项已逐表列明；未声明字段只
+  能在显式空值语义下表示“不参与”，validator 漏配必须返回 `descriptor_invalid`。
+- [x] `channels.<channel_key>`、CLI、API、Console 单实例兼容面及内部 `instance_id` ownership
+  约束见 Design §4.2、§14.3；本任务不增加多实例产品入口。
+
+实现交付：
+
+- [x] 实现含唯一 string escape、finite decimal JSON number 的受限 canonical JSON encoder、
+  domain-separated SHA-256 helper 和 Design §10.1.4 Requirement canonicalizer；所有 digest
+  只接收 canonicalized value。
+- [x] 实现 `channel_key`、`instance_id`、`environment_spec_id`、`environment_id`、
+  installation ID、ABI/platform 输入、release target registry 成员校验和 `dir_key` 的 value
+  model、生成与严格校验函数。
+- [x] 实现 descriptor v1 closed data model、交叉字段 validator 和 canonical digest；验证
+  unknown field、secret default、Requirement、identity 和 capability 规则，静态校验不得
+  import descriptor entrypoint；CH-0-002 不解析 Pydantic/JSON Schema，schema adapter 和
+  投影一致性检查完整归入 `CH-2-006`。
+- [x] 为 canonical、ID、目录键、descriptor 和单实例 ownership 添加聚焦单测；测试只使用
+  pure value model，不提前实现 Registry/Catalog。
+
+验证向量和证据要求：
+
+- [x] canonical JSON 至少覆盖 ASCII/Unicode NFC、唯一 control character escape、literal
+  slash/U+2028/U+2029、surrogate 拒绝、object key 重排、array 顺序、整数/decimal 边界、
+  null、重复 key、binary float/bytes/Path 拒绝和 domain separator 隔离；固定向量不得读取
+  host locale、路径规则或默认 JSON encoder，G0 在目标平台复用同一测试文件。
+- [x] ID 向量至少覆盖三个平台 tag、三个 Python ABI、大小写敏感 `agent_id`、空 condition `{}`、
+  lock/condition/platform/ABI 变化、release target registry 成员/非成员、repair 新 installation
+  和短目录键碰撞校验。
+- [x] descriptor validator 向量覆盖 closed object、每个 enum、entrypoint/process 映射、
+  LocalizedText 空值/fallback/URL、secret default/identity 引用/值不外泄、Requirement
+  canonicalization/重复折叠/`extra` marker 拒绝、requirement array 的 process-mode 约束、
+  有限 condition/allowed-values、
+  capability-ingress 组合、identity 排序与重复 name、allowlist、完整 descriptor digest fixture
+  和 legacy 非 canonical key。
+- [x] 单实例兼容测试证明两个 Agent 的同一 `channel_key` 得到不同 `instance_id`，同一 Agent
+  的重复解析稳定，内部状态 key 不以 `channel_key` singleton 覆盖；测试执行使用 conda 环境
+  `qwenpaw`，并通过 Python 单测、pre-commit 和 `git diff --check`。
+
+初始实现证据：CH-0-002 聚焦测试 `94 passed`，`tests/unit/channel_isolation` 共
+`105 passed`；目标 Python、测试和文档文件的 pre-commit 全部通过，`git diff --check`
+通过。Design §11.0.1 的完整 descriptor fixture 从文档原文机械重算为
+`8b05ef521e5f2ae268f90f704dd36f1fe1e8eb958182c1c0220ffe6405e7cdb8`，与实现固定向量一致。
+本记录保持 `[-]`，待独立 Review 和最终验证后才能标记完成。
+
+本任务明确不做：登记实际 builtin/Plugin descriptor；迁移或删除 Registry/Catalog 和 §11.1
+硬编码表；生成或安装 lock；创建 environment/Runner/Proxy；改变现有 Pydantic config schema；
+迁移 bot 查重或扫码登录；修改 CLI/API/Console、SDK、Channel 行为和前端；创建提交或将任务
+标记完成。任务只有在用户确认契约、完成上述实现和测试、独立 Review 与最终验证全部通过后，
+才允许更新为 `[x]`。
+
+验收：Design §10.1、§10.4、§11.0、§11.1 的契约由本任务实现的 canonical encoder、ID model、
+descriptor validator 和聚焦单测机械验证；ADR-035/036 已确认。初始
+实现和验证完成后状态仍保持 `[-]`，等待独立 Review。
 
 ### CH-0-003：stdio framing 和传输层
 
@@ -348,6 +410,8 @@ backpressure 测试通过。
 
 - [ ] 职责、descriptor、stdio framing、JSON-RPC、可靠投递、媒体和 Runner-owned Voice
   ingress 边界冻结；如需 Core-owned 兼容入口，必须有独立 ADR。
+- [ ] CH-0-002 的 canonical encoder、ID/目录键模型和 descriptor v1 validator 已通过聚焦
+  单测与独立 Review；目标平台运行同一固定 hash 向量得到一致结果。
 - [ ] 飞书、OneBot、Voice/Twilio 三条纵向原型分别通过。
 - [ ] 无阻塞当前 Phase 的 P0/P1。
 
@@ -479,6 +543,8 @@ stderr。
 ### CH-2-006：Descriptor Registry 和实例解析
 
 - [ ] 实现静态 descriptor 枚举和 Channel 实例解析两层 Registry。
+- [ ] 复用 CH-0-002 的 descriptor model/validator；实现 builtin Pydantic JSON Schema
+  adapter 和 `config_fields` 投影一致性检查，不得复制或改写 canonical/ID/descriptor 算法。
 - [ ] 支持 Core Channel、runner-process Channel 和 legacy Plugin Channel 混合运行。
 - [ ] legacy descriptor 从既有 PluginRegistration 合成。
 - [ ] 禁止通过 import 成功与否推断 Channel 存在性。
@@ -688,6 +754,8 @@ endpoint 切换和故障矩阵达到发布标准；Core-owned 兼容实现仅按
 ### CH-5-001：Isolated Plugin 描述、依赖和安装模型
 
 - [ ] 定义静态 plugin descriptor 和版本兼容矩阵。
+- [ ] 冻结 isolated Plugin artifact 的完整版本化 config value schema；descriptor
+  `config_fields` 只作为该 schema 的 UI 投影，不替代运行时验证。
 - [ ] 定义插件依赖声明、lock、wheel hash 和支持目标。
 - [ ] 定义插件源码不进入 dependency environment 的加载方式。
 - [ ] 定义 plugin artifact digest、来源 metadata 和 `code_root` 校验边界；仅复用产品
@@ -741,9 +809,10 @@ endpoint 切换和故障矩阵达到发布标准；Core-owned 兼容实现仅按
 - [ ] 实现 `channels list/install/repair/verify-env/restart` 的运维语义。环境校验命令命名
   为 `verify-env`，不占用 `doctor`（ADR-029）。
 - [ ] 保持既有 `channels list`、`channels config`、`channels send` 兼容：`list` 输出兼容；
-  `config` 的 per-channel configurator 表按 Design §11.1 收敛到 descriptor；`channels send`
-  经由 Runner 的 `channel.send` 执行，Runner 未运行时返回明确错误，不绕过 Runner 直连
-  平台 SDK。
+  `config` 的显示名和 `config_fields` 可表达的 projection 按 Design §11.1 收敛到 descriptor，
+  未投影的 array/object/float 等字段继续从完整 Pydantic/JSON Schema（Plugin 为 artifact
+  schema）取得类型、默认值和交互渲染；`channels send` 经由 Runner 的 `channel.send` 执行，
+  Runner 未运行时返回明确错误，不绕过 Runner 直连平台 SDK。
 - [ ] 明确 `channels verify-env` 不产生网络 I/O，与顶层 `qwenpaw doctor` 的平台连通性
   探测语义分离，并在帮助文本和文档中区分。
 - [ ] health/list/Core 启动不触发安装；显式 install/repair 或用户启用/启动 Channel 时
@@ -801,7 +870,8 @@ endpoint 切换和故障矩阵达到发布标准；Core-owned 兼容实现仅按
 依赖 `CH-0-002` 的 `bot_identity_fields` 字段定义和 `CH-2-006` 的 Registry。
 
 - [ ] 将 `conflict.py` 的 `_CHANNEL_IDENTITY_FIELDS` 硬编码表收敛到 descriptor 的
-  `bot_identity_fields`，保留现有归一化规则（`homeserver`/`url` 去尾部斜杠、值 strip）。
+  `bot_identity_fields`，保留现有归一化规则（`homeserver`/`url` 去尾部斜杠、值 strip）和
+  Discord、Telegram、Slack、Mattermost、WeChat 的 secret token 查重。
 - [ ] 改为 config 级比较：枚举已配置 Agent（与 `/agents` 列表同源）后读取各自
   `channels.<key>` 配置段提取身份值，不再遍历其他 Agent 的 `channel_manager.channels`，
   也不读取其内存态 `Config`。
@@ -813,7 +883,8 @@ endpoint 切换和故障矩阵达到发布标准；Core-owned 兼容实现仅按
 - [ ] 响应附带对方的 enabled/instance 状态，使 Console 能区分“已配置”与“正在运行”两种
   文案；状态取自 Core 侧 instance 注册信息，不反射其他 Agent 的对象。
 - [ ] 保持 secret 不回显：响应只含 `agent_id` 和 Agent 名称，不含身份字段值；沿用现有
-  回归测试。
+  回归测试。secret effective value 只在 Core 内存中比较，不进入 digest、ID、日志、RPC、
+  持久化诊断或 API 响应。
 
 验收：查重在隔离后仍生效且不依赖存活探测；未启动 Agent 的配置冲突可被发现；命中范围
 扩大为“已配置”这一变化在 Console 文案中有明确表达。

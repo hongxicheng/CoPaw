@@ -852,20 +852,157 @@ generation fencing。若音频处理始终留在 Runner 内部，音频不跨 Co
 
 ### 10.1 标识
 
+标识只使用逻辑值，不拼接文件系统路径，也不读取当前工作目录。所有 hash 输入都使用
+§10.1.1 的 canonical JSON；hash 为完整 SHA-256 小写十六进制，不截断。逻辑 ID 可以写入
+协议和 manifest，但 secret、绝对路径和平台凭证不得进入任何标识输入。
+
+#### 10.1.1 Canonical JSON
+
+本设计使用一个受限、版本化的 JSON 子集作为标识和 descriptor digest 的唯一编码：
+
+- 输入只允许 object、array、UTF-8 string、boolean、null、signed 64-bit integer 和有限
+  base-10 decimal；禁止 binary float、NaN/Infinity、bytes、`Path` 和语言专属对象。decoder
+  必须将 JSON number 解析为精确 decimal，而不是 host float；
+- object key 和 string value 先执行 Unicode NFC；NFC 后出现重复 key 必须拒绝；
+- object key 按 Unicode code point 升序排列；array 保持声明顺序；集合语义字段必须在进入
+  encoder 前按各字段规则排序和去重；
+- string 只允许 Unicode scalar value；NFC 后包含 U+D800--U+DFFF surrogate 的 string/key
+  必须拒绝。string 使用 UTF-8 字面量，不转义 `/`、非 ASCII、U+2028 或 U+2029；只允许
+  `"`、`\\`、`\b`、`\t`、`\n`、`\f`、`\r` 六种短转义，其他 U+0000--U+001F 控制字符
+  必须写成唯一的 `\u00xx`（小写 hex）转义；
+- integer 写为十进制且不带 `+`、前导零或 exponent；decimal 先去尾随零，负零写为 `0`，再
+  写为无 exponent、无前导零的十进制 JSON number。canonical decimal 超过 128 个字符必须
+  拒绝，避免等价指数形式产生无界编码；
+- 使用 UTF-8、无 BOM、无缩进、分隔符 `,`/`:`，不写末尾换行。`ensure_ascii=false` 只描述
+  输出中非 ASCII scalar 的字面量规则，不能替代本节的完整转义规则；
+- hash 输入为 ASCII domain separator、单个 NUL byte 和 canonical JSON bytes。domain
+  separator 中包含 schema version，避免未来算法升级与 v1 碰撞。
+
+任何实现语言都必须用测试向量证明输出 bytes 完全一致，不能依赖默认 JSON encoder、dict
+插入顺序、locale、系统路径分隔符或平台换行。
+
+#### 10.1.2 逻辑 ID
+
+`channel_key` 是用户可见配置、CLI 和 API 使用的稳定逻辑 key。新的 builtin descriptor 和
+isolated Plugin descriptor 必须使用 1--64 字符的 canonical key，格式为
+`^[a-z0-9](?:[a-z0-9_-]{0,62}[a-z0-9])?$`；解析时不自动 trim、lower 或替换字符，非
+canonical 输入直接拒绝。现有 legacy Plugin 继续使用既有注册流程生成的 key；若其历史 key
+不满足新格式，只能合成为 `source_kind=plugin`、`process_mode=in_process` 的 legacy
+descriptor，不能升级为 isolated descriptor，也不能直接用作磁盘目录名。builtin、legacy
+Plugin 和 isolated Plugin 的最终 key 在 Catalog 中必须全局唯一。
+
+`agent_id` 使用 Core 已提交配置中的精确值，区分大小写；生成标识时不得再次 sanitize 或
+lower。系统默认 Agent 使用其已提交的稳定 ID。空 `agent_id` 或空 `channel_key` 必须拒绝。
+
 ```text
-environment_spec_id = hash(
-  channel_key,
-  lock_sha256,
-  python_abi,
-  platform_tag,
-  condition_set
+instance_payload = {
+  "agent_id": agent_id,
+  "channel_key": channel_key
+}
+instance_id = "chi1_" + sha256(
+  "qwenpaw.channel.instance.v1" + NUL + canonical_json(instance_payload)
 )
-environment_id = environment_spec_id + immutable_installation_id
-instance_id = deterministic(agent_id, channel_key)
+
+condition_set_sha256 = sha256(
+  "qwenpaw.channel.conditions.v1" + NUL + canonical_json(condition_set)
+)
+
+environment_spec_payload = {
+  "channel_key": channel_key,
+  "condition_set_sha256": condition_set_sha256,
+  "lock_sha256": lock_sha256,
+  "platform_tag": platform_tag,
+  "python_abi": python_abi
+}
+environment_spec_id = "ches1_" + sha256(
+  "qwenpaw.channel.environment-spec.v1" + NUL
+  + canonical_json(environment_spec_payload)
+)
+
+immutable_installation_id = "install1_" + 32 lowercase hex characters
+environment_id = environment_spec_id + "." + immutable_installation_id
 ```
 
+`lock_sha256` 和 `condition_set_sha256` 必须是完整的 64 个小写 hex 字符。`immutable_installation_id`
+使用 128-bit CSPRNG，在一个 staging installation 创建时生成一次，并原样持久化到
+`install.json`；同一个 installation 重读时不变，repair 或重新安装必须产生新值。因此同一
+spec 可以对应多个不可变 installation，但一个 `environment_id` 只指向一个 installation。
+
 同一 `environment_spec_id` 可以有多个不可变 `environment_id`，用于 repair 和候选
-切换。活动 environment 不原地升级。
+切换。活动 environment 不原地升级。磁盘目录键与上述逻辑 ID 分离：目录键使用
+`dir1_` 加逻辑 ID UTF-8 bytes 的 SHA-256 前 32 个 hex；创建或读取目录时必须用 manifest
+中的完整逻辑 ID 检查碰撞，不能因短 hash 相同而复用。任何位置都不得把 `channel_key`、
+`agent_id` 或完整逻辑 ID 当作相对/绝对路径片段拼接。
+
+#### 10.1.3 Python ABI、platform tag 和 condition set
+
+canonical `python_abi` 是 PEP 425 interpreter tag 与 ABI tag 的组合
+`<interpreter>-<abi>`，例如 CPython 3.11--3.13 分别为 `cp311-cp311`、
+`cp312-cp312`、`cp313-cp313`；debug、free-threaded 或其他解释器必须保留其真实 ABI tag，
+不得折叠为普通 CPython。实现从 `packaging.tags.sys_tags()` 中选择当前解释器最优先且
+ABI 不为 `none` 的 tag，取其 `interpreter` 和 `abi`；结果必须等于 lower-case canonical
+形式并匹配 `^[a-z0-9_]+-[a-z0-9_]+$`。
+
+canonical `platform_tag` 是发布 lock/manifest 选择的 PEP 425 platform component，例如
+`win_amd64`、`macosx_11_0_arm64`、`manylinux_2_28_x86_64`。它必须是 lower-case 且匹配
+`^[a-z0-9]+(?:_[a-z0-9]+)*$`，但该 grammar 本身不证明 tag 合法；`packaging.tags.Tag` 能
+构造也不得作为验证依据。一个 tag 只有同时满足下列条件才合法：
+
+- 由版本化的 release target registry 枚举；该 registry 的 tag 必须来自受支持 target
+  interpreter 上 `packaging.tags.sys_tags()` 产生的 `Tag.platform`，或来自该 target 已验证
+  wheel 的 platform tag；
+- 属于当前 descriptor 的 `supported_platform_tags` 与当前发布 manifest 的 target 集交集；
+- 通过 `CH-0-002` validator 传入的 `allowed_platform_tags` 成员检查。
+
+`windows`、`darwin`、`macos`、裸 `x86_64` 等产品别名从不在 registry 中，必须拒绝。
+`CH-1-001` 负责生成和签入 release target registry/manifest；CH-0-002 只冻结其 value model
+和成员校验接口，不从 `sys.platform`、路径、locale 或任意可构造的 `Tag` 猜测合法性。
+
+`condition_set` 是 descriptor 声明的全部 condition fields 到 effective config value 的
+object。Core 必须先用当前 config schema 展开默认值，再校验 allowed values，然后按字段名
+排序进入 canonical JSON。condition value 只允许 string、boolean、null 或有符号 64-bit
+integer；condition field 禁止引用 secret、任意路径、自由文本或 decimal。每个 condition
+field 都必须声明非空、有限的 `allowed_values`：string/integer 必须显式列出所有允许值，
+boolean 使用 `[false]`、`[true]` 或 `[false, true]`，null 只能作为显式 array 成员。没有
+condition fields 时使用空 object `{}` 的 digest，而不是空字符串或缺失值。配置中与 condition
+fields 无关的变化不得改变 `environment_spec_id`。
+
+#### 10.1.4 Requirement canonicalization
+
+descriptor 中的 requirement 字符串使用 PEP 508 解析，但 PEP 508 本身不规定唯一的重新
+序列化形式。v1 validator 因此先用 `packaging.Requirement` 解析，再按下列规则产生唯一的
+canonical requirement；descriptor digest 对 canonicalized descriptor 计算，不对生产者提供的
+原始 requirement 拼写计算：
+
+- project name 和 extras 使用 PEP 503 `canonicalize_name` 的小写结果；extras 按 ASCII
+  升序排列，写成 `name[extra-a,extra-b]`；解析器折叠或 canonicalize 后的重复 extra 必须
+  去重，不能要求 validator 从已解析对象恢复原始重复 token；
+- specifier 先由 `packaging.specifiers.Specifier` 验证。除 arbitrary equality `===` 外，
+  version 使用 `packaging.version.Version` 的字符串结果；`==`/`!=` 的 `.*` 前缀先按
+  `Version` canonicalize 再加回 `.*`；`===` 的 value 按区分大小写的 NFC 字符串原样保留。
+  每项写成无空白的 `operator + version`，按完整字符串 ASCII 升序排列，以逗号连接；
+  解析器折叠或 canonicalize 后的重复 specifier 必须去重，不能要求 validator 从已解析对象
+  恢复原始重复 token；没有 specifier 时省略该部分；
+- direct URL requirement 使用 `name[extras] @ url` 形式。URL 必须是解析结果中的非空绝对
+  URL，不含空白或用户信息；scheme 和 DNS host 转小写，host 使用 ASCII IDNA，移除
+  `http:80`/`https:443` 默认端口，空 HTTP(S) path 写成 `/`，path 执行 RFC 3986 dot-segment
+  移除；所有 URL component 中的 percent triplet 使用大写 hex，并解码 percent-encoded
+  unreserved character。query 和 fragment 保持项目顺序，不做服务端语义推断；specifier
+  与 direct URL 不能同时出现；
+- marker 不得引用 PEP 508 `extra` variable。descriptor requirement 只描述当前 Channel 的
+  直接依赖，v1 不携带 owner-extra context；若需要该语义，必须在未来 schema version 中显式
+  建模。其余 marker 由 PEP 508 marker parser 生成 expression tree 后重新序列化：variable 使用规范中
+  的小写标识；字符串先 NFC，再使用双引号并只转义 `\` 和 `"`；comparison 两侧和 operator
+  之间各一个 ASCII 空格；同层 `and`/`or` 子项先 flatten、按其 canonical string 的 Unicode
+  code point 升序排列并拒绝重复，只有保留 `and`/`or` 优先级所需时才写括号。完整 requirement
+  使用单个 ASCII 空格包围分号：`base ; marker`；不同的布尔 expression tree 仍视为不同声明，
+  v1 不做分配律或运行时 environment 等价推理；
+- canonical requirement array 按上述完整字符串的 Unicode code point 升序排列并去重；
+  `core_requirements` 与 `isolated_requirements` 的生产者声明顺序和等价重复项不产生语义，
+  也不得影响 digest。
+
+测试必须覆盖项目名大小写、extras 顺序、specifier 顺序、marker 空白/引号/同层布尔项顺序、
+direct URL 和重复项，并证明等价输入得到相同 canonical requirement array 和 descriptor digest。
 
 ### 10.2 依赖校验
 
@@ -915,15 +1052,18 @@ hash。`condition_set` 只允许机器可求值的配置 equality，必须先按
 `lock_sha256`；缺失、重复或多重匹配都必须拒绝。没有完全匹配 lock/wheel 时状态为
 `unsupported_platform` 或 `config_invalid`，不得退回宽松解析或现场构建 sdist。
 
-建议目录：
+目录布局：
 
 ```text
 <working-dir>/channel_envs/
-  <channel_key>/
-    environments/<environment_spec_dir>/<environment_dir>/
-      venv/
-      dependency.lock
-      install.json
+  <channel_dir>/
+    channel.json
+    environments/<environment_spec_dir>/
+      environment_spec.json
+      <environment_dir>/
+        venv/
+        dependency.lock
+        install.json
     instances/<instance_dir>/
       instance.json
       current.json
@@ -931,6 +1071,24 @@ hash。`condition_set` 只允许机器可求值的配置 equality，必须先按
       state/
       logs/
 ```
+
+目录键与逻辑 ID 的映射固定为：
+
+```text
+channel_dir = dir_key(channel_key)
+environment_spec_dir = dir_key(environment_spec_id)
+environment_dir = dir_key(environment_id)
+instance_dir = dir_key(instance_id)
+```
+
+其中 `dir_key(logical_id)` 是 `dir1_` 加 logical ID UTF-8 bytes 的 SHA-256 前 32 个小写
+hex。任何目录布局不得直接使用 `channel_key`、`agent_id` 或完整逻辑 ID 作为路径片段。
+`channel.json` 保存完整 `channel_key`，`environment_spec.json` 保存完整
+`environment_spec_id`，`install.json` 保存完整 `environment_id` 和其 spec ID，
+`instance.json` 保存完整 `instance_id`、`agent_id` 和 `channel_key`；pointer 也必须保存其
+引用的完整逻辑 ID。创建或读取每一级目录时都要核对对应 manifest，短目录键冲突时必须返回
+稳定错误而不是复用目录。manifest 必须先写入 staging 并随目录原子发布；缺失、格式错误或
+逻辑 ID 不一致的 manifest 都不得解释为空目录或合法 installation。
 
 逻辑 ID 与磁盘目录键分离，目录键使用跨平台安全的短 hash，完整逻辑 ID 保存在
 `install.json` 和 pointer 中。environment 按 Channel lock、ABI、平台和条件集共享，
@@ -961,12 +1119,200 @@ descriptor 至少包含：
 - required/conditional dependencies、core requirements 和 external requirements；
 - plugin metadata 和配置字段。
 
+#### 11.0 Descriptor v1 规范
+
+CH-0-002 冻结 descriptor 的数据形状；Registry、Catalog 和各个配置面只负责消费该形状，
+不在本任务中迁移现有硬编码表。descriptor 是一个 UTF-8 JSON object，顶层字段如下，所有
+字段都必须出现（没有值时使用表中规定的空值）。顶层 object 和除 LocalizedText locale map
+以外的所有嵌套 object 都是 closed object，等价于 JSON Schema `additionalProperties=false`；
+任何未知字段都必须返回 `descriptor_invalid`。LocalizedText 的动态 object 只允许 BCP-47
+locale key 和字符串值，不得借此引入其他字段：
+
+```json
+{
+  "schema_version": 1,
+  "channel_key": "feishu",
+  "source_kind": "builtin",
+  "process_mode": "runner_process",
+  "dispatch_mode": "manager_queue",
+  "ingress_owner": "none",
+  "label": {"en": "Feishu", "zh": "飞书"},
+  "description": {"en": "", "zh": ""},
+  "icon": "",
+  "doc_url": "",
+  "plugin_metadata": null,
+  "entrypoint": {
+    "scope": "runner",
+    "module": "qwenpaw.app.channels.feishu.driver",
+    "qualname": "FeishuDriver"
+  },
+  "config_fields": [],
+  "core_requirements": [],
+  "isolated_requirements": [],
+  "condition_fields": [],
+  "supported_python_abis": [],
+  "supported_platform_tags": [],
+  "capabilities": [],
+  "bot_identity_fields": [],
+  "environment_passthrough_allowlist": []
+}
+```
+
+字段语义和校验规则如下：
+
+- `schema_version` 当前只能为整数 `1`；未知版本必须拒绝，不能按最佳努力解析。
+- `channel_key` 遵守 §10.1.2。descriptor 集合中 key 全局唯一；`builtin` key 必须对应
+  发布物中的内置记录，`plugin` key 必须包含稳定的 plugin owner metadata。`plugin_metadata`
+  对 builtin 必须为 JSON `null`；对 plugin 必须为 object，严格包含 `plugin_id`、`version`
+  和 `artifact_sha256` 三个非空字符串，其中 digest 是 64 个小写 hex 字符。plugin owner
+  由 `plugin_id` 精确标识，不能从 channel key 反推。legacy Plugin 的 descriptor 是明确的
+  compatibility profile：由既有注册记录确定性合成，`plugin_metadata.artifact_sha256` 可为
+  空字符串（表示当前 manifest 没有 artifact digest），且只能保持 `in_process`；历史非
+  canonical key 不能伪装成 v1 isolated descriptor。isolated Plugin 则必须提供非空 digest，
+  并按 §12.2 校验 artifact 来源。
+- `source_kind`、`process_mode`、`dispatch_mode` 和 `ingress_owner` 只能使用各自表中的
+  枚举值。`ingress_owner=runner_owned` 必须是 `process_mode=runner_process` 且声明
+  `ingress_endpoint` capability；`ingress_owner=none` 不得声明外部 ingress capability。
+  `core_owned` 只表达入口归属，不允许把平台 SDK 或 socket 对象放进 Core。
+- `entrypoint` 是 object，必须包含 `scope`、`module`、`qualname` 三个非空 ASCII 字段。
+  `module` 和 `qualname` 使用点分隔 Python 标识符；`scope=core` 只可与
+  `process_mode=in_process` 同时出现，`scope=runner` 只可与
+  `process_mode=runner_process` 同时出现。`in_process` 的 entrypoint 解析为
+  `BaseChannel`；`runner_process` 的 entrypoint 解析为 Runner 侧 `ChannelDriver`，Core
+  侧固定创建 `IsolatedChannelProxy`。不得再添加 `driver_kind` 或其他重复映射字段。
+- `label`、`description`、`doc_url`、`config_fields[].label`、`help` 和 `placeholder` 使用
+  `LocalizedText`：一个 NFC string，或非空的 BCP-47 locale key 到 NFC string 的 closed-value
+  map；locale key 以 ASCII lower-case primary language 开头，可带 BCP-47 subtag，按
+  §10.1.1 canonicalize。map 不提供隐式 locale fallback：consumer 必须依次选择精确 locale、
+  primary language、`en`、第一个按 key 排序的值。新的 builtin/isolated descriptor 的
+  `label` 必须是 map 且含非空 `en`、`zh`；`description` 可以是空 string，map 可含空值；
+  legacy 合成记录可以保留现有 string 或 map。`doc_url` 可以是空 string；非空 string 或 map
+  中的每个非空值都必须是 `http://`/`https://` absolute URL，不允许 data URL、相对路径或文件
+  路径。`icon` 同样只能是空值或 HTTP(S) absolute URL。
+- `config_fields` 是保持声明顺序的 array。每个 field object 必须包含
+  `name`、`label`、`help`、`placeholder`、`type`、`required`、`nullable`、`default`、
+  `allowed_values`、`secret` 和 `condition`：`name` 匹配 `^[a-z][a-z0-9_]*$` 且在 descriptor
+  内唯一；`label`、`help`、`placeholder` 是 `LocalizedText` 或空字符串；
+  `type` 只能为 `text`、`password`、`number`、`switch` 或 `select`；`required`、
+  `nullable`、`secret`、`condition` 为 boolean；无默认值用 JSON `null`；无枚举约束用空
+  array。`number` 的 default/allowed value 是 §10.1.1 的 integer 或 finite canonical
+  decimal JSON number；不得使用 binary float 或指数拼写。`required=true` 与
+  `nullable=true` 的组合必须拒绝；`required=true` 时 effective value 不得为 null 或空字符串；
+  `nullable=true` 时允许 null；`required=false` 且
+  `default=null` 表示未提供时仍为 null。`config_fields` 是 CLI/API/frontend 的字段展示、
+  录入和条件声明投影，不是完整的运行时 value schema；它只覆盖 v1 UI 控件和标量约束。
+  array/object/float 等 v1 UI 无法表达的字段可以不出现在 projection 中，仍由完整 schema
+  接受和校验；但 `condition_fields`、`bot_identity_fields` 引用的字段必须出现在 projection。
+  builtin effective config 的完整类型、array/object/float 约束和默认值继续由现有 Pydantic/
+  JSON Schema 负责；CH-0-002 只校验 descriptor 自身的 field 结构和交叉引用，不解析外部
+  schema。`CH-2-006` 负责实现 builtin schema adapter 和投影一致性检查，并且不得要求
+  descriptor validator import Channel 或平台模块。
+  isolated Plugin 的完整 value schema 属于其 plugin artifact 的版本化 schema，由
+  `CH-5-001` 冻结；不得把五种 UI type 当作插件运行时 schema。`allowed_values`
+  只能包含与 `type` 相容的 canonical JSON scalar value 且不得重复，非空时 effective value
+  必须命中；`secret=true` 时 `default` 必须是 JSON `null`，`allowed_values` 必须为空 array，
+  且有效 secret value 永不进入 descriptor digest、ID、日志、RPC 或 manifest。
+  `condition=true` 的 field 才能出现在 `condition_fields`；`secret=true` 与 `condition=true`
+  的组合必须拒绝。
+- `core_requirements` 和 `isolated_requirements` 是生产者声明顺序无语义、进入 digest 前按
+  §10.1.4 canonicalize、排序并去重的 requirement array。前者表达平台无关的 Core
+  最小依赖，后者表达 Runner environment 的直接第三方依赖；两者都可为空。
+  CH-0-002 只做 PEP 508 解析和 canonicalization，不判断 distribution 是否属于平台 SDK、
+  是否已安装在 Core，也不维护额外的依赖 policy。平台依赖放置由后续逐 Channel 迁移和发布
+  验证检查。`process_mode=in_process` 时
+  `isolated_requirements` 必须为空，`process_mode=runner_process` 时平台 SDK 必须只在
+  `isolated_requirements` 中声明。
+- `condition_fields` 是 field `name` 的排序去重 array，所有引用必须存在、`condition=true`、
+  且其 effective value 满足 §10.1.3 的标量限制和非空有限 `allowed_values`。condition field
+  不得使用 `type=password` 或 `type=number` 的 decimal value；boolean/null 必须按 §10.1.3
+  显式列出有限值。无条件 descriptor 必须显式使用空 array；effective `condition_set` 没有
+  字段时为 `{}`。
+- `supported_python_abis` 和 `supported_platform_tags` 使用 §10.1.3 的 canonical 字符串，
+  排序去重；空 array 只表示该 descriptor 不限定目标（`in_process` 的默认形态），不表示
+  “未知”。isolated descriptor 至少声明一个 ABI 和一个 platform，发布 lock 再从中选择
+  精确组合。
+- `capabilities` 是排序去重的 capability ID array；ID 匹配
+  `^[a-z][a-z0-9_.-]*$`，按 ASCII lower-case 比较，协议 capability registry 负责词汇表和
+  方法 Schema 绑定。未登记的 ID、重复项或与 `ingress_owner` 不一致的 ID 必须拒绝；没有
+  能力用空 array，不用隐式默认值。v1 保留以下稳定 capability ID：
+  `streaming`、`typing`、`reaction`、`media`、`approval_card`、`server_side_idempotency`、
+  `exactly-once-visible`、`ingress_endpoint`、`checkpoint` 和 `host_state`。
+  `exactly-once-visible` 只有在同时声明 `server_side_idempotency` 的平台 profile 中才可使用。
+  能力声明只描述可用操作，
+  不改变 `process_mode` 到驱动的唯一映射。
+- `bot_identity_fields` 是按 `(name, normalization)` 排序的 object array，每项严格为
+  `{ "name": string, "normalization": enum }`；`name` 必须引用 `config_fields` 中的字段，
+  包括 `secret=true` 的字段；`normalization` v1 只能为 `strip` 或
+  `strip_trailing_slash`。同一 `name` 只能声明一次，即使 normalization 不同也必须拒绝；
+  validator 在计算 digest 前按该 key 排序；完整 object array 的源顺序不得影响 digest。
+  Core 在 config 级比较时才读取并比较 effective value；descriptor 只保存字段名和
+  normalization，任何 secret value 都不得进入
+  descriptor、digest、ID、日志、RPC、持久化诊断数据或 API 响应。两种 normalization 都先
+  转字符串并去首尾空白，后者再去除所有末尾 `/`；任一字段为空时 descriptor 不产生
+  identity。显式空 array 表示该 Channel 不参与查重，不得解释为漏配或默认查重。
+- `environment_passthrough_allowlist` 是排序去重的环境变量名 array；名称匹配
+  `^[A-Z][A-Z0-9_]*$`，不得出现通配符、赋值号、值、路径或 secret。Runner 的
+  `minimal_env` 只从该 allowlist 和 §6.4 的协议启动变量构造，不从 Core 环境无条件继承；
+  代理和 TLS 变量必须逐 Channel 显式声明，空 array 表示没有额外透传。
+
+静态 descriptor 读取只允许打开 descriptor 文件、解析 JSON、执行上述结构/字符串校验和
+计算 canonical digest；不得 import `entrypoint.module`、探测平台 SDK、读取安装环境、执行
+代码或启动 Runner。只有通过静态校验后，Runner bootstrap 才能在 §6.4 的 isolated environment
+中按 entrypoint 加载 driver。上述 object 的 required/nullable/empty 语义是 descriptor v1 的兼容契约。
+纯模型校验失败统一抛出 `DescriptorValidationError`，其稳定属性
+`code == "descriptor_invalid"`；异常消息和字段路径仅用于本地诊断，暂不属于协议契约。
+RPC/API 错误映射由后续协议或接入任务负责。
+descriptor 的
+canonical bytes 按 §10.1.1 编码；计算 digest 前必须把 Requirement arrays 和
+`bot_identity_fields` 替换为上述 canonical form，其他 array 按各字段已经规定的顺序处理。
+配置默认值展开后的 `condition_set` 和 descriptor digest 必须使用同一 canonical encoder。
+任何字段新增、枚举扩展或归一化变化都必须递增
+`schema_version` 或新增 ADR，不能静默改变 v1。
+
+descriptor 的逻辑摘要使用 `descriptor_sha256 = sha256("qwenpaw.channel.descriptor.v1" +
+NUL + canonical_json(descriptor))`，输出完整 64 个小写 hex 字符。descriptor digest 只对
+静态 descriptor 字段计算；不得把 effective config、secret value、lock 内容、environment
+installation ID 或运行时状态混入其中。
+
+#### 11.0.1 Descriptor and ID test vectors
+
+以下向量固定使用 §10.1.1 的 compact UTF-8 bytes 和 domain separator + NUL 规则，作为跨
+平台实现的最小互操作基线：
+
+| 用途 | canonical JSON bytes | domain separator | expected SHA-256 |
+| --- | --- | --- | --- |
+| `instance_id` payload | `{"agent_id":"default","channel_key":"feishu"}` | `qwenpaw.channel.instance.v1` | `00aaff7d5548053ae2a51a6bc5e64a3b2e5198a311dcd98be9916162b3e63b17` |
+| empty `condition_set` | `{}` | `qwenpaw.channel.conditions.v1` | `dc4e5b494b66d21b82ac92cf406a37d007c80b7d5b986203d5b8d3094d1d051f` |
+| string escape | `{"sample":"a\u0001b\n/  é"}` | `qwenpaw.channel.canonical-json.v1` | `5b086f7a2fbaa46869e971cc985df0b13d5422a3013b600ae9883e6e1d5e0b01` |
+| `environment_spec_id` payload | `{"channel_key":"feishu","condition_set_sha256":"dc4e5b494b66d21b82ac92cf406a37d007c80b7d5b986203d5b8d3094d1d051f","lock_sha256":"0000000000000000000000000000000000000000000000000000000000000000","platform_tag":"macosx_11_0_arm64","python_abi":"cp313-cp313"}` | `qwenpaw.channel.environment-spec.v1` | `5c705f48418202bdafc20672ae0ccb7c1b178a389389ee6bbd9a8ec7c59264c1` |
+
+`string escape` 中 `\u0001` 与 `\n` 是 ASCII escape bytes，`/`、U+2028、U+2029 和 `é` 是
+UTF-8 literal bytes；它必须拒绝将这些 bytes 改写为 `\u000a`、`\/` 或 `\u2028`。前三个
+hash 独立于 host platform；最后一个是有意的平台相关向量。实现必须额外把 object member
+以不同源顺序提供，并得到相同 bytes。
+
+完整 descriptor digest fixture 的 canonical bytes 由下列 UTF-8 JSON 给出。此 fixture 已完成
+Requirement、identity 与集合 array 的 canonicalization；其中 `help` 的 `\n` 是两个 ASCII
+escape bytes，`Fixturé` 和 `示例` 是 UTF-8 literal bytes：
+
+```json
+{"bot_identity_fields":[{"name":"bot_token","normalization":"strip"},{"name":"url","normalization":"strip_trailing_slash"}],"capabilities":["media","streaming"],"channel_key":"fixture","condition_fields":["region"],"config_fields":[{"allowed_values":["eu","us"],"condition":true,"default":"eu","help":"Line\nhelp","label":{"en":"Fixturé","zh":"示例"},"name":"region","nullable":false,"placeholder":"","required":true,"secret":false,"type":"select"},{"allowed_values":[],"condition":false,"default":null,"help":"","label":{"en":"Token","zh":"令牌"},"name":"bot_token","nullable":false,"placeholder":"","required":true,"secret":true,"type":"password"},{"allowed_values":[],"condition":false,"default":null,"help":"","label":{"en":"URL","zh":"地址"},"name":"url","nullable":false,"placeholder":"","required":false,"secret":false,"type":"text"}],"core_requirements":["requests>=2"],"description":{"en":"","zh":""},"dispatch_mode":"manager_queue","doc_url":{"en":"https://example.com/en","zh":"https://example.com/zh"},"entrypoint":{"module":"qwenpaw.fixture","qualname":"FixtureDriver","scope":"runner"},"environment_passthrough_allowlist":["HTTPS_PROXY"],"icon":"","ingress_owner":"none","isolated_requirements":["fixture[bar,foo]>=1.0 ; python_version >= \"3.11\""],"label":{"en":"Fixturé","zh":"示例"},"plugin_metadata":null,"process_mode":"runner_process","schema_version":1,"source_kind":"builtin","supported_platform_tags":["macosx_11_0_arm64"],"supported_python_abis":["cp313-cp313"]}
+```
+
+`sha256("qwenpaw.channel.descriptor.v1" + NUL + bytes)` 必须是
+`8b05ef521e5f2ae268f90f704dd36f1fe1e8eb958182c1c0220ffe6405e7cdb8`。测试必须从包括
+`Fixture[FOO,bar] >= 1.0`、集合乱序、Unicode 组合字符和 control character 的等价 producer
+输入得到这一个 canonical descriptor 和 digest；surrogate、unknown field、`extra` marker、
+非有限 condition domain 和 non-registry platform tag 必须失败。
+
 `core requirements` 必须保持平台 SDK 无关，只允许 descriptor 声明的 Core 侧入口或
 代理所需的最小、经过审计的实现；平台 SDK、平台客户端和可选原生扩展必须属于
 isolated dependencies。
 
-descriptor 是 Catalog、lock generator、installer、Registry、CLI/API/frontend 的单一
-事实来源。枚举 descriptor 不应 import 平台 SDK、安装依赖或启动 Runner。
+descriptor 是 Catalog、lock generator、installer、Registry、CLI/API/frontend 的静态发现、
+展示投影、身份声明、条件声明和环境透传的单一事实来源；builtin effective config 的完整
+value schema 仍由 Pydantic/JSON Schema 负责，isolated Plugin 的完整 schema 由其版本化
+artifact schema 负责。枚举 descriptor 不应 import 平台 SDK、安装依赖或启动 Runner。
 
 legacy Plugin descriptor 在插件完成既有注册后合成，依赖管理标为 `legacy_shared`，
 不进入官方 Channel lock。isolated Plugin descriptor 必须在 Runner 启动前可静态读取，
@@ -984,7 +1330,23 @@ legacy Plugin descriptor 在插件完成既有注册后合成，依赖管理标�
 | `app/channels/conflict.py` 的 `_CHANNEL_IDENTITY_FIELDS` | 14 个 Channel 的 bot 身份字段名 | descriptor 的 `bot_identity_fields`（见 §14.4） |
 | `app/channels/qrcode_auth_handler.py` 的 `QRCODE_AUTH_HANDLERS` | 5 个平台的扫码登录实现 | 保留在 Core，但按 §14.5 显式登记为例外 |
 | `cli/doctor_connectivity.py` 的探测分派表 | 13 个 Channel 的平台连通性探测 | 保留在 Core CLI，按 §14.3 与环境校验区分命名 |
-| `cli/channels_cmd.py` 的 label 与 configurator 表 | Channel 显示名与交互式配置函数 | descriptor 的 label 与配置字段声明 |
+| `cli/channels_cmd.py` 的 label 与 configurator 表 | Channel 显示名与交互式配置函数 | descriptor 的 label/`config_fields` 投影；投影外字段继续由完整 schema 提供类型、默认值和交互渲染 |
+
+收敛的执行 owner 和边界固定如下；本表是 CH-0-002 的契约输出，实际删表或改调用点由
+后续任务完成：
+
+| 硬编码表 | 契约 owner | 后续实施任务 | 本任务不做 |
+| --- | --- | --- | --- |
+| `_BUILTIN_SPECS` | Descriptor entrypoint | `CH-2-006` | 不删除 Registry 表 |
+| `ChannelType` / `BUILTIN_CHANNEL_TYPES` | Descriptor key 集合 | `CH-2-006` | 不改变 Plugin key 兼容 |
+| `_CHANNEL_IDENTITY_FIELDS` | `bot_identity_fields` | `CH-6-007` | 不迁移查重实现 |
+| `QRCODE_AUTH_HANDLERS` | §14.5 的 Core 例外登记 | `CH-6-008` | 不移动扫码代码 |
+| doctor connectivity 分派表 | Core CLI connectivity adapter | `CH-6-001` | 不改 `qwenpaw doctor` |
+| CLI label/configurator 表 | Descriptor label/`config_fields` 投影；projection 外字段由完整 schema 驱动 | `CH-6-001`、`CH-6-003` | 不改 CLI/Console |
+
+Descriptor 漏配按以下规则失败：业务身份字段、ingress capability、condition field 或
+环境透传变量缺失时，validator 返回稳定 `descriptor_invalid`，而不是静默跳过；只有
+`bot_identity_fields=[]` 这种显式声明才表示“不参与查重”。
 
 此外 `app/channels/manager.py` 中存在 `ch.channel == "dingtalk"` 的诊断日志分支，属于
 Core 侧 per-channel 特例，迁移 DingTalk 时必须一并移除；Core 的通用编排层不得保留按
@@ -1190,10 +1552,12 @@ qwenpaw channels restart <channel_key>
 新增子命令必须与现有 CLI 表面共存，不得改写既有语义：
 
 - 仓库已有 `qwenpaw channels list`、`channels config`、`channels send` 三个子命令。
-  `list` 的现有输出必须保持兼容；`config` 是交互式配置入口，其 per-channel configurator
-  表按 §11.1 收敛到 descriptor；`channels send` 是主动外发，隔离后必须经由 Runner 的
-  `channel.send` 执行，Runner 未运行时返回明确错误，不得静默失败或绕过 Runner 直接
-  调用平台 SDK。
+  `list` 的现有输出必须保持兼容；`config` 是交互式配置入口：显示名和 `config_fields`
+  可表达的 field projection 按 §11.1 收敛到 descriptor，projection 外的 array/object/float
+  等字段仍从完整 Pydantic/JSON Schema（Plugin 为 artifact schema）取得类型、默认值和
+  交互渲染，不能因未出现在 descriptor 而丢失；`channels send` 是主动外发，隔离后必须经由
+  Runner 的 `channel.send` 执行，Runner 未运行时返回明确错误，不得静默失败或绕过 Runner
+  直接调用平台 SDK。
 - 环境/依赖校验命名为 `channels verify-env`，**不叫 `doctor`**。仓库已存在顶层
   `qwenpaw doctor`，其语义是平台连通性探测（直连 `api.telegram.org`、`open.feishu.cn`
   等 13 个 Channel 的平台端点）并校验凭证字段，与本设计的 lock/ABI/distribution 完整性
@@ -1224,7 +1588,10 @@ Core 已有“同一个 bot 被多个 Agent 使用”的查重能力：Console �
   判定“同一个 bot”的配置字段名及其归一化规则（当前实现对 `homeserver`/`url` 会去掉尾部
   斜杠，需保留）。这取代 `conflict.py` 的硬编码表，并顺带解决现有实现遗漏 5 个内置
   Channel 和全部 Plugin Channel 的问题：descriptor 未声明该字段的 Channel 明确表示“不参与
-  查重”，与“忘记配”区分开。
+  查重”，与“忘记配”区分开。身份字段允许引用 secret config field，以保留 Discord、
+  Telegram、Slack、Mattermost 和 WeChat 现有的 token 查重；descriptor 只保存字段名和
+  normalization，secret effective value 只在 Core 内存中比较，不进入 digest、日志、RPC、
+  持久化诊断或响应。
 - **比较只读配置。** Core 枚举已配置的 Agent（`config.agents.profiles` 与
   `load_agent_config(agent_id)`，与 `/agents` 列表同源），读取各自的 `channels.<key>` 配置段，
   按 descriptor 声明提取身份值后比较。不访问其他 Agent 的运行对象，不发起 Runner RPC。
@@ -1473,3 +1840,5 @@ Core Channel、runner-process Channel 和 legacy Plugin Channel 混合运行、�
 | ADR-032 | `media_work_dir` 是新增的 Core 侧解析能力，不是既有实现的迁移；收敛时保留各 Channel 现有默认子目录 | 被 ADR-034 替代 |
 | ADR-033 | 平台网关地址注入（Feishu `domain` 的 URL 形态、WeCom/XiaoYi/Yuanbao 的 `ws_url`、QQ 的端点环境变量）是测试 mock 注入点，不是产品功能，不作为兼容目标；失效由测试侧处理。Feishu `domain` 的 `feishu`/`lark` 枚举值除外，属真实能力 | 已确认 |
 | ADR-034 | 对需要入站媒体落盘的 Channel，Core 统一解析 `config.media_dir` → `workspace_dir/media` → `WORKING_DIR/media`；`from_env` 使用 `<CHANNEL>_MEDIA_DIR` → `WORKING_DIR/media`。最终目录平铺，不追加 Channel 子目录；各 Channel 保留现有下载、命名、覆盖和清理行为，不迁移既有文件 | 已确认；替代 ADR-032 |
+| ADR-035 | v1 标识使用带唯一 string escape 和 finite decimal 的受限 canonical JSON、domain separator + NUL、完整 SHA-256 和稳定前缀；逻辑 ID 与 `dir1_` 磁盘目录键分离，目录 manifest 保留并核对完整逻辑 ID；platform tag 必须属于版本化 release target registry | 已确认 |
+| ADR-036 | v1 descriptor 使用 closed object、显式空值和字段级 required/nullable/secret/condition 语义；Requirement 在 digest 前统一 canonicalize，重复折叠且拒绝 `extra` marker；condition domain 必须有限；`config_fields` 是支持 number 的 UI 投影，完整 value schema 仍由 Pydantic/JSON Schema 或 plugin artifact schema 负责；身份声明可引用 secret 字段但 secret value 仅在 Core 内比较；静态读取不得 import 平台模块；process mode 唯一派生驱动接口 | 已确认 |
