@@ -3,7 +3,17 @@
 
 from .canonical import canonical_json, domain_sha256, parse_json_value
 from .descriptor import ChannelDescriptor, resolve_localized_text
-from .errors import DescriptorValidationError
+from .errors import (
+    DescriptorValidationError,
+    FrameClosedError,
+    FrameEOFError,
+    FrameError,
+    FrameLimitError,
+    FrameProtocolError,
+    FrameTimeoutError,
+    FrameWriteError,
+)
+from .framing import FrameReader, FramedTransport, FramingLimits, encode_frame
 from .identifiers import (
     DirectoryIdentity,
     EnvironmentIdentity,
@@ -24,6 +34,16 @@ from .requirements import (
 
 __all__ = [
     "DescriptorValidationError",
+    "FrameClosedError",
+    "FrameEOFError",
+    "FrameError",
+    "FrameLimitError",
+    "FrameProtocolError",
+    "FrameReader",
+    "FrameTimeoutError",
+    "FrameWriteError",
+    "FramedTransport",
+    "FramingLimits",
     "ChannelDescriptor",
     "DirectoryIdentity",
     "EnvironmentIdentity",
@@ -37,6 +57,7 @@ __all__ = [
     "current_python_abi",
     "dir_key",
     "domain_sha256",
+    "encode_frame",
     "parse_json_value",
     "resolve_localized_text",
     "validate_channel_key",

@@ -280,15 +280,24 @@ descriptor validator 和聚焦单测机械验证；ADR-035/036 已确认。独�
 
 ### CH-0-003：stdio framing 和传输层
 
-- [ ] 实现严格的 LSP `Content-Length` framing。
-- [ ] 处理半帧、粘包、非法 Header、重复 Header、超长 Header、非法 UTF-8 和 EOF。
-- [ ] 设置控制帧最大长度、Header 上限、读取超时和写入超时。
-- [ ] 实现单一写入器、并发写锁和有界写队列。
-- [ ] 定义 stdin/stdout 半关闭、broken pipe 和协议错误后的关闭规则。
-- [ ] 完成 Windows、Linux、macOS 的分片读写和 EOF 测试。
+- 状态：[-] 初始实现与验证通过，等待独立 Review。
+
+- [x] 实现严格的 LSP `Content-Length` framing。
+- [x] 处理半帧、粘包、非法 Header、重复 Header、超长 Header、非法 UTF-8 和 EOF。
+- [x] 设置控制帧最大长度、Header 上限、读取超时和写入超时。
+- [x] 实现单一写入器、并发写锁和有界写队列。
+- [x] 定义 stdin/stdout 半关闭、broken pipe 和协议错误后的关闭规则。
+- [x] 完成 Windows、Linux、macOS 的分片读写和 EOF 测试。
 
 验收：纯 framing 层不依赖 Channel 业务方法，能够稳定传输任意合法 JSON message；
-非法帧、超时、半关闭和并发写测试通过。
+非法帧、超时、半关闭和并发写测试通过。实现位于
+`src/qwenpaw/channel_protocol/framing.py`，测试和跨平台子进程 fixture 位于
+`tests/unit/channel_isolation/test_ch_0_003_framing.py`、
+`tests/unit/channel_isolation/test_ch_0_003_transport.py` 和
+`tests/fixtures/channel_isolation/framing_peer.py`；不依赖 Channel 业务方法或 JSON-RPC。
+聚焦测试 `45 passed`，`tests/unit/channel_isolation` 共 `158 passed`；目标文件
+pre-commit 全部通过，`git diff --check` 通过。本记录保持 `[-]`，待独立 Review 和最终
+验证后才能标记完成。
 
 ### CH-0-004：JSON-RPC 2.0、Schema 和生命周期
 
