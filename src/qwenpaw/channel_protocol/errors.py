@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Sequence
 
 
@@ -50,6 +51,51 @@ class FrameClosedError(FrameError):
 
 class FrameWriteError(FrameError):
     """Report an OS or stream failure while writing a frame."""
+
+
+class ProtocolValidationError(ValueError):
+    """Report an invalid JSON-RPC envelope or versioned DTO."""
+
+    code = "invalid_params"
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        path: Sequence[PathPart] = (),
+        reason_code: str = "INVALID_PARAMS",
+    ) -> None:
+        self.path = tuple(path)
+        self.reason_code = reason_code
+        super().__init__(message)
+
+
+class RpcError(Exception):
+    """Report a remote JSON-RPC error response."""
+
+    def __init__(
+        self,
+        code: int,
+        message: str,
+        *,
+        data: object = None,
+    ) -> None:
+        self.code = code
+        self.message = message
+        self.data = data
+        super().__init__(f"{code}: {message}")
+
+
+class RpcTimeoutError(TimeoutError):
+    """Report a request deadline expiry."""
+
+
+class RpcClosedError(ConnectionError):
+    """Report a request attempted after peer shutdown."""
+
+
+class RpcCancelledError(asyncio.CancelledError):
+    """Report a request cancelled through the protocol."""
 
 
 def validation_error(

@@ -303,29 +303,38 @@ descriptor validator 和聚焦单测机械验证；ADR-035/036 已确认。独�
 
 ### CH-0-004：JSON-RPC 2.0、Schema 和生命周期
 
-- [ ] 实现 JSON-RPC 2.0 request、response、notification、error 和 cancel。
-- [ ] 实现 pending request 上限、request timeout、未知方法和重复 response 处理。
-- [ ] 定义 `runner.hello`、`channel.prepare/activate/quiesce/health/stop`、
+- 状态：[-] 初始实现与验证通过，等待独立 Review。
+
+- [x] 实现 JSON-RPC 2.0 request、response、notification、error 和 cancel。
+- [x] 实现 pending request 上限、request timeout、未知方法和重复 response 处理。
+- [x] 定义 `runner.hello`、`channel.prepare/activate/quiesce/health/stop`、
   `channel.commit/lease_renew/generation_status`、`channel.send`、普通媒体定位符、
   `ingress.endpoint.register/update/unregister`、`host.state.*` 和 `request.cancel`
   的 schema。
-- [ ] `channel.prepare` 的 host context 定义跨平台绝对 `media_work_dir`；它只对需要
+- [x] `channel.prepare` 的 host context 定义跨平台绝对 `media_work_dir`；它只对需要
   入站落盘的 Channel 生效，不作为出站文件访问白名单。
-- [ ] 定义 Runner-owned ingress endpoint 的 host、port/path、可选 `public_base_url`、
+- [x] 定义 Runner-owned ingress endpoint 的 host、port/path、可选 `public_base_url`、
   protocol、readiness、generation、quiesce 和 unregister 语义；定义 Voice event 的稳定
   `event_kind`、`connection_id`、sequence、session binding 和稳定错误码。
-- [ ] 定义 `setup` 产生并通过 `call.started` 上报的 `session_binding`、
+- [x] 定义 `setup` 产生并通过 `call.started` 上报的 `session_binding`、
   `platform_session_id=CallSid` 及 status callback 的幂等关闭映射；Core-owned 兼容入口的
   DTO 仅作为独立 capability 记录。
-- [ ] 实现持续 reader/dispatcher，使 request handler 可以发起反向 request；禁止在 reader
+- [x] 实现持续 reader/dispatcher，使 request handler 可以发起反向 request；禁止在 reader
   loop 内等待业务 handler，覆盖嵌套调用与 response 乱序。
-- [ ] 定义 created、preparing、standby、active、quiescing、stopped、failed 状态转换。
-- [ ] 实现 protocol version、capability negotiation 和稳定错误码。
-- [ ] 校验 `channel_key`、`instance_id`、generation 和 environment identity。
+- [x] 定义 created、preparing、standby、active、quiescing、stopped、failed 状态转换。
+- [x] 实现 protocol version、capability negotiation 和稳定错误码。
+- [x] 校验 `channel_key`、`instance_id`、generation 和 environment identity。
 
 验收：mock Core/Runner 能完成 hello、prepare、activate、commit、lease renewal、
 health、cancel 和 stop；commit 前不能正式消费。非法状态转换、Schema 不匹配、超时和
 协议版本不兼容均返回稳定结果。
+
+实现位于 `src/qwenpaw/channel_protocol/models.py`、`rpc.py` 和 `lifecycle.py`，
+公共导出与错误类型位于 `__init__.py`、`errors.py`；聚焦测试位于
+`tests/unit/channel_isolation/test_ch_0_004_models.py`、`test_ch_0_004_rpc.py` 和
+`test_ch_0_004_lifecycle.py`。聚焦测试 `14 passed`，
+`tests/unit/channel_isolation` 共 `175 passed`；目标文件 pre-commit 全部通过，
+`git diff --check` 通过。本记录保持 `[-]`，待独立 Review 和最终验证后才能标记完成。
 
 ### CH-0-005：可靠事件、ACK 和幂等原型
 
