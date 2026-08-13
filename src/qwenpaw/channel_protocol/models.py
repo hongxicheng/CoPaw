@@ -813,8 +813,8 @@ class InboundEvent:
     acl_sender_id: str
     sender_name: str
     content_parts: tuple[dict[str, Any], ...]
+    event_kind: str
     metadata: Mapping[str, Any] = field(default_factory=dict)
-    event_kind: str | None = None
 
     @classmethod
     def from_mapping(cls, value: object) -> "InboundEvent":
@@ -840,7 +840,7 @@ class InboundEvent:
         metadata = data.get("metadata", {})
         if not isinstance(metadata, Mapping):
             raise _error("metadata must be an object", path=("metadata",))
-        event_kind = _optional_string(data, "event_kind")
+        event_kind = _string(data.get("event_kind"), "event_kind")
         return cls(
             event_id=_string(data.get("event_id"), "event_id"),
             event_kind=event_kind,
@@ -884,8 +884,7 @@ class InboundEvent:
             "content_parts": list(self.content_parts),
             "metadata": dict(self.metadata),
         }
-        if self.event_kind is not None:
-            result["event_kind"] = self.event_kind
+        result["event_kind"] = self.event_kind
         return result
 
 
@@ -909,33 +908,46 @@ class EventBatchParams:
         events: list[InboundEvent] = []
         invalid_events: list[RejectedEvent] = []
         identity: IdentityParams | None = None
+        seen_event_ids: set[str] = set()
         for item in raw_events:
+            raw_item = item if isinstance(item, Mapping) else {}
+            item_identity = IdentityParams.from_mapping(
+                {
+                    key: raw_item.get(key)
+                    for key in (
+                        "channel_key",
+                        "instance_id",
+                        "generation",
+                    )
+                },
+            )
+            if identity is None:
+                identity = item_identity
+            elif item_identity != identity:
+                raise _error(
+                    "all events in a batch must share identity",
+                    reason_code="SCHEMA_MISMATCH",
+                )
             try:
                 event = InboundEvent.from_mapping(item)
+                if event.event_id in seen_event_ids:
+                    raise _error(
+                        "event_id must be unique within a batch",
+                        path=("event_id",),
+                        reason_code="SCHEMA_MISMATCH",
+                    )
                 events.append(event)
-                identity = IdentityParams(
-                    channel_key=event.channel_key,
-                    instance_id=event.instance_id,
-                    generation=event.generation,
-                )
+                seen_event_ids.add(event.event_id)
             except ProtocolValidationError as exc:
-                raw_item = item if isinstance(item, Mapping) else {}
                 event_id = raw_item.get("event_id")
                 if not isinstance(event_id, str) or not event_id:
                     raise
-                if identity is None:
-                    identity_data = {
-                        key: raw_item.get(key)
-                        for key in (
-                            "channel_key",
-                            "instance_id",
-                            "generation",
-                        )
-                    }
-                    try:
-                        identity = IdentityParams.from_mapping(identity_data)
-                    except ProtocolValidationError as identity_error:
-                        raise exc from identity_error
+                if event_id in seen_event_ids:
+                    raise _error(
+                        "event_id must be unique within a batch",
+                        path=("event_id",),
+                        reason_code="SCHEMA_MISMATCH",
+                    ) from exc
                 invalid_events.append(
                     RejectedEvent(
                         event_id=event_id,
@@ -943,25 +955,8 @@ class EventBatchParams:
                         retryable=False,
                     ),
                 )
-        if identity is None:
-            raise _error(
-                "events must contain a valid identity",
-                path=("events",),
-                reason_code="SCHEMA_MISMATCH",
-            )
+                seen_event_ids.add(event_id)
         event_tuple = tuple(events)
-        if any(
-            (
-                event.channel_key != identity.channel_key
-                or event.instance_id != identity.instance_id
-                or event.generation != identity.generation
-            )
-            for event in event_tuple[1:]
-        ):
-            raise _error(
-                "all events in a batch must share identity",
-                reason_code="SCHEMA_MISMATCH",
-            )
         return cls(
             batch_id=_string(data.get("batch_id"), "batch_id"),
             events=event_tuple,
