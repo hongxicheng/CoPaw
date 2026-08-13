@@ -303,7 +303,7 @@ descriptor validator 和聚焦单测机械验证；ADR-035/036 已确认。独�
 
 ### CH-0-004：JSON-RPC 2.0、Schema 和生命周期
 
-- 状态：[-] 初始实现与验证通过，等待独立 Review。
+- 状态：[x] 独立 Review 和最终验证通过。
 
 - [x] 实现 JSON-RPC 2.0 request、response、notification、error 和 cancel。
 - [x] 实现 pending request 上限、request timeout、未知方法和重复 response 处理。
@@ -337,9 +337,8 @@ health、cancel 和 stop；commit 前不能正式消费。非法状态转换、S
 tests/unit/channel_isolation/test_ch_0_004_lifecycle.py
 tests/unit/channel_isolation/test_ch_0_004_rpc.py` 为 `28 passed`，
 `conda run -n qwenpaw pytest -q tests/unit/channel_isolation` 为 `189 passed`；目标文件
-pre-commit 全部通过，`git diff --check` 通过。最近修复提交为
-`339766f7` 及其后续独立修复提交；本记录保持 `[-]`，待独立 Review 和最终验证后才能
-标记完成。
+pre-commit 全部通过，`git diff --check` 通过。独立 Review 已通过（用户确认）；实现与
+修复提交为 `95836112`、`26958f06`、`339766f7` 和 `4cd74739`。任务状态更新为 `[x]`。
 
 ### CH-0-005：可靠事件、ACK 和幂等原型
 
