@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 
 import pytest
 
@@ -454,6 +455,131 @@ async def test_capability_gates_and_bounded_host_state() -> None:
             ),
         )
     assert limit_error.value.reason_code == "STATE_LIMIT_EXCEEDED"
+
+
+@pytest.mark.asyncio
+async def test_prepare_subset_is_the_effective_capability_set() -> None:
+    """Prepare cannot be bypassed by hello-only capabilities."""
+    clock = Clock()
+    controller = _controller(clock)
+    controller.accept_hello(_hello())
+    await controller.prepare(
+        PrepareParams.from_mapping(
+            {
+                **_identity(),
+                "host_context": {},
+                "capabilities": ["ingress_endpoint"],
+            },
+        ),
+    )
+    lease = LeaseParams.from_mapping(
+        {**_identity(), "lease_token": "subset", "lease_ttl_ms": 100},
+    )
+    await controller.activate(lease)
+    await controller.commit(lease)
+    media = SendParams.from_mapping(
+        {
+            **_identity(),
+            "delivery_id": "media-1",
+            "to_handle": "call-1",
+            "content_parts": [
+                {"type": "image", "image_url": "https://example/image"},
+            ],
+        },
+    )
+    with pytest.raises(RpcError) as media_error:
+        await controller.send(media)
+    assert media_error.value.data["reason_code"] == "CAPABILITY_REQUIRED"
+    state = HostStateParams.from_mapping(
+        {**_identity(), "key": "checkpoint", "value": {"ok": True}},
+    )
+    with pytest.raises(RpcError) as state_error:
+        await controller.host_state_put(state)
+    assert state_error.value.data["reason_code"] == "CAPABILITY_REQUIRED"
+
+
+@pytest.mark.asyncio
+async def test_lease_expiry_removes_core_endpoint_registry() -> None:
+    """Lease fencing also revokes Core routing state."""
+    clock = Clock()
+    controller = _controller(clock)
+    adapter = CoreLifecycleAdapter(controller)
+    controller.accept_hello(_hello())
+    await controller.prepare(
+        PrepareParams.from_mapping(
+            {
+                **_identity(),
+                "host_context": {},
+                "capabilities": [
+                    "host_state",
+                    "ingress_endpoint",
+                    "media",
+                ],
+            },
+        ),
+    )
+    lease = LeaseParams.from_mapping(
+        {**_identity(), "lease_token": "expire", "lease_ttl_ms": 10},
+    )
+    await controller.activate(lease)
+    await controller.commit(lease)
+    endpoint = EndpointParams.from_mapping(
+        {
+            **_identity(),
+            "protocol": "http",
+            "host": "127.0.0.1",
+            "port": 8080,
+            "path": "/voice",
+            "public_base_url": None,
+            "readiness": "ready",
+            "bound_externally": False,
+            "auth_required": False,
+            "quiescing": False,
+        },
+    )
+    await adapter.endpoint_register(endpoint)
+    assert adapter.endpoints[7] == endpoint
+    clock.now = 1011
+    await controller.health(IdentityParams.from_mapping(_identity()))
+    assert controller.state is RunnerState.FAILED
+    assert not adapter.endpoints
+
+
+@pytest.mark.asyncio
+async def test_host_state_rejects_non_finite_numbers() -> None:
+    """Host State accepts only strict JSON values."""
+    clock = Clock()
+    controller = _controller(clock)
+    controller.accept_hello(_hello())
+    await controller.prepare(
+        PrepareParams.from_mapping(
+            {
+                **_identity(),
+                "host_context": {},
+                "capabilities": [
+                    "host_state",
+                    "ingress_endpoint",
+                    "media",
+                ],
+            },
+        ),
+    )
+    lease = LeaseParams.from_mapping(
+        {**_identity(), "lease_token": "finite", "lease_ttl_ms": 100},
+    )
+    await controller.activate(lease)
+    await controller.commit(lease)
+    with pytest.raises(ProtocolValidationError) as value_error:
+        await controller.host_state_put(
+            HostStateParams.from_mapping(
+                {
+                    **_identity(),
+                    "key": "non-finite",
+                    "value": {"score": math.nan},
+                },
+            ),
+        )
+    assert value_error.value.reason_code == "SCHEMA_MISMATCH"
 
 
 def test_protocol_version_mismatch_has_stable_reason() -> None:

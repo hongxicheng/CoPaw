@@ -38,6 +38,21 @@ JSONRPC_INVALID_PARAMS = -32602
 JSONRPC_INTERNAL_ERROR = -32603
 
 
+def _reject_non_finite(value: str) -> object:
+    """Reject non-standard JSON numeric constants."""
+    raise ValueError(f"non-finite JSON constant is not allowed: {value}")
+
+
+def _strict_json_dumps(value: object) -> str:
+    """Encode one JSON-RPC message using strict JSON numbers."""
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+    )
+
+
 RequestHandler = Callable[[Any, RpcRequest], Any]
 NotificationHandler = Callable[[Any, RpcNotification], Any]
 
@@ -212,11 +227,7 @@ class RpcPeer:
     async def _send(self, message: RpcMessage) -> None:
         """Serialize and send one validated envelope."""
         try:
-            encoded = json.dumps(
-                message.to_mapping(),
-                ensure_ascii=False,
-                separators=(",", ":"),
-            )
+            encoded = _strict_json_dumps(message.to_mapping())
         except (TypeError, ValueError) as exc:
             raise ProtocolValidationError(
                 "RPC message contains non-JSON data",
@@ -240,7 +251,7 @@ class RpcPeer:
     async def _dispatch_raw(self, raw: str) -> None:
         """Parse one JSON frame and schedule its work."""
         try:
-            value = json.loads(raw)
+            value = json.loads(raw, parse_constant=_reject_non_finite)
             message = parse_rpc_message(value)
         except json.JSONDecodeError as exc:
             await self._send_error(None, JSONRPC_PARSE_ERROR, "Parse error")
@@ -260,6 +271,10 @@ class RpcPeer:
                     str(exc),
                     data={"reason_code": exc.reason_code},
                 )
+            return
+        except ValueError as exc:
+            await self._send_error(None, JSONRPC_PARSE_ERROR, "Parse error")
+            _ = exc
             return
         if isinstance(message, RpcResponse):
             self._resolve_response(message)

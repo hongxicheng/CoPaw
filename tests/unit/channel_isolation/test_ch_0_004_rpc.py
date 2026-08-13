@@ -4,10 +4,14 @@
 from __future__ import annotations
 
 import asyncio
+import math
 
 import pytest
 
 from qwenpaw.channel_protocol import (
+    ProtocolValidationError,
+    CoreLifecycleAdapter,
+    LifecycleController,
     RpcError,
     RpcLimits,
     RpcPeer,
@@ -183,4 +187,69 @@ async def test_protocol_and_schema_errors_are_stable() -> None:
     with pytest.raises(RpcError) as schema_error:
         await core.call("channel.health", {"unexpected": True})
     assert schema_error.value.data["reason_code"] == "SCHEMA_MISMATCH"
+    await asyncio.gather(core.aclose(), runner.aclose())
+
+
+@pytest.mark.asyncio
+async def test_protocol_mismatch_returns_rpc_error_envelope() -> None:
+    """An incompatible hello is rejected through bidirectional RPC."""
+    left_transport, right_transport = _transport_pair()
+    core = RpcPeer(left_transport)
+    runner = RpcPeer(right_transport)
+    controller = LifecycleController(
+        channel_key="voice",
+        instance_id="instance-1",
+        generation=7,
+        environment_spec_id="ches1_" + "1" * 64,
+        environment_id="ches1_" + "1" * 64 + ".install1_" + "2" * 32,
+        protocol_min=2,
+        protocol_max=2,
+    )
+    CoreLifecycleAdapter(controller).register_rpc_methods(core)
+    await asyncio.gather(core.start(), runner.start())
+    hello = {
+        "protocol_min": 1,
+        "protocol_max": 1,
+        "qwenpaw_version": "0.1",
+        "channel_key": "voice",
+        "instance_id": "instance-1",
+        "environment_spec_id": "ches1_" + "1" * 64,
+        "environment_id": "ches1_" + "1" * 64 + ".install1_" + "2" * 32,
+        "lock_sha256": "0" * 64,
+        "python_abi": "cp313-cp313",
+        "platform_tag": "macosx_11_0_arm64",
+        "capabilities": [],
+    }
+    with pytest.raises(RpcError) as mismatch:
+        await runner.call("runner.hello", hello)
+    assert mismatch.value.code == -32010
+    assert mismatch.value.data["reason_code"] == "PROTOCOL_MISMATCH"
+    await asyncio.gather(core.aclose(), runner.aclose())
+
+
+@pytest.mark.asyncio
+async def test_rpc_strict_json_rejects_non_finite_values() -> None:
+    """RPC serialization and parsing reject non-standard JSON numbers."""
+    left_transport, right_transport = _transport_pair()
+    core = RpcPeer(left_transport)
+    runner = RpcPeer(right_transport)
+    handled = False
+
+    async def echo(params: object, _: object) -> object:
+        """Record that a strict-invalid request was not dispatched."""
+        nonlocal handled
+        handled = True
+        return params
+
+    runner.register_method("echo", echo)
+    await asyncio.gather(core.start(), runner.start())
+    with pytest.raises(ProtocolValidationError) as outbound:
+        await core.call("echo", {"score": math.inf})
+    assert outbound.value.reason_code == "SCHEMA_MISMATCH"
+    await right_transport.send(
+        '{"jsonrpc":"2.0","id":"bad","method":"echo",'
+        '"params":{"score":NaN}}',
+    )
+    await asyncio.sleep(0.05)
+    assert handled is False
     await asyncio.gather(core.aclose(), runner.aclose())

@@ -32,6 +32,22 @@ RPC_AUTH_ERROR = -32012
 RPC_CAPABILITY_ERROR = -32013
 
 
+def _strict_json_dumps(value: object) -> str:
+    """Encode the protocol JSON subset without non-finite numbers."""
+    try:
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        )
+    except (TypeError, ValueError) as exc:
+        raise ProtocolValidationError(
+            "value must be strict JSON serializable",
+            reason_code="SCHEMA_MISMATCH",
+        ) from exc
+
+
 class HostStateStore:
     """Bounded Core-owned store for instance-scoped host state."""
 
@@ -62,7 +78,7 @@ class HostStateStore:
 
     async def put(self, key: str, schema_version: int, value: object) -> None:
         """Atomically validate and replace one value."""
-        encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        encoded = _strict_json_dumps(value)
         size = len(encoded.encode("utf-8"))
         if size > self.max_value_bytes:
             raise ProtocolValidationError(
@@ -164,7 +180,7 @@ class CoreLifecycleAdapter:
 
     def _check_capability(self, capability: str) -> None:
         """Reject a Core-owned operation without negotiated capability."""
-        if capability not in self.controller.negotiated_capabilities:
+        if capability not in self.controller.effective_capabilities:
             raise RpcError(
                 RPC_CAPABILITY_ERROR,
                 "capability was not negotiated",
@@ -181,7 +197,7 @@ class CoreLifecycleAdapter:
         """Register a Runner-owned endpoint in Core."""
         self._check_capability("ingress_endpoint")
         self.controller._check_identity(params)
-        self.controller._expire_lease_if_needed()
+        await self.controller._expire_lease_if_needed_async()
         if self.controller.state == RunnerState.FAILED:
             raise self.controller._lifecycle_error("LEASE_EXPIRED")
         if self.controller.state not in {
@@ -252,7 +268,7 @@ class CoreLifecycleAdapter:
             and self.controller._clock_ms()
             >= self.controller.lease_expires_at_ms
         )
-        self.controller._expire_lease_if_needed()
+        await self.controller._expire_lease_if_needed_async()
         if expired:
             raise self.controller._lifecycle_error("LEASE_EXPIRED")
         self.controller._ensure_state(RunnerState.ACTIVE)
@@ -276,7 +292,7 @@ class CoreLifecycleAdapter:
             and self.controller._clock_ms()
             >= self.controller.lease_expires_at_ms
         )
-        self.controller._expire_lease_if_needed()
+        await self.controller._expire_lease_if_needed_async()
         if expired:
             raise self.controller._lifecycle_error("LEASE_EXPIRED")
         self.controller._ensure_state(RunnerState.ACTIVE)
@@ -334,6 +350,7 @@ class LifecycleController:
         self.endpoint: EndpointParams | None = None
         self.host_state_store = host_state_store or HostStateStore()
         self.negotiated_capabilities: frozenset[str] = frozenset()
+        self.effective_capabilities: frozenset[str] = frozenset()
         self._send_handler = send_handler
         self._endpoint_handler = endpoint_handler
         self._clock_ms = clock_ms or (lambda: time.monotonic_ns() // 1_000_000)
@@ -443,7 +460,7 @@ class LifecycleController:
                 )
             self.state = RunnerState.PREPARING
             self.host_context = params.host_context
-            self.capabilities = tuple(sorted(requested))
+            self.effective_capabilities = frozenset(requested)
             self.state = RunnerState.STANDBY
             return GenerationStatus(
                 state=self.state.value,
@@ -498,7 +515,7 @@ class LifecycleController:
         async with self._lock:
             self._check_identity(params)
             self._ensure_state(RunnerState.ACTIVE, RunnerState.STANDBY)
-            self._expire_lease_if_needed()
+            await self._expire_lease_if_needed_async()
             if self.state == RunnerState.FAILED:
                 raise self._lifecycle_error("LEASE_EXPIRED")
             if self.state == RunnerState.ACTIVE:
@@ -519,7 +536,7 @@ class LifecycleController:
         async with self._lock:
             self._check_identity(params)
             if self.state in {RunnerState.STANDBY, RunnerState.ACTIVE}:
-                self._expire_lease_if_needed()
+                await self._expire_lease_if_needed_async()
             return GenerationStatus(
                 state=self.state.value,
                 generation=self.generation,
@@ -554,14 +571,14 @@ class LifecycleController:
         async with self._lock:
             self._check_identity(params)
             self._ensure_state(RunnerState.ACTIVE)
-            self._expire_lease_if_needed()
+            await self._expire_lease_if_needed_async()
             if self.state != RunnerState.ACTIVE:
                 raise self._lifecycle_error("LEASE_EXPIRED")
             if (
                 any(
                     part.get("type") != "text" for part in params.content_parts
                 )
-                and "media" not in self.negotiated_capabilities
+                and "media" not in self.effective_capabilities
             ):
                 raise RpcError(
                     RPC_CAPABILITY_ERROR,
@@ -616,7 +633,7 @@ class LifecycleController:
         """Read instance-scoped host state."""
         async with self._lock:
             self._check_identity(params)
-            if "host_state" not in self.negotiated_capabilities:
+            if "host_state" not in self.effective_capabilities:
                 raise RpcError(
                     RPC_CAPABILITY_ERROR,
                     "host state capability was not negotiated",
@@ -644,11 +661,11 @@ class LifecycleController:
                 self.lease_expires_at_ms is not None
                 and self._clock_ms() >= self.lease_expires_at_ms
             )
-            self._expire_lease_if_needed()
+            await self._expire_lease_if_needed_async()
             if expired:
                 raise self._lifecycle_error("LEASE_EXPIRED")
             self._ensure_state(RunnerState.ACTIVE)
-            if "host_state" not in self.negotiated_capabilities:
+            if "host_state" not in self.effective_capabilities:
                 raise RpcError(
                     RPC_CAPABILITY_ERROR,
                     "host state capability was not negotiated",
@@ -676,11 +693,11 @@ class LifecycleController:
                 self.lease_expires_at_ms is not None
                 and self._clock_ms() >= self.lease_expires_at_ms
             )
-            self._expire_lease_if_needed()
+            await self._expire_lease_if_needed_async()
             if expired:
                 raise self._lifecycle_error("LEASE_EXPIRED")
             self._ensure_state(RunnerState.ACTIVE)
-            if "host_state" not in self.negotiated_capabilities:
+            if "host_state" not in self.effective_capabilities:
                 raise RpcError(
                     RPC_CAPABILITY_ERROR,
                     "host state capability was not negotiated",
@@ -701,10 +718,10 @@ class LifecycleController:
         async with self._lock:
             self._check_identity(params)
             self._ensure_state(RunnerState.STANDBY, RunnerState.ACTIVE)
-            self._expire_lease_if_needed()
+            await self._expire_lease_if_needed_async()
             if self.state == RunnerState.FAILED:
                 raise self._lifecycle_error("LEASE_EXPIRED")
-            if "ingress_endpoint" not in self.negotiated_capabilities:
+            if "ingress_endpoint" not in self.effective_capabilities:
                 raise RpcError(
                     RPC_CAPABILITY_ERROR,
                     "ingress endpoint capability was not negotiated",
@@ -745,13 +762,19 @@ class LifecycleController:
         self.lease_expires_at_ms = None
         if self.state in {RunnerState.STANDBY, RunnerState.ACTIVE}:
             self.state = RunnerState.FAILED
-            self.endpoint = None
+
+    async def _expire_lease_if_needed_async(self) -> None:
+        """Fence an expired lease and revoke its endpoint registration."""
+        had_endpoint = self.endpoint is not None
+        self._expire_lease_if_needed()
+        if had_endpoint and self.state is RunnerState.FAILED:
+            await self._unregister_endpoint_locked()
 
     @staticmethod
     def _ensure_json_value(value: object) -> None:
         """Reject values that cannot cross the JSON protocol boundary."""
         try:
-            json.dumps(value, ensure_ascii=False)
+            _strict_json_dumps(value)
         except (TypeError, ValueError) as exc:
             raise ProtocolValidationError(
                 "host state value must be JSON serializable",
