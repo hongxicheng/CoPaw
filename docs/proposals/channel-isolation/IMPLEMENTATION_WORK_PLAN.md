@@ -199,7 +199,7 @@ WeCom 测试共 `182 passed`；目标文件 `pre-commit` 全部通过，`git dif
 
 ### CH-0-002：标识、descriptor 和单实例模型
 
-- 状态：[-] 初始实现与验证通过，等待独立 Review。
+- 状态：[x] 独立 Review 和最终验证通过
 
 本任务先冻结 `DESIGN.md` §10.1、§10.4、§11.0、§11.1 的 v1 契约；在同一任务内
 实现 canonical encoder、Requirement canonicalizer、ID/目录键模型和 descriptor v1 validator，
@@ -264,21 +264,19 @@ condition 和 environment spec，`CH-6-001`/`CH-6-003` 消费配置字段展示�
   的重复解析稳定，内部状态 key 不以 `channel_key` singleton 覆盖；测试执行使用 conda 环境
   `qwenpaw`，并通过 Python 单测、pre-commit 和 `git diff --check`。
 
-初始实现证据：CH-0-002 聚焦测试 `94 passed`，`tests/unit/channel_isolation` 共
-`105 passed`；目标 Python、测试和文档文件的 pre-commit 全部通过，`git diff --check`
+验证证据：CH-0-002 聚焦测试 `102 passed`，`tests/unit/channel_isolation` 共
+`113 passed`；目标 Python 和测试文件的 pre-commit 全部通过，`git diff --check`
 通过。Design §11.0.1 的完整 descriptor fixture 从文档原文机械重算为
 `8b05ef521e5f2ae268f90f704dd36f1fe1e8eb958182c1c0220ffe6405e7cdb8`，与实现固定向量一致。
-本记录保持 `[-]`，待独立 Review 和最终验证后才能标记完成。
+独立 Review 已通过（用户确认）；实现与修复提交为 `ee21c660` 和 `91d46ebf`。
 
 本任务明确不做：登记实际 builtin/Plugin descriptor；迁移或删除 Registry/Catalog 和 §11.1
 硬编码表；生成或安装 lock；创建 environment/Runner/Proxy；改变现有 Pydantic config schema；
-迁移 bot 查重或扫码登录；修改 CLI/API/Console、SDK、Channel 行为和前端；创建提交或将任务
-标记完成。任务只有在用户确认契约、完成上述实现和测试、独立 Review 与最终验证全部通过后，
-才允许更新为 `[x]`。
+迁移 bot 查重或扫码登录；修改 CLI/API/Console、SDK、Channel 行为和前端。
 
 验收：Design §10.1、§10.4、§11.0、§11.1 的契约由本任务实现的 canonical encoder、ID model、
-descriptor validator 和聚焦单测机械验证；ADR-035/036 已确认。初始
-实现和验证完成后状态仍保持 `[-]`，等待独立 Review。
+descriptor validator 和聚焦单测机械验证；ADR-035/036 已确认。独立 Review 和最终验证
+通过后，任务状态更新为 `[x]`。
 
 ### CH-0-003：stdio framing 和传输层
 
