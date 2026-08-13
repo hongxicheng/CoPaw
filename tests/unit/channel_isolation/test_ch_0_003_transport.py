@@ -12,6 +12,7 @@ import pytest
 
 from qwenpaw.channel_protocol import (
     FrameClosedError,
+    FrameLimitError,
     FrameProtocolError,
     FrameTimeoutError,
     FrameWriteError,
@@ -144,11 +145,13 @@ async def test_broken_pipe_closes_both_transport_directions() -> None:
     writer = FakeWriter()
     writer.drain_error = BrokenPipeError("peer exited")
     transport = FramedTransport(_idle_reader(), writer)
+    pending_receive = asyncio.create_task(transport.receive())
+    await asyncio.sleep(0)
 
     with pytest.raises(FrameWriteError):
         await transport.send("{}")
     with pytest.raises(FrameClosedError):
-        await transport.receive()
+        await asyncio.wait_for(pending_receive, timeout=0.1)
 
     assert transport.is_closed
     await transport.aclose()
@@ -167,6 +170,26 @@ async def test_protocol_error_closes_write_side() -> None:
     with pytest.raises(FrameClosedError):
         await transport.send("{}")
 
+    assert writer.closed
+    await transport.aclose()
+
+
+@pytest.mark.asyncio
+async def test_oversized_decimal_length_closes_transport() -> None:
+    """Python's integer guard cannot escape the framing error model."""
+    reader = asyncio.StreamReader()
+    reader.feed_data(
+        b"Content-Length: " + b"9" * 4301 + b"\r\n\r\n",
+    )
+    writer = FakeWriter()
+    transport = FramedTransport(reader, writer)
+
+    with pytest.raises(FrameLimitError):
+        await transport.receive()
+    with pytest.raises(FrameClosedError):
+        await transport.send("{}")
+
+    assert transport.is_closed
     assert writer.closed
     await transport.aclose()
 
@@ -202,6 +225,36 @@ async def test_explicit_close_fails_pending_writes() -> None:
 
     with pytest.raises(FrameClosedError):
         await pending
+
+
+@pytest.mark.asyncio
+async def test_explicit_close_releases_pending_receive() -> None:
+    """Closing locally wakes a receive waiting for its first frame byte."""
+    transport = FramedTransport(_idle_reader(), FakeWriter())
+    pending = asyncio.create_task(transport.receive())
+    await asyncio.sleep(0)
+
+    await transport.aclose()
+
+    with pytest.raises(FrameClosedError):
+        await asyncio.wait_for(pending, timeout=0.1)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_receive_releases_stream_reader() -> None:
+    """Caller cancellation leaves no read task attached to the stream."""
+    reader = asyncio.StreamReader()
+    transport = FramedTransport(reader, FakeWriter())
+    pending = asyncio.create_task(transport.receive())
+    await asyncio.sleep(0)
+
+    pending.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await pending
+    reader.feed_data(b"Content-Length: 2\r\n\r\n{}")
+
+    assert await asyncio.wait_for(transport.receive(), timeout=0.1) == "{}"
+    await transport.aclose()
 
 
 async def _spawn_peer(mode: str = "echo") -> asyncio.subprocess.Process:

@@ -146,11 +146,13 @@ class FrameReader:
         value = value.strip(b" \t")
         if not value.isdigit() or value.startswith(b"0") and len(value) > 1:
             raise FrameProtocolError("invalid Content-Length value")
-        length = int(value)
+        length = 0
+        for digit in value:
+            length = length * 10 + digit - ord("0")
+            if length > self._limits.max_frame_bytes:
+                raise FrameLimitError("frame body exceeds maximum length")
         if length <= 0:
             raise FrameProtocolError("Content-Length must be positive")
-        if length > self._limits.max_frame_bytes:
-            raise FrameLimitError("frame body exceeds maximum length")
         return length
 
     async def read_message(self) -> str:
@@ -314,14 +316,30 @@ class FramedTransport:
         """Read one frame and close both directions on any transport error."""
         if self._closed:
             raise FrameClosedError("stdio transport is closed")
+        read_task = asyncio.create_task(self._reader.read_message())
+        close_task = asyncio.create_task(self._closed_event.wait())
         try:
-            return await self._reader.read_message()
+            done, _ = await asyncio.wait(
+                {read_task, close_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if close_task in done or self._closed:
+                raise FrameClosedError("stdio transport is closed")
+            return await read_task
         except FrameEOFError as exc:
             await self._close(exc)
             raise FrameClosedError("stdio peer closed") from exc
         except (FrameProtocolError, FrameTimeoutError) as exc:
             await self._close(exc)
             raise
+        finally:
+            read_task.cancel()
+            close_task.cancel()
+            await asyncio.gather(
+                read_task,
+                close_task,
+                return_exceptions=True,
+            )
 
     async def _close(self, reason: BaseException | None = None) -> None:
         """Close both halves and fail every queued or active write."""

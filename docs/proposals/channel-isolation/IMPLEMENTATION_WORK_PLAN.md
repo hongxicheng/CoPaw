@@ -295,9 +295,11 @@ descriptor validator 和聚焦单测机械验证；ADR-035/036 已确认。独�
 `tests/unit/channel_isolation/test_ch_0_003_framing.py`、
 `tests/unit/channel_isolation/test_ch_0_003_transport.py` 和
 `tests/fixtures/channel_isolation/framing_peer.py`；不依赖 Channel 业务方法或 JSON-RPC。
-聚焦测试 `45 passed`，`tests/unit/channel_isolation` 共 `158 passed`；目标文件
-pre-commit 全部通过，`git diff --check` 通过。本记录保持 `[-]`，待独立 Review 和最终
-验证后才能标记完成。
+审查修复覆盖本端显式关闭和 broken pipe 解除既有 pending receive、调用者取消后回收
+内部读取 task，以及 Header 上限内超长十进制 `Content-Length` 返回 `FrameLimitError`
+并关闭双向传输。聚焦测试 `48 passed`，`tests/unit/channel_isolation` 共 `161 passed`；
+目标文件 pre-commit 全部通过，`git diff --check` 通过。本记录保持 `[-]`，待独立 Review
+和最终验证后才能标记完成。
 
 ### CH-0-004：JSON-RPC 2.0、Schema 和生命周期
 
