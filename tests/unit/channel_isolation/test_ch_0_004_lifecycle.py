@@ -15,9 +15,12 @@ from qwenpaw.channel_protocol import (
     IdentityParams,
     LeaseParams,
     LifecycleController,
+    CoreLifecycleAdapter,
+    HostStateStore,
     PrepareParams,
     QuiesceParams,
     RpcError,
+    ProtocolValidationError,
     RunnerState,
     RpcPeer,
     SendParams,
@@ -97,7 +100,7 @@ def _hello() -> HelloParams:
             "lock_sha256": "0" * 64,
             "python_abi": "cp313-cp313",
             "platform_tag": "macosx_11_0_arm64",
-            "capabilities": ["ingress_endpoint", "media"],
+            "capabilities": ["host_state", "ingress_endpoint", "media"],
         },
     )
 
@@ -107,10 +110,10 @@ def _controller(clock: Clock) -> LifecycleController:
     return LifecycleController(
         channel_key="voice",
         instance_id="instance-1",
+        generation=7,
         environment_spec_id="ches1_" + "1" * 64,
         environment_id="ches1_" + "1" * 64 + ".install1_" + "2" * 32,
-        generation=7,
-        capabilities=("ingress_endpoint", "media"),
+        capabilities=("host_state", "ingress_endpoint", "media"),
         clock_ms=clock,
     )
 
@@ -183,7 +186,15 @@ async def test_generation_fencing_expiry_and_quiesce() -> None:
     controller.accept_hello(_hello())
     await controller.prepare(
         PrepareParams.from_mapping(
-            {**_identity(), "host_context": {}, "capabilities": []},
+            {
+                **_identity(),
+                "host_context": {},
+                "capabilities": [
+                    "host_state",
+                    "ingress_endpoint",
+                    "media",
+                ],
+            },
         ),
     )
     lease = LeaseParams.from_mapping(
@@ -192,6 +203,17 @@ async def test_generation_fencing_expiry_and_quiesce() -> None:
     await controller.activate(lease)
     await controller.commit(lease)
     clock.now = 1011
+    with pytest.raises(RpcError) as expired_write:
+        await controller.host_state_put(
+            HostStateParams.from_mapping(
+                {
+                    **_identity(),
+                    "key": "stale",
+                    "value": {"blocked": True},
+                },
+            ),
+        )
+    assert expired_write.value.data["reason_code"] == "LEASE_EXPIRED"
     health = await controller.health(IdentityParams.from_mapping(_identity()))
     assert health["state"] == "failed"
     assert controller.state is RunnerState.FAILED
@@ -208,7 +230,15 @@ async def test_endpoint_and_host_state_require_active_generation() -> None:
     controller.accept_hello(_hello())
     await controller.prepare(
         PrepareParams.from_mapping(
-            {**_identity(), "host_context": {}, "capabilities": []},
+            {
+                **_identity(),
+                "host_context": {},
+                "capabilities": [
+                    "host_state",
+                    "ingress_endpoint",
+                    "media",
+                ],
+            },
         ),
     )
     endpoint = EndpointParams.from_mapping(
@@ -236,7 +266,8 @@ async def test_endpoint_and_host_state_require_active_generation() -> None:
             EndpointParams.from_mapping(
                 {
                     **endpoint.to_mapping(),
-                    "bound_externally": True,
+                    "host": "0.0.0.0",
+                    "bound_externally": False,
                     "auth_required": True,
                 },
             ),
@@ -253,10 +284,17 @@ async def test_endpoint_and_host_state_require_active_generation() -> None:
     )
     assert (await controller.host_state_put(state))["status"] == "stored"
     assert (await controller.host_state_get(state))["value"] == {"ok": True}
+    assert (await controller.endpoint_update(endpoint))["status"] == "updated"
     await controller.quiesce(
         QuiesceParams.from_mapping({**_identity(), "drain_timeout_ms": 10}),
     )
     assert controller.state is RunnerState.QUIESCING
+    assert controller.endpoint is None
+    assert (
+        await controller.endpoint_unregister(
+            IdentityParams.from_mapping(_identity()),
+        )
+    )["status"] == "unregistered"
     with pytest.raises(RpcError):
         await controller.host_state_put(state)
 
@@ -270,15 +308,25 @@ async def test_mock_core_runner_completes_control_lifecycle() -> None:
     runner = RpcPeer(right_transport)
     controller = _controller(clock)
     controller.register_rpc_methods(runner)
+    adapter = CoreLifecycleAdapter(controller)
+    adapter.register_rpc_methods(core)
     await core.start()
     await runner.start()
 
-    hello = await core.call("runner.hello", _hello().to_mapping())
+    hello = await runner.call("runner.hello", _hello().to_mapping())
     assert hello["protocol_version"] == 1
     prepared = await core.call(
         "channel.prepare",
         PrepareParams.from_mapping(
-            {**_identity(), "host_context": {}, "capabilities": ["media"]},
+            {
+                **_identity(),
+                "host_context": {},
+                "capabilities": [
+                    "host_state",
+                    "ingress_endpoint",
+                    "media",
+                ],
+            },
         ).to_mapping(),
     )
     assert prepared["state"] == "standby"
@@ -294,6 +342,133 @@ async def test_mock_core_runner_completes_control_lifecycle() -> None:
     assert (await core.call("channel.health", _identity()))[
         "consuming"
     ] is True
+    renewed = await core.call(
+        "channel.lease_renew",
+        LeaseParams.from_mapping(
+            {**_identity(), "lease_token": "rpc-token", "lease_ttl_ms": 100},
+        ).to_mapping(),
+    )
+    assert renewed["consuming"] is True
+    endpoint = EndpointParams.from_mapping(
+        {
+            **_identity(),
+            "protocol": "http",
+            "host": "127.0.0.1",
+            "port": 8080,
+            "path": "/voice",
+            "public_base_url": None,
+            "readiness": "ready",
+            "bound_externally": False,
+            "auth_required": False,
+            "quiescing": False,
+        },
+    )
+    registered = await runner.call(
+        "ingress.endpoint.register",
+        endpoint.to_mapping(),
+    )
+    assert registered["status"] == "registered"
+    assert adapter.endpoints[7] == endpoint
+    state = HostStateParams.from_mapping(
+        {
+            **_identity(),
+            "key": "rpc-checkpoint",
+            "value": {"ok": True},
+        },
+    )
+    await runner.call("host.state.put", state.to_mapping())
+    assert await adapter.host_state_store.get("rpc-checkpoint") == (
+        1,
+        {"ok": True},
+    )
+    await runner.call(
+        "ingress.endpoint.unregister",
+        IdentityParams.from_mapping(_identity()).to_mapping(),
+    )
+    assert not adapter.endpoints
     assert (await core.call("channel.stop", _identity()))["state"] == "stopped"
     await core.aclose()
     await runner.aclose()
+
+
+@pytest.mark.asyncio
+async def test_capability_gates_and_bounded_host_state() -> None:
+    """Methods requiring undeclared capabilities return stable errors."""
+    clock = Clock()
+    controller = LifecycleController(
+        channel_key="voice",
+        instance_id="instance-1",
+        generation=7,
+        environment_spec_id="ches1_" + "1" * 64,
+        environment_id="ches1_" + "1" * 64 + ".install1_" + "2" * 32,
+        capabilities=("media",),
+        clock_ms=clock,
+    )
+    controller.accept_hello(_hello())
+    with pytest.raises(RpcError) as prepare_error:
+        await controller.prepare(
+            PrepareParams.from_mapping(
+                {
+                    **_identity(),
+                    "host_context": {},
+                    "capabilities": ["host_state"],
+                },
+            ),
+        )
+    assert prepare_error.value.data["reason_code"] == "CAPABILITY_REQUIRED"
+
+    store = HostStateStore(
+        max_value_bytes=8,
+        max_total_bytes=12,
+        max_keys=1,
+    )
+    controller = _controller(clock)
+    controller.host_state_store = store
+    controller.accept_hello(_hello())
+    await controller.prepare(
+        PrepareParams.from_mapping(
+            {
+                **_identity(),
+                "host_context": {},
+                "capabilities": [
+                    "host_state",
+                    "ingress_endpoint",
+                    "media",
+                ],
+            },
+        ),
+    )
+    lease = LeaseParams.from_mapping(
+        {**_identity(), "lease_token": "opaque", "lease_ttl_ms": 100},
+    )
+    await controller.activate(lease)
+    await controller.commit(lease)
+    with pytest.raises(ProtocolValidationError) as limit_error:
+        await controller.host_state_put(
+            HostStateParams.from_mapping(
+                {
+                    **_identity(),
+                    "key": "large",
+                    "value": "0123456789",
+                },
+            ),
+        )
+    assert limit_error.value.reason_code == "STATE_LIMIT_EXCEEDED"
+
+
+def test_protocol_version_mismatch_has_stable_reason() -> None:
+    """Hello rejects non-overlapping protocol versions deterministically."""
+    clock = Clock()
+    controller = LifecycleController(
+        channel_key="voice",
+        instance_id="instance-1",
+        generation=7,
+        environment_spec_id="ches1_" + "1" * 64,
+        environment_id="ches1_" + "1" * 64 + ".install1_" + "2" * 32,
+        protocol_min=2,
+        protocol_max=2,
+        clock_ms=clock,
+    )
+    with pytest.raises(RpcError) as mismatch:
+        controller.accept_hello(_hello())
+    assert mismatch.value.data["reason_code"] == "PROTOCOL_MISMATCH"

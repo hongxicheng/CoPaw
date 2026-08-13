@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import ntpath
 import posixpath
 from dataclasses import dataclass, field
@@ -697,11 +698,12 @@ class EndpointParams(IdentityParams):
         readiness = _string(data.get("readiness"), "readiness")
         if readiness not in {"starting", "ready", "degraded", "stopped"}:
             raise _error("invalid endpoint readiness", path=("readiness",))
-        bound_externally = _boolean(
+        _boolean(
             data.get("bound_externally"),
             "bound_externally",
         )
         auth_required = _boolean(data.get("auth_required"), "auth_required")
+        bound_externally = is_external_host(host)
         if bound_externally and not auth_required:
             raise _error(
                 "externally bound endpoint must require authentication",
@@ -734,6 +736,17 @@ class EndpointParams(IdentityParams):
             "auth_required": self.auth_required,
             "quiescing": self.quiescing,
         }
+
+
+def is_external_host(host: str) -> bool:
+    """Return whether an endpoint host is exposed beyond loopback."""
+    normalized = host.strip().lower()
+    if normalized == "localhost":
+        return False
+    try:
+        return not ipaddress.ip_address(normalized.strip("[]")).is_loopback
+    except ValueError:
+        return True
 
 
 def validate_content_part(value: object) -> dict[str, Any]:
@@ -1049,7 +1062,6 @@ class VoiceSetup:
     def from_mapping(cls, value: object) -> "VoiceSetup":
         """Validate a ConversationRelay setup message."""
         data = _object(value)
-        _closed(data, {"type", "callSid", "from", "to"})
         if data.get("type") != "setup":
             raise _error(
                 "setup message must have type 'setup'",
@@ -1083,7 +1095,6 @@ class VoiceStatusCallback:
     def from_mapping(cls, value: object) -> "VoiceStatusCallback":
         """Validate a Twilio status callback form mapping."""
         data = _object(value)
-        _closed(data, {"CallSid", "CallStatus"})
         return cls(
             platform_session_id=_string(data.get("CallSid"), "CallSid"),
             status=_string(data.get("CallStatus"), "CallStatus"),

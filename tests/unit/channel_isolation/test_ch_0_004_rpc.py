@@ -95,7 +95,7 @@ async def test_unknown_method_and_duplicate_response() -> None:
     await right_transport.send(
         '{"jsonrpc":"2.0","id":"rpc-999","result":null}',
     )
-    await asyncio.sleep(0)
+    await asyncio.sleep(0.05)
     assert core.duplicate_responses == 1
     await asyncio.gather(core.aclose(), runner.aclose())
 
@@ -124,11 +124,63 @@ async def test_pending_limit_timeout_and_cancel_notification() -> None:
     await asyncio.gather(core.start(), runner.start())
 
     pending = asyncio.create_task(core.call("never.respond"))
-    await asyncio.sleep(0)
+    await asyncio.sleep(0.05)
     with pytest.raises(RpcError):
         await core.call("second")
     with pytest.raises(RpcTimeoutError):
         await pending
     await asyncio.sleep(0)
     assert cancellations
+    await asyncio.gather(core.aclose(), runner.aclose())
+
+
+@pytest.mark.asyncio
+async def test_explicit_cancel_notification_cancels_incoming_request() -> None:
+    """A caller can explicitly cancel a running request."""
+    left_transport, right_transport = _transport_pair()
+    core = RpcPeer(left_transport)
+    runner = RpcPeer(right_transport)
+    cancelled = asyncio.Event()
+    started = asyncio.Event()
+
+    async def never_respond(_: object, __: object) -> None:
+        """Keep the inbound request running until cancellation."""
+        started.set()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    runner.register_method("never.respond", never_respond)
+    await asyncio.gather(core.start(), runner.start())
+    request = asyncio.create_task(
+        core.call("never.respond", timeout=1.0),
+    )
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    await core.notify(
+        "request.cancel",
+        {"request_id": "rpc-1", "reason": "user_cancelled"},
+    )
+    await asyncio.wait_for(cancelled.wait(), timeout=1.0)
+    with pytest.raises(RpcError) as cancelled_error:
+        await request
+    assert cancelled_error.value.data["reason_code"] == "REQUEST_CANCELLED"
+    await asyncio.gather(core.aclose(), runner.aclose())
+
+
+@pytest.mark.asyncio
+async def test_protocol_and_schema_errors_are_stable() -> None:
+    """Protocol mismatch and invalid DTOs expose stable reason codes."""
+    left_transport, right_transport = _transport_pair()
+    core = RpcPeer(left_transport)
+    runner = RpcPeer(right_transport)
+    runner.register_method("channel.health", lambda params, _: params)
+    await asyncio.gather(core.start(), runner.start())
+    with pytest.raises(RpcError) as unknown:
+        await core.call("missing.method")
+    assert unknown.value.data["reason_code"] == "METHOD_NOT_FOUND"
+    with pytest.raises(RpcError) as schema_error:
+        await core.call("channel.health", {"unexpected": True})
+    assert schema_error.value.data["reason_code"] == "SCHEMA_MISMATCH"
     await asyncio.gather(core.aclose(), runner.aclose())

@@ -21,6 +21,7 @@ from .models import (
     PrepareParams,
     QuiesceParams,
     SendParams,
+    is_external_host,
 )
 from .rpc import RpcPeer
 
@@ -28,6 +29,259 @@ from .rpc import RpcPeer
 RPC_LIFECYCLE_ERROR = -32010
 RPC_FENCING_ERROR = -32011
 RPC_AUTH_ERROR = -32012
+RPC_CAPABILITY_ERROR = -32013
+
+
+class HostStateStore:
+    """Bounded Core-owned store for instance-scoped host state."""
+
+    def __init__(
+        self,
+        *,
+        max_value_bytes: int = 64 * 1024,
+        max_total_bytes: int = 1024 * 1024,
+        max_keys: int = 1024,
+    ) -> None:
+        if max_value_bytes <= 0 or max_total_bytes <= 0 or max_keys <= 0:
+            raise ValueError("host state limits must be positive")
+        if max_value_bytes > max_total_bytes:
+            raise ValueError("max_value_bytes cannot exceed max_total_bytes")
+        self.max_value_bytes = max_value_bytes
+        self.max_total_bytes = max_total_bytes
+        self.max_keys = max_keys
+        self._values: dict[str, tuple[int, object, int]] = {}
+        self._lock = asyncio.Lock()
+
+    async def get(self, key: str) -> tuple[int, object] | None:
+        """Read one value from the bounded store."""
+        async with self._lock:
+            entry = self._values.get(key)
+            if entry is None:
+                return None
+            return entry[0], entry[1]
+
+    async def put(self, key: str, schema_version: int, value: object) -> None:
+        """Atomically validate and replace one value."""
+        encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        size = len(encoded.encode("utf-8"))
+        if size > self.max_value_bytes:
+            raise ProtocolValidationError(
+                "host state value exceeds size limit",
+                reason_code="STATE_LIMIT_EXCEEDED",
+            )
+        async with self._lock:
+            old = self._values.get(key)
+            total = sum(entry[2] for entry in self._values.values())
+            total -= old[2] if old is not None else 0
+            if old is None and len(self._values) >= self.max_keys:
+                raise ProtocolValidationError(
+                    "host state key limit exceeded",
+                    reason_code="STATE_LIMIT_EXCEEDED",
+                )
+            if total + size > self.max_total_bytes:
+                raise ProtocolValidationError(
+                    "host state total size limit exceeded",
+                    reason_code="STATE_LIMIT_EXCEEDED",
+                )
+            self._values[key] = (schema_version, value, size)
+
+    async def delete(self, key: str) -> None:
+        """Atomically delete one value."""
+        async with self._lock:
+            self._values.pop(key, None)
+
+
+# pylint: disable=protected-access
+class CoreLifecycleAdapter:
+    """Receive Runner-owned requests and retain Core-owned state."""
+
+    def __init__(
+        self,
+        controller: "LifecycleController",
+        *,
+        host_state_store: HostStateStore | None = None,
+    ) -> None:
+        self.controller = controller
+        self.host_state_store = host_state_store or HostStateStore()
+        self.controller.host_state_store = self.host_state_store
+        self.endpoints: dict[int, EndpointParams] = {}
+        previous_handler = self.controller._endpoint_handler
+
+        async def endpoint_handler(
+            operation: str,
+            params: EndpointParams | None,
+        ) -> None:
+            """Forward lifecycle callbacks and update the Core registry."""
+            if previous_handler is not None:
+                result = previous_handler(operation, params)
+                if hasattr(result, "__await__"):
+                    await result
+            await self._endpoint_handler(operation, params)
+
+        self.controller._endpoint_handler = endpoint_handler
+
+    async def _endpoint_handler(
+        self,
+        operation: str,
+        params: EndpointParams | None,
+    ) -> None:
+        """Keep the Core endpoint registry in sync with lifecycle changes."""
+        if operation == "unregister":
+            self.endpoints.pop(self.controller.generation, None)
+        elif params is not None:
+            self.endpoints[params.generation] = params
+
+    def register_rpc_methods(self, peer: RpcPeer) -> None:
+        """Register Core-owned Runner-to-Core methods."""
+        peer.register_method(
+            "runner.hello",
+            lambda params, _: self.controller.accept_hello(params),
+        )
+        peer.register_method(
+            "ingress.endpoint.register",
+            lambda params, _: self.endpoint_register(params),
+        )
+        peer.register_method(
+            "ingress.endpoint.update",
+            lambda params, _: self.endpoint_update(params),
+        )
+        peer.register_method(
+            "ingress.endpoint.unregister",
+            lambda params, _: self.endpoint_unregister(params),
+        )
+        peer.register_method(
+            "host.state.get",
+            lambda params, _: self.host_state_get(params),
+        )
+        peer.register_method(
+            "host.state.put",
+            lambda params, _: self.host_state_put(params),
+        )
+        peer.register_method(
+            "host.state.delete",
+            lambda params, _: self.host_state_delete(params),
+        )
+
+    def _check_capability(self, capability: str) -> None:
+        """Reject a Core-owned operation without negotiated capability."""
+        if capability not in self.controller.negotiated_capabilities:
+            raise RpcError(
+                RPC_CAPABILITY_ERROR,
+                "capability was not negotiated",
+                data={
+                    "reason_code": "CAPABILITY_REQUIRED",
+                    "capability": capability,
+                },
+            )
+
+    async def endpoint_register(
+        self,
+        params: EndpointParams,
+    ) -> dict[str, Any]:
+        """Register a Runner-owned endpoint in Core."""
+        self._check_capability("ingress_endpoint")
+        self.controller._check_identity(params)
+        self.controller._expire_lease_if_needed()
+        if self.controller.state == RunnerState.FAILED:
+            raise self.controller._lifecycle_error("LEASE_EXPIRED")
+        if self.controller.state not in {
+            RunnerState.STANDBY,
+            RunnerState.ACTIVE,
+        }:
+            raise self.controller._lifecycle_error("INVALID_STATE_TRANSITION")
+        if self.controller.state != RunnerState.ACTIVE and is_external_host(
+            params.host,
+        ):
+            raise RpcError(
+                RPC_FENCING_ERROR,
+                "standby endpoint cannot be externally exposed",
+                data={"reason_code": "STANDBY_ENDPOINT_FORBIDDEN"},
+            )
+        if is_external_host(params.host) and not params.auth_required:
+            raise RpcError(
+                RPC_AUTH_ERROR,
+                "externally bound endpoint must require authentication",
+                data={"reason_code": "AUTH_FAILED"},
+            )
+        self.endpoints[params.generation] = params
+        self.controller.endpoint = params
+        return {
+            "status": "registered",
+            "generation": params.generation,
+            "readiness": params.readiness,
+        }
+
+    async def endpoint_update(self, params: EndpointParams) -> dict[str, Any]:
+        """Update a Runner-owned endpoint in Core."""
+        result = await self.endpoint_register(params)
+        result["status"] = "updated"
+        return result
+
+    async def endpoint_unregister(
+        self,
+        params: IdentityParams,
+    ) -> dict[str, Any]:
+        """Idempotently unregister a Runner-owned endpoint."""
+        self._check_capability("ingress_endpoint")
+        self.controller._check_identity(params)
+        self.endpoints.pop(params.generation, None)
+        self.controller.endpoint = None
+        return {"status": "unregistered", "generation": params.generation}
+
+    async def host_state_get(self, params: HostStateParams) -> dict[str, Any]:
+        """Read Core-owned host state."""
+        self._check_capability("host_state")
+        self.controller._check_identity(params)
+        entry = await self.host_state_store.get(params.key)
+        if entry is None:
+            return {"found": False, "key": params.key}
+        schema_version, value = entry
+        return {
+            "found": True,
+            "key": params.key,
+            "schema_version": schema_version,
+            "value": value,
+        }
+
+    async def host_state_put(self, params: HostStateParams) -> dict[str, Any]:
+        """Write Core-owned host state with generation fencing."""
+        self._check_capability("host_state")
+        self.controller._check_identity(params)
+        expired = (
+            self.controller.lease_expires_at_ms is not None
+            and self.controller._clock_ms()
+            >= self.controller.lease_expires_at_ms
+        )
+        self.controller._expire_lease_if_needed()
+        if expired:
+            raise self.controller._lifecycle_error("LEASE_EXPIRED")
+        self.controller._ensure_state(RunnerState.ACTIVE)
+        self.controller._ensure_json_value(params.value)
+        await self.host_state_store.put(
+            params.key,
+            params.schema_version,
+            params.value,
+        )
+        return {"status": "stored", "key": params.key}
+
+    async def host_state_delete(
+        self,
+        params: HostStateParams,
+    ) -> dict[str, Any]:
+        """Delete Core-owned host state with generation fencing."""
+        self._check_capability("host_state")
+        self.controller._check_identity(params)
+        expired = (
+            self.controller.lease_expires_at_ms is not None
+            and self.controller._clock_ms()
+            >= self.controller.lease_expires_at_ms
+        )
+        self.controller._expire_lease_if_needed()
+        if expired:
+            raise self.controller._lifecycle_error("LEASE_EXPIRED")
+        self.controller._ensure_state(RunnerState.ACTIVE)
+        await self.host_state_store.delete(params.key)
+        return {"status": "deleted", "key": params.key}
 
 
 class RunnerState(StrEnum):
@@ -60,6 +314,7 @@ class LifecycleController:
         send_handler: Callable[[SendParams], Any] | None = None,
         endpoint_handler: Callable[[str, EndpointParams | None], Any]
         | None = None,
+        host_state_store: HostStateStore | None = None,
         clock_ms: Callable[[], int] | None = None,
     ) -> None:
         self.channel_key = channel_key
@@ -77,7 +332,8 @@ class LifecycleController:
         self.lease_token: str | None = None
         self.lease_expires_at_ms: int | None = None
         self.endpoint: EndpointParams | None = None
-        self._host_state: dict[str, tuple[int, object]] = {}
+        self.host_state_store = host_state_store or HostStateStore()
+        self.negotiated_capabilities: frozenset[str] = frozenset()
         self._send_handler = send_handler
         self._endpoint_handler = endpoint_handler
         self._clock_ms = clock_ms or (lambda: time.monotonic_ns() // 1_000_000)
@@ -154,11 +410,14 @@ class LifecycleController:
         if self.state != RunnerState.CREATED:
             raise self._lifecycle_error("HELLO_ALREADY_ACCEPTED")
         self.hello = params
+        self.negotiated_capabilities = frozenset(
+            set(self.capabilities).intersection(params.capabilities),
+        )
         return {
             "protocol_version": min(self.protocol_max, params.protocol_max),
             "capabilities": list(
                 sorted(
-                    set(self.capabilities).intersection(params.capabilities),
+                    self.negotiated_capabilities,
                 ),
             ),
         }
@@ -170,13 +429,21 @@ class LifecycleController:
             self._ensure_state(RunnerState.CREATED)
             if self.hello is None:
                 raise self._lifecycle_error("HELLO_REQUIRED")
+            requested = set(params.capabilities)
+            if not requested.issubset(self.negotiated_capabilities):
+                raise RpcError(
+                    RPC_CAPABILITY_ERROR,
+                    "prepare requested an unnegotiated capability",
+                    data={
+                        "reason_code": "CAPABILITY_REQUIRED",
+                        "capabilities": sorted(
+                            requested - self.negotiated_capabilities,
+                        ),
+                    },
+                )
             self.state = RunnerState.PREPARING
             self.host_context = params.host_context
-            self.capabilities = tuple(
-                sorted(
-                    set(self.capabilities).intersection(params.capabilities),
-                ),
-            )
+            self.capabilities = tuple(sorted(requested))
             self.state = RunnerState.STANDBY
             return GenerationStatus(
                 state=self.state.value,
@@ -231,9 +498,13 @@ class LifecycleController:
         async with self._lock:
             self._check_identity(params)
             self._ensure_state(RunnerState.ACTIVE, RunnerState.STANDBY)
+            self._expire_lease_if_needed()
+            if self.state == RunnerState.FAILED:
+                raise self._lifecycle_error("LEASE_EXPIRED")
             if self.state == RunnerState.ACTIVE:
                 if self.lease_token is None:
                     raise self._lifecycle_error("LEASE_REQUIRED")
+            await self._unregister_endpoint_locked()
             self.state = RunnerState.QUIESCING
             self.lease_token = None
             self.lease_expires_at_ms = None
@@ -267,6 +538,7 @@ class LifecycleController:
         """Stop the Runner from any non-terminal state."""
         async with self._lock:
             self._check_identity(params)
+            await self._unregister_endpoint_locked()
             if self.state != RunnerState.STOPPED:
                 self.state = RunnerState.STOPPED
             self.lease_token = None
@@ -285,6 +557,20 @@ class LifecycleController:
             self._expire_lease_if_needed()
             if self.state != RunnerState.ACTIVE:
                 raise self._lifecycle_error("LEASE_EXPIRED")
+            if (
+                any(
+                    part.get("type") != "text" for part in params.content_parts
+                )
+                and "media" not in self.negotiated_capabilities
+            ):
+                raise RpcError(
+                    RPC_CAPABILITY_ERROR,
+                    "media capability was not negotiated",
+                    data={
+                        "reason_code": "CAPABILITY_REQUIRED",
+                        "capability": "media",
+                    },
+                )
             callback = self._send_handler
         if callback is not None:
             result = callback(params)
@@ -314,18 +600,32 @@ class LifecycleController:
         """Unregister the endpoint for this generation."""
         async with self._lock:
             self._check_identity(params)
-            self.endpoint = None
-            if self._endpoint_handler is not None:
-                result = self._endpoint_handler("unregister", None)
-                if hasattr(result, "__await__"):
-                    await result
+            await self._unregister_endpoint_locked()
             return {"status": "unregistered", "generation": self.generation}
+
+    async def _unregister_endpoint_locked(self) -> None:
+        """Clear the endpoint and invoke the unregister hook once if needed."""
+        had_endpoint = self.endpoint is not None
+        self.endpoint = None
+        if had_endpoint and self._endpoint_handler is not None:
+            result = self._endpoint_handler("unregister", None)
+            if hasattr(result, "__await__"):
+                await result
 
     async def host_state_get(self, params: HostStateParams) -> dict[str, Any]:
         """Read instance-scoped host state."""
         async with self._lock:
             self._check_identity(params)
-            entry = self._host_state.get(params.key)
+            if "host_state" not in self.negotiated_capabilities:
+                raise RpcError(
+                    RPC_CAPABILITY_ERROR,
+                    "host state capability was not negotiated",
+                    data={
+                        "reason_code": "CAPABILITY_REQUIRED",
+                        "capability": "host_state",
+                    },
+                )
+            entry = await self.host_state_store.get(params.key)
             if entry is None:
                 return {"found": False, "key": params.key}
             schema_version, value = entry
@@ -340,9 +640,26 @@ class LifecycleController:
         """Write host state only from the active generation."""
         async with self._lock:
             self._check_identity(params)
+            expired = (
+                self.lease_expires_at_ms is not None
+                and self._clock_ms() >= self.lease_expires_at_ms
+            )
+            self._expire_lease_if_needed()
+            if expired:
+                raise self._lifecycle_error("LEASE_EXPIRED")
             self._ensure_state(RunnerState.ACTIVE)
+            if "host_state" not in self.negotiated_capabilities:
+                raise RpcError(
+                    RPC_CAPABILITY_ERROR,
+                    "host state capability was not negotiated",
+                    data={
+                        "reason_code": "CAPABILITY_REQUIRED",
+                        "capability": "host_state",
+                    },
+                )
             self._ensure_json_value(params.value)
-            self._host_state[params.key] = (
+            await self.host_state_store.put(
+                params.key,
                 params.schema_version,
                 params.value,
             )
@@ -355,8 +672,24 @@ class LifecycleController:
         """Delete host state only from the active generation."""
         async with self._lock:
             self._check_identity(params)
+            expired = (
+                self.lease_expires_at_ms is not None
+                and self._clock_ms() >= self.lease_expires_at_ms
+            )
+            self._expire_lease_if_needed()
+            if expired:
+                raise self._lifecycle_error("LEASE_EXPIRED")
             self._ensure_state(RunnerState.ACTIVE)
-            self._host_state.pop(params.key, None)
+            if "host_state" not in self.negotiated_capabilities:
+                raise RpcError(
+                    RPC_CAPABILITY_ERROR,
+                    "host state capability was not negotiated",
+                    data={
+                        "reason_code": "CAPABILITY_REQUIRED",
+                        "capability": "host_state",
+                    },
+                )
+            await self.host_state_store.delete(params.key)
             return {"status": "deleted", "key": params.key}
 
     async def _endpoint_change(
@@ -368,7 +701,21 @@ class LifecycleController:
         async with self._lock:
             self._check_identity(params)
             self._ensure_state(RunnerState.STANDBY, RunnerState.ACTIVE)
-            if self.state != RunnerState.ACTIVE and params.bound_externally:
+            self._expire_lease_if_needed()
+            if self.state == RunnerState.FAILED:
+                raise self._lifecycle_error("LEASE_EXPIRED")
+            if "ingress_endpoint" not in self.negotiated_capabilities:
+                raise RpcError(
+                    RPC_CAPABILITY_ERROR,
+                    "ingress endpoint capability was not negotiated",
+                    data={
+                        "reason_code": "CAPABILITY_REQUIRED",
+                        "capability": "ingress_endpoint",
+                    },
+                )
+            if self.state != RunnerState.ACTIVE and is_external_host(
+                params.host,
+            ):
                 raise RpcError(
                     RPC_FENCING_ERROR,
                     "standby endpoint cannot be externally exposed",
@@ -380,7 +727,10 @@ class LifecycleController:
                 if hasattr(result, "__await__"):
                     await result
             return {
-                "status": operation + "ed",
+                "status": {
+                    "register": "registered",
+                    "update": "updated",
+                }[operation],
                 "generation": self.generation,
                 "readiness": params.readiness,
             }
@@ -395,6 +745,7 @@ class LifecycleController:
         self.lease_expires_at_ms = None
         if self.state in {RunnerState.STANDBY, RunnerState.ACTIVE}:
             self.state = RunnerState.FAILED
+            self.endpoint = None
 
     @staticmethod
     def _ensure_json_value(value: object) -> None:
@@ -408,11 +759,7 @@ class LifecycleController:
             ) from exc
 
     def register_rpc_methods(self, peer: RpcPeer) -> None:
-        """Register the controller on a bidirectional RPC peer."""
-        peer.register_method(
-            "runner.hello",
-            lambda params, _: self.accept_hello(params),
-        )
+        """Register Core-to-Runner lifecycle methods on a peer."""
         peer.register_method(
             "channel.prepare",
             lambda params, _: self.prepare(params),
@@ -449,36 +796,15 @@ class LifecycleController:
             "channel.send",
             lambda params, _: self.send(params),
         )
-        peer.register_method(
-            "ingress.endpoint.register",
-            lambda params, _: self.endpoint_register(params),
-        )
-        peer.register_method(
-            "ingress.endpoint.update",
-            lambda params, _: self.endpoint_update(params),
-        )
-        peer.register_method(
-            "ingress.endpoint.unregister",
-            lambda params, _: self.endpoint_unregister(params),
-        )
-        peer.register_method(
-            "host.state.get",
-            lambda params, _: self.host_state_get(params),
-        )
-        peer.register_method(
-            "host.state.put",
-            lambda params, _: self.host_state_put(params),
-        )
-        peer.register_method(
-            "host.state.delete",
-            lambda params, _: self.host_state_delete(params),
-        )
 
 
 __all__ = [
     "LifecycleController",
+    "CoreLifecycleAdapter",
+    "HostStateStore",
     "RPC_AUTH_ERROR",
     "RPC_FENCING_ERROR",
     "RPC_LIFECYCLE_ERROR",
+    "RPC_CAPABILITY_ERROR",
     "RunnerState",
 ]

@@ -19,7 +19,12 @@ from .errors import (
     RpcTimeoutError,
 )
 from .framing import FrameReader, FramedTransport, FramingLimits, encode_frame
-from .lifecycle import LifecycleController, RunnerState
+from .lifecycle import (
+    CoreLifecycleAdapter,
+    HostStateStore,
+    LifecycleController,
+    RunnerState,
+)
 from .models import (
     CancelParams,
     EndpointParams,
@@ -43,6 +48,7 @@ from .models import (
     parse_rpc_message,
     validate_content_part,
     validate_method_params,
+    is_external_host,
     voice_event_from_setup,
     voice_event_from_status_callback,
 )
@@ -118,6 +124,8 @@ __all__ = [
     "IdentityParams",
     "LeaseParams",
     "LifecycleController",
+    "CoreLifecycleAdapter",
+    "HostStateStore",
     "PrepareParams",
     "QuiesceParams",
     "RpcErrorObject",
@@ -133,6 +141,7 @@ __all__ = [
     "parse_rpc_message",
     "validate_content_part",
     "validate_method_params",
+    "is_external_host",
     "voice_event_from_setup",
     "voice_event_from_status_callback",
     "JSONRPC_INVALID_PARAMS",

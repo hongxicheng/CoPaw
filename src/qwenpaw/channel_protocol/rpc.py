@@ -13,6 +13,7 @@ from typing import Any
 
 from .errors import (
     ProtocolValidationError,
+    RpcCancelledError,
     RpcClosedError,
     RpcError,
     RpcTimeoutError,
@@ -379,6 +380,15 @@ class RpcPeer:
         task = self._incoming.get(cancel.request_id)
         if task is not None and not task.done():
             task.cancel()
+            return
+
+        pending = self._pending.get(cancel.request_id)
+        if pending is not None and not pending.future.done():
+            pending.future.set_exception(
+                RpcCancelledError(
+                    f"request cancelled: {cancel.reason or 'unspecified'}",
+                ),
+            )
 
     async def _send_error(
         self,

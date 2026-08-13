@@ -129,10 +129,57 @@ def test_endpoint_rejects_unauthenticated_external_binding() -> None:
     assert exc_info.value.reason_code == "AUTH_FAILED"
 
 
+@pytest.mark.parametrize("host", ["0.0.0.0", "::", "example.test"])
+def test_endpoint_derives_external_binding_from_host(host: str) -> None:
+    """Core derives external exposure instead of trusting the DTO flag."""
+    with pytest.raises(ProtocolValidationError) as exc_info:
+        EndpointParams.from_mapping(
+            {
+                **_identity(),
+                "protocol": "http",
+                "host": host,
+                "port": 8080,
+                "path": "/voice",
+                "public_base_url": None,
+                "readiness": "ready",
+                "bound_externally": False,
+                "auth_required": False,
+                "quiescing": False,
+            },
+        )
+    assert exc_info.value.reason_code == "AUTH_FAILED"
+
+
+def test_endpoint_loopback_is_not_external() -> None:
+    """Loopback endpoint hosts may omit authentication."""
+    endpoint = EndpointParams.from_mapping(
+        {
+            **_identity(),
+            "protocol": "http",
+            "host": "::1",
+            "port": 8080,
+            "path": "/voice",
+            "public_base_url": None,
+            "readiness": "ready",
+            "bound_externally": True,
+            "auth_required": False,
+            "quiescing": False,
+        },
+    )
+    assert endpoint.bound_externally is False
+
+
 def test_voice_setup_and_terminal_callback_build_stable_events() -> None:
     """ConversationRelay fields map to stable protocol event DTOs."""
     setup = VoiceSetup.from_mapping(
-        {"type": "setup", "callSid": "CA123", "from": "+1", "to": "+2"},
+        {
+            "type": "setup",
+            "callSid": "CA123",
+            "from": "+1",
+            "to": "+2",
+            "AccountSid": "AC123",
+            "Direction": "inbound",
+        },
     )
     started = voice_event_from_setup(
         setup,
@@ -145,7 +192,14 @@ def test_voice_setup_and_terminal_callback_build_stable_events() -> None:
     )
     assert started.event_kind is VoiceEventKind.CALL_STARTED
     callback = VoiceStatusCallback.from_mapping(
-        {"CallSid": "CA123", "CallStatus": "completed"},
+        {
+            "CallSid": "CA123",
+            "CallStatus": "completed",
+            "AccountSid": "AC123",
+            "Direction": "inbound",
+            "From": "+1",
+            "To": "+2",
+        },
     )
     closed = voice_event_from_status_callback(
         callback,
