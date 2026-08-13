@@ -7,6 +7,7 @@ from collections.abc import Collection, Mapping
 from dataclasses import dataclass
 from decimal import Decimal
 import re
+from types import MappingProxyType
 from typing import Any, cast, Literal, TypeAlias
 from urllib.parse import urlsplit
 
@@ -27,7 +28,7 @@ from .identifiers import (
 from .requirements import canonicalize_requirements
 
 
-LocalizedText: TypeAlias = str | dict[str, str]
+LocalizedText: TypeAlias = str | Mapping[str, str]
 SourceKind: TypeAlias = Literal["builtin", "plugin"]
 ProcessMode: TypeAlias = Literal["in_process", "runner_process"]
 DispatchMode: TypeAlias = Literal["manager_queue", "direct_session"]
@@ -85,6 +86,8 @@ _DOTTED_NAME_PATTERN = re.compile(
 _LOCALE_PATTERN = re.compile(r"^[a-z]{2,8}(?:-[A-Za-z0-9]{1,8})*$")
 _CAPABILITY_PATTERN = re.compile(r"^[a-z][a-z0-9_.-]*$")
 _ENVIRONMENT_NAME_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]*$")
+_URL_PERCENT_ESCAPE_PATTERN = re.compile(r"%[0-9A-Fa-f]{2}")
+_URL_FORBIDDEN_CHARACTERS = frozenset('<>"{}|\\^`')
 
 _SOURCE_KINDS = frozenset({"builtin", "plugin"})
 _PROCESS_MODES = frozenset({"in_process", "runner_process"})
@@ -177,6 +180,20 @@ def _enum(
 def _http_url(value: str, *path: PathPart) -> str:
     if not value:
         return value
+    if any(
+        character.isspace()
+        or ord(character) < 0x20
+        or ord(character) == 0x7F
+        or character in _URL_FORBIDDEN_CHARACTERS
+        for character in value
+    ):
+        raise _error("HTTP(S) URL contains an invalid character", *path)
+    for index, character in enumerate(value):
+        if (
+            character == "%"
+            and _URL_PERCENT_ESCAPE_PATTERN.match(value, index) is None
+        ):
+            raise _error("HTTP(S) URL percent escape is invalid", *path)
     try:
         parts = urlsplit(value)
         port = parts.port
@@ -213,7 +230,13 @@ def _localized_text(
             if url
             else normalized_text
         )
-    return output
+    return MappingProxyType(output)
+
+
+def _localized_text_mapping(value: LocalizedText) -> LocalizedText:
+    if isinstance(value, str):
+        return value
+    return dict(value)
 
 
 def resolve_localized_text(value: LocalizedText, locale: str) -> str:
@@ -330,9 +353,9 @@ class ConfigField:
         """Return the closed canonical JSON object."""
         return {
             "name": self.name,
-            "label": self.label,
-            "help": self.help,
-            "placeholder": self.placeholder,
+            "label": _localized_text_mapping(self.label),
+            "help": _localized_text_mapping(self.help),
+            "placeholder": _localized_text_mapping(self.placeholder),
             "type": self.type,
             "required": self.required,
             "nullable": self.nullable,
@@ -786,7 +809,7 @@ class ChannelDescriptor:
         )
         label = _localized_text(mapping["label"], "label")
         if not legacy:
-            if not isinstance(label, dict):
+            if not isinstance(label, Mapping):
                 raise _error("New descriptor label must be localized", "label")
             if not label.get("en") or not label.get("zh"):
                 raise _error("Label requires non-empty en and zh", "label")
@@ -883,10 +906,10 @@ class ChannelDescriptor:
             "process_mode": self.process_mode,
             "dispatch_mode": self.dispatch_mode,
             "ingress_owner": self.ingress_owner,
-            "label": self.label,
-            "description": self.description,
+            "label": _localized_text_mapping(self.label),
+            "description": _localized_text_mapping(self.description),
             "icon": self.icon,
-            "doc_url": self.doc_url,
+            "doc_url": _localized_text_mapping(self.doc_url),
             "plugin_metadata": (
                 self.plugin_metadata.to_mapping()
                 if self.plugin_metadata is not None

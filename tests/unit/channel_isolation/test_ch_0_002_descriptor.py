@@ -159,6 +159,32 @@ def test_complete_descriptor_fixture_matches_design_digest() -> None:
     assert "Fixturé" in descriptor.canonical_bytes().decode("utf-8")
 
 
+def test_descriptor_localized_maps_are_immutable_and_defensively_copied() -> (
+    None
+):
+    """Validated localized maps cannot mutate descriptor state or digest."""
+    descriptor = _validate(_descriptor())
+    digest = descriptor.digest()
+    label: Any = descriptor.label
+    field_label: Any = descriptor.config_fields[0].label
+
+    with pytest.raises(TypeError):
+        label["en"] = "Changed"
+    with pytest.raises(TypeError):
+        field_label["en"] = "Changed"
+
+    output = descriptor.to_mapping()
+    output["label"]["en"] = "Changed"
+    output["config_fields"][0]["label"]["en"] = "Changed"
+
+    assert resolve_localized_text(descriptor.label, "en") == "Fixturé"
+    assert (
+        resolve_localized_text(descriptor.config_fields[0].label, "en")
+        == "Fixturé"
+    )
+    assert descriptor.digest() == digest == EXPECTED_DIGEST
+
+
 def test_descriptor_json_decoder_preserves_decimal_numbers() -> None:
     """JSON descriptor decimals remain exact and encode without exponent."""
     value = _descriptor()
@@ -274,6 +300,29 @@ def test_localized_text_fallback_and_url_rules() -> None:
     value["label"] = {}
     with pytest.raises(DescriptorValidationError):
         _validate(value)
+
+
+@pytest.mark.parametrize(
+    ("field", "url"),
+    [
+        ("icon", "https://exa mple.com/icon.png"),
+        ("icon", "https://example.com/a b"),
+        ("icon", "https://example.com/\\path"),
+        ("doc_url", "https://example.com/\x01docs"),
+        ("doc_url", "https:///docs"),
+        ("doc_url", "https://example.com/%zz"),
+        ("doc_url", "https://example.com/<docs>"),
+    ],
+)
+def test_descriptor_rejects_malformed_http_urls(field: str, url: str) -> None:
+    """Display URLs must be syntactically valid absolute HTTP(S) URLs."""
+    value = _descriptor()
+    value[field] = url
+
+    with pytest.raises(DescriptorValidationError) as raised:
+        _validate(value)
+
+    assert raised.value.code == "descriptor_invalid"
 
 
 @pytest.mark.parametrize(
