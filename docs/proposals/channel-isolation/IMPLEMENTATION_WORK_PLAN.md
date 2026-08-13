@@ -342,7 +342,7 @@ pre-commit 全部通过，`git diff --check` 通过。独立 Review 已通过（
 
 ### CH-0-005：可靠事件、ACK 和幂等原型
 
-- 状态：[-] 实施完成，等待独立 Review 和最终验证
+- 状态：[x] 独立 Review 和最终验证通过
 
 - [x] 定义 `event.batch`、`batch_id`、稳定 `event_id` 和
   accepted/duplicate/rejected ACK；rejected 带 reason code 与 `retryable`。
