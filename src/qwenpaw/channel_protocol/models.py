@@ -776,6 +776,389 @@ def validate_content_part(value: object) -> dict[str, Any]:
     return data
 
 
+def _conversation(value: object) -> dict[str, Any]:
+    """Validate the stable conversation identity carried by an event."""
+    data = _object(value, path=("conversation",))
+    _closed(
+        data,
+        {"id", "type", "thread_id"},
+        path=("conversation",),
+    )
+    result = {
+        "id": _string(data.get("id"), "id", path=("conversation",)),
+        "type": _string(
+            data.get("type"),
+            "type",
+            path=("conversation",),
+        ),
+        "thread_id": _optional_string(
+            data,
+            "thread_id",
+            path=("conversation",),
+        ),
+    }
+    return result
+
+
+@dataclass(frozen=True)
+class InboundEvent:
+    """Stable platform-independent event submitted by a Runner."""
+
+    event_id: str
+    channel_key: str
+    instance_id: str
+    generation: int
+    conversation: Mapping[str, Any]
+    sender_id: str
+    acl_sender_id: str
+    sender_name: str
+    content_parts: tuple[dict[str, Any], ...]
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+    event_kind: str | None = None
+
+    @classmethod
+    def from_mapping(cls, value: object) -> "InboundEvent":
+        """Validate one stable inbound event."""
+        data = _object(value)
+        _closed(
+            data,
+            {
+                "event_id",
+                "event_kind",
+                "channel_key",
+                "instance_id",
+                "generation",
+                "conversation",
+                "sender_id",
+                "acl_sender_id",
+                "sender_name",
+                "content_parts",
+                "metadata",
+            },
+        )
+        content_parts = _list(data.get("content_parts"), "content_parts")
+        metadata = data.get("metadata", {})
+        if not isinstance(metadata, Mapping):
+            raise _error("metadata must be an object", path=("metadata",))
+        event_kind = _optional_string(data, "event_kind")
+        return cls(
+            event_id=_string(data.get("event_id"), "event_id"),
+            event_kind=event_kind,
+            channel_key=validate_channel_key(
+                _string(data.get("channel_key"), "channel_key"),
+            ),
+            instance_id=_string(data.get("instance_id"), "instance_id"),
+            generation=_integer(
+                data.get("generation"),
+                "generation",
+                minimum=1,
+            ),
+            conversation=_conversation(data.get("conversation")),
+            sender_id=_string(data.get("sender_id"), "sender_id"),
+            acl_sender_id=_string(
+                data.get("acl_sender_id"),
+                "acl_sender_id",
+            ),
+            sender_name=_string(
+                data.get("sender_name"),
+                "sender_name",
+                non_empty=False,
+            ),
+            content_parts=tuple(
+                validate_content_part(item) for item in content_parts
+            ),
+            metadata=dict(metadata),
+        )
+
+    def to_mapping(self) -> dict[str, Any]:
+        """Encode one stable inbound event."""
+        result = {
+            "event_id": self.event_id,
+            "channel_key": self.channel_key,
+            "instance_id": self.instance_id,
+            "generation": self.generation,
+            "conversation": dict(self.conversation),
+            "sender_id": self.sender_id,
+            "acl_sender_id": self.acl_sender_id,
+            "sender_name": self.sender_name,
+            "content_parts": list(self.content_parts),
+            "metadata": dict(self.metadata),
+        }
+        if self.event_kind is not None:
+            result["event_kind"] = self.event_kind
+        return result
+
+
+@dataclass(frozen=True)
+class EventBatchParams:
+    """Reliable batch of inbound events submitted by a Runner."""
+
+    batch_id: str
+    events: tuple[InboundEvent, ...]
+    invalid_events: tuple[RejectedEvent, ...] = ()
+    identity: IdentityParams | None = None
+
+    @classmethod
+    def from_mapping(cls, value: object) -> "EventBatchParams":
+        """Validate a non-empty event batch and its shared identity."""
+        data = _object(value)
+        _closed(data, {"batch_id", "events"})
+        raw_events = _list(data.get("events"), "events")
+        if not raw_events:
+            raise _error("events must not be empty", path=("events",))
+        events: list[InboundEvent] = []
+        invalid_events: list[RejectedEvent] = []
+        identity: IdentityParams | None = None
+        for item in raw_events:
+            try:
+                event = InboundEvent.from_mapping(item)
+                events.append(event)
+                identity = IdentityParams(
+                    channel_key=event.channel_key,
+                    instance_id=event.instance_id,
+                    generation=event.generation,
+                )
+            except ProtocolValidationError as exc:
+                raw_item = item if isinstance(item, Mapping) else {}
+                event_id = raw_item.get("event_id")
+                if not isinstance(event_id, str) or not event_id:
+                    raise
+                if identity is None:
+                    identity_data = {
+                        key: raw_item.get(key)
+                        for key in (
+                            "channel_key",
+                            "instance_id",
+                            "generation",
+                        )
+                    }
+                    try:
+                        identity = IdentityParams.from_mapping(identity_data)
+                    except ProtocolValidationError as identity_error:
+                        raise exc from identity_error
+                invalid_events.append(
+                    RejectedEvent(
+                        event_id=event_id,
+                        reason_code=exc.reason_code,
+                        retryable=False,
+                    ),
+                )
+        if identity is None:
+            raise _error(
+                "events must contain a valid identity",
+                path=("events",),
+                reason_code="SCHEMA_MISMATCH",
+            )
+        event_tuple = tuple(events)
+        if any(
+            (
+                event.channel_key != identity.channel_key
+                or event.instance_id != identity.instance_id
+                or event.generation != identity.generation
+            )
+            for event in event_tuple[1:]
+        ):
+            raise _error(
+                "all events in a batch must share identity",
+                reason_code="SCHEMA_MISMATCH",
+            )
+        return cls(
+            batch_id=_string(data.get("batch_id"), "batch_id"),
+            events=event_tuple,
+            invalid_events=tuple(invalid_events),
+            identity=identity,
+        )
+
+    def to_mapping(self) -> dict[str, Any]:
+        """Encode a reliable event batch."""
+        return {
+            "batch_id": self.batch_id,
+            "events": [event.to_mapping() for event in self.events],
+        }
+
+
+@dataclass(frozen=True)
+class RejectedEvent:
+    """Per-event rejection returned in a reliable batch ACK."""
+
+    event_id: str
+    reason_code: str
+    retryable: bool
+
+    @classmethod
+    def from_mapping(cls, value: object) -> "RejectedEvent":
+        """Validate a rejected event result."""
+        data = _object(value)
+        _closed(data, {"event_id", "reason_code", "retryable"})
+        return cls(
+            event_id=_string(data.get("event_id"), "event_id"),
+            reason_code=_string(data.get("reason_code"), "reason_code"),
+            retryable=_boolean(data.get("retryable"), "retryable"),
+        )
+
+    def to_mapping(self) -> dict[str, Any]:
+        """Encode a rejected event result."""
+        return {
+            "event_id": self.event_id,
+            "reason_code": self.reason_code,
+            "retryable": self.retryable,
+        }
+
+
+@dataclass(frozen=True)
+class EventBatchAck:
+    """Per-event ACK returned after Core persistence and deduplication."""
+
+    accepted_event_ids: tuple[str, ...] = ()
+    duplicate_event_ids: tuple[str, ...] = ()
+    rejected_events: tuple[RejectedEvent, ...] = ()
+    batch_id: str | None = None
+
+    @classmethod
+    def from_mapping(cls, value: object) -> "EventBatchAck":
+        """Validate an event batch ACK."""
+        data = _object(value)
+        _closed(
+            data,
+            {
+                "batch_id",
+                "accepted_event_ids",
+                "duplicate_event_ids",
+                "rejected_events",
+            },
+        )
+        accepted = _list(
+            data.get("accepted_event_ids", []),
+            "accepted_event_ids",
+        )
+        duplicates = _list(
+            data.get("duplicate_event_ids", []),
+            "duplicate_event_ids",
+        )
+        if any(not isinstance(item, str) or not item for item in accepted):
+            raise _error(
+                "accepted_event_ids must contain non-empty strings",
+                path=("accepted_event_ids",),
+            )
+        if any(not isinstance(item, str) or not item for item in duplicates):
+            raise _error(
+                "duplicate_event_ids must contain non-empty strings",
+                path=("duplicate_event_ids",),
+            )
+        if set(accepted).intersection(duplicates):
+            raise _error(
+                "accepted and duplicate event IDs must be disjoint",
+                reason_code="SCHEMA_MISMATCH",
+            )
+        rejected = _list(data.get("rejected_events", []), "rejected_events")
+        rejected_ids = [
+            item.get("event_id")
+            for item in rejected
+            if isinstance(item, Mapping)
+        ]
+        if set(accepted).intersection(rejected_ids) or set(
+            duplicates,
+        ).intersection(
+            rejected_ids,
+        ):
+            raise _error(
+                "ACK event classifications must be disjoint",
+                reason_code="SCHEMA_MISMATCH",
+            )
+        return cls(
+            batch_id=_optional_string(data, "batch_id"),
+            accepted_event_ids=tuple(accepted),
+            duplicate_event_ids=tuple(duplicates),
+            rejected_events=tuple(
+                RejectedEvent.from_mapping(item) for item in rejected
+            ),
+        )
+
+    def to_mapping(self) -> dict[str, Any]:
+        """Encode an event batch ACK."""
+        result = {
+            "accepted_event_ids": list(self.accepted_event_ids),
+            "duplicate_event_ids": list(self.duplicate_event_ids),
+            "rejected_events": [
+                item.to_mapping() for item in self.rejected_events
+            ],
+        }
+        if self.batch_id is not None:
+            result["batch_id"] = self.batch_id
+        return result
+
+
+class DeliveryState(StrEnum):
+    """Stable outbound delivery ledger states."""
+
+    REQUESTED = "requested"
+    SENDING = "sending"
+    ACKNOWLEDGED = "acknowledged"
+    FAILED = "failed"
+    TIMEOUT = "timeout"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class DeliveryUpdateParams(IdentityParams):
+    """Runner result update for an immutable outbound delivery."""
+
+    delivery_id: str
+    state: DeliveryState
+    reason_code: str | None = None
+    retryable: bool = False
+
+    @classmethod
+    def from_mapping(cls, value: object) -> "DeliveryUpdateParams":
+        """Validate a delivery ledger update."""
+        data = _object(value)
+        _closed(
+            data,
+            {
+                "channel_key",
+                "instance_id",
+                "generation",
+                "delivery_id",
+                "state",
+                "reason_code",
+                "retryable",
+            },
+        )
+        identity = IdentityParams.from_mapping(
+            {
+                key: data[key]
+                for key in ("channel_key", "instance_id", "generation")
+            },
+        )
+        state_value = _string(data.get("state"), "state")
+        try:
+            state = DeliveryState(state_value)
+        except ValueError as exc:
+            raise _error(
+                "unsupported delivery state",
+                path=("state",),
+            ) from exc
+        return cls(
+            **identity.__dict__,
+            delivery_id=_string(data.get("delivery_id"), "delivery_id"),
+            state=state,
+            reason_code=_optional_string(data, "reason_code"),
+            retryable=_boolean(data.get("retryable", False), "retryable"),
+        )
+
+    def to_mapping(self) -> dict[str, Any]:
+        """Encode a delivery ledger update."""
+        result = {
+            **super().to_mapping(),
+            "delivery_id": self.delivery_id,
+            "state": self.state.value,
+            "retryable": self.retryable,
+        }
+        if self.reason_code is not None:
+            result["reason_code"] = self.reason_code
+        return result
+
+
 @dataclass(frozen=True)
 class SendParams(IdentityParams):
     """Platform-independent outbound message DTO."""
@@ -1191,6 +1574,8 @@ METHOD_SCHEMAS: dict[str, type[Any]] = {
     "channel.generation_status": IdentityParams,
     "channel.stop": IdentityParams,
     "channel.send": SendParams,
+    "event.batch": EventBatchParams,
+    "delivery.update": DeliveryUpdateParams,
     "ingress.endpoint.register": EndpointParams,
     "ingress.endpoint.update": EndpointParams,
     "ingress.endpoint.unregister": IdentityParams,

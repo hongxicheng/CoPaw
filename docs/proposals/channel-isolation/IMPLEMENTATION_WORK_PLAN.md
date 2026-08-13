@@ -342,12 +342,14 @@ pre-commit 全部通过，`git diff --check` 通过。独立 Review 已通过（
 
 ### CH-0-005：可靠事件、ACK 和幂等原型
 
-- [ ] 定义 `event.batch`、`batch_id`、稳定 `event_id` 和
+- 状态：[-] 实施完成，等待独立 Review 和最终验证
+
+- [x] 定义 `event.batch`、`batch_id`、稳定 `event_id` 和
   accepted/duplicate/rejected ACK；rejected 带 reason code 与 `retryable`。
-- [ ] 定义 Runner 未收到 ACK 的重试和退避规则。
-- [ ] 定义 Core 在 Inbox 持久化后才 ACK 的边界。
-- [ ] 定义 OutboundDeliveryLedger、`delivery_id` 和 `unknown` 发送语义。
-- [ ] 注入 ACK 丢失、Core 重启、Runner 重启和重复事件。
+- [x] 定义 Runner 未收到 ACK 的重试和退避规则。
+- [x] 定义 Core 在 Inbox 持久化后才 ACK 的边界。
+- [x] 定义 OutboundDeliveryLedger、`delivery_id` 和 `unknown` 发送语义。
+- [x] 注入 ACK 丢失、Core 重启、Runner 重启和重复事件。
 
 验收：至少一次投递不会导致重复进入 Agent；ACK 丢失可以安全重试。
 

@@ -11,6 +11,8 @@ from typing import Any, Callable, Mapping
 
 from .errors import ProtocolValidationError, RpcError
 from .models import (
+    DeliveryUpdateParams,
+    EventBatchParams,
     EndpointParams,
     GenerationStatus,
     HelloParams,
@@ -23,6 +25,7 @@ from .models import (
     SendParams,
     is_external_host,
 )
+from .reliability import InboundInbox, OutboundDeliveryLedger
 from .rpc import RpcPeer
 
 
@@ -116,9 +119,13 @@ class CoreLifecycleAdapter:
         controller: "LifecycleController",
         *,
         host_state_store: HostStateStore | None = None,
+        delivery_ledger: OutboundDeliveryLedger | None = None,
+        inbound_inbox: InboundInbox | None = None,
     ) -> None:
         self.controller = controller
         self.host_state_store = host_state_store or HostStateStore()
+        self.delivery_ledger = delivery_ledger or OutboundDeliveryLedger()
+        self.inbound_inbox = inbound_inbox or InboundInbox()
         self.controller.host_state_store = self.host_state_store
         self.endpoints: dict[int, EndpointParams] = {}
         previous_handler = self.controller._endpoint_handler
@@ -177,6 +184,42 @@ class CoreLifecycleAdapter:
             "host.state.delete",
             lambda params, _: self.host_state_delete(params),
         )
+        peer.register_method(
+            "delivery.update",
+            lambda params, _: self.delivery_update(params),
+        )
+        peer.register_method(
+            "event.batch",
+            lambda params, _: self.event_batch(params),
+        )
+
+    async def event_batch(
+        self,
+        params: EventBatchParams,
+    ) -> dict[str, Any]:
+        """Persist and deduplicate a reliable inbound event batch."""
+        if params.identity is None:
+            raise self.controller._lifecycle_error("INVALID_EVENT_BATCH")
+        self.controller._check_identity(params.identity)
+        await self.controller._expire_lease_if_needed_async()
+        self.controller._ensure_state(RunnerState.ACTIVE)
+        ack = self.inbound_inbox.accept_batch(params)
+        return ack.to_mapping()
+
+    async def delivery_update(
+        self,
+        params: DeliveryUpdateParams,
+    ) -> dict[str, Any]:
+        """Record a Runner delivery result after identity validation."""
+        self.controller._check_identity(params)
+        await self.controller._expire_lease_if_needed_async()
+        self.controller._ensure_state(RunnerState.ACTIVE)
+        state = self.delivery_ledger.apply(params)
+        return {
+            "status": "recorded",
+            "delivery_id": params.delivery_id,
+            "state": state.value,
+        }
 
     def _check_capability(self, capability: str) -> None:
         """Reject a Core-owned operation without negotiated capability."""
