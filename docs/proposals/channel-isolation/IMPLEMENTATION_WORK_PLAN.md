@@ -332,9 +332,14 @@ health、cancel 和 stop；commit 前不能正式消费。非法状态转换、S
 实现位于 `src/qwenpaw/channel_protocol/models.py`、`rpc.py` 和 `lifecycle.py`，
 公共导出与错误类型位于 `__init__.py`、`errors.py`；聚焦测试位于
 `tests/unit/channel_isolation/test_ch_0_004_models.py`、`test_ch_0_004_rpc.py` 和
-`test_ch_0_004_lifecycle.py`。聚焦测试 `14 passed`，
-`tests/unit/channel_isolation` 共 `175 passed`；目标文件 pre-commit 全部通过，
-`git diff --check` 通过。本记录保持 `[-]`，待独立 Review 和最终验证后才能标记完成。
+`test_ch_0_004_lifecycle.py`。当前聚焦测试命令
+`conda run -n qwenpaw pytest -q tests/unit/channel_isolation/test_ch_0_004_models.py
+tests/unit/channel_isolation/test_ch_0_004_lifecycle.py
+tests/unit/channel_isolation/test_ch_0_004_rpc.py` 为 `28 passed`，
+`conda run -n qwenpaw pytest -q tests/unit/channel_isolation` 为 `189 passed`；目标文件
+pre-commit 全部通过，`git diff --check` 通过。最近修复提交为
+`339766f7` 及其后续独立修复提交；本记录保持 `[-]`，待独立 Review 和最终验证后才能
+标记完成。
 
 ### CH-0-005：可靠事件、ACK 和幂等原型
 

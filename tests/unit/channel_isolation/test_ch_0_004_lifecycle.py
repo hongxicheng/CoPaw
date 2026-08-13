@@ -78,6 +78,21 @@ class Clock:
         return self.now
 
 
+class BlockingHostStateStore(HostStateStore):
+    """Block one mutation to deterministically exercise lifecycle fencing."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def put(self, key: str, schema_version: int, value: object) -> None:
+        """Pause mutation until the test releases the store."""
+        self.started.set()
+        await self.release.wait()
+        await super().put(key, schema_version, value)
+
+
 def _identity(generation: int = 7) -> dict[str, object]:
     """Return a valid control identity fixture."""
     return {
@@ -543,6 +558,48 @@ async def test_lease_expiry_removes_core_endpoint_registry() -> None:
     await controller.health(IdentityParams.from_mapping(_identity()))
     assert controller.state is RunnerState.FAILED
     assert not adapter.endpoints
+
+
+@pytest.mark.asyncio
+async def test_core_host_state_put_linearizes_before_stop() -> None:
+    """A blocked state write holds the lifecycle lock across Store mutation."""
+    clock = Clock()
+    controller = _controller(clock)
+    store = BlockingHostStateStore()
+    adapter = CoreLifecycleAdapter(controller, host_state_store=store)
+    controller.accept_hello(_hello())
+    await controller.prepare(
+        PrepareParams.from_mapping(
+            {
+                **_identity(),
+                "host_context": {},
+                "capabilities": [
+                    "host_state",
+                    "ingress_endpoint",
+                    "media",
+                ],
+            },
+        ),
+    )
+    lease = LeaseParams.from_mapping(
+        {**_identity(), "lease_token": "blocked", "lease_ttl_ms": 100},
+    )
+    await controller.activate(lease)
+    await controller.commit(lease)
+    params = HostStateParams.from_mapping(
+        {**_identity(), "key": "blocked", "value": {"ok": True}},
+    )
+    write = asyncio.create_task(adapter.host_state_put(params))
+    await store.started.wait()
+    stop = asyncio.create_task(
+        controller.stop(IdentityParams.from_mapping(_identity())),
+    )
+    await asyncio.sleep(0)
+    assert not stop.done()
+    store.release.set()
+    assert (await write)["status"] == "stored"
+    assert (await stop)["state"] == "stopped"
+    assert await store.get("blocked") == (1, {"ok": True})
 
 
 @pytest.mark.asyncio

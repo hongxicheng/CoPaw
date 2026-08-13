@@ -53,6 +53,22 @@ def _strict_json_dumps(value: object) -> str:
     )
 
 
+def _recover_request_id(
+    raw: str,
+) -> tuple[bool, str | int | None] | None:
+    """Recover request-ID presence from a loosely parsed JSON object."""
+    try:
+        value = json.loads(raw)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
+    if not isinstance(value, Mapping) or "id" not in value:
+        return (False, None)
+    request_id = value["id"]
+    if isinstance(request_id, (str, int)) and not isinstance(request_id, bool):
+        return True, request_id
+    return True, None
+
+
 RequestHandler = Callable[[Any, RpcRequest], Any]
 NotificationHandler = Callable[[Any, RpcNotification], Any]
 
@@ -254,7 +270,14 @@ class RpcPeer:
             value = json.loads(raw, parse_constant=_reject_non_finite)
             message = parse_rpc_message(value)
         except json.JSONDecodeError as exc:
-            await self._send_error(None, JSONRPC_PARSE_ERROR, "Parse error")
+            recovered = _recover_request_id(raw)
+            if recovered is None or recovered[0]:
+                await self._send_error(
+                    recovered[1] if recovered is not None else None,
+                    JSONRPC_PARSE_ERROR,
+                    "Parse error",
+                    allow_null_id=True,
+                )
             _ = exc
             return
         except ProtocolValidationError as exc:
@@ -273,7 +296,14 @@ class RpcPeer:
                 )
             return
         except ValueError as exc:
-            await self._send_error(None, JSONRPC_PARSE_ERROR, "Parse error")
+            recovered = _recover_request_id(raw)
+            if recovered is None or recovered[0]:
+                await self._send_error(
+                    recovered[1] if recovered is not None else None,
+                    JSONRPC_PARSE_ERROR,
+                    "Parse error",
+                    allow_null_id=True,
+                )
             _ = exc
             return
         if isinstance(message, RpcResponse):
@@ -412,9 +442,10 @@ class RpcPeer:
         message: str,
         *,
         data: object = None,
+        allow_null_id: bool = False,
     ) -> None:
         """Send one JSON-RPC error response when an ID is available."""
-        if request_id is None or self._closed:
+        if (request_id is None and not allow_null_id) or self._closed:
             return
         with contextlib.suppress(RpcClosedError):
             await self._send(

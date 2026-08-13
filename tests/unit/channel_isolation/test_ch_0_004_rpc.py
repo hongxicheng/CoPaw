@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import math
 
 import pytest
@@ -246,10 +247,22 @@ async def test_rpc_strict_json_rejects_non_finite_values() -> None:
     with pytest.raises(ProtocolValidationError) as outbound:
         await core.call("echo", {"score": math.inf})
     assert outbound.value.reason_code == "SCHEMA_MISMATCH"
-    await right_transport.send(
+    await asyncio.gather(core.aclose(), runner.aclose())
+
+    input_transport, output_transport = _transport_pair()
+    parser = RpcPeer(output_transport)
+    parser.register_method("echo", echo)
+    await parser.start()
+    await input_transport.send(
         '{"jsonrpc":"2.0","id":"bad","method":"echo",'
         '"params":{"score":NaN}}',
     )
-    await asyncio.sleep(0.05)
+    response = json.loads(await input_transport.receive())
+    assert response["id"] == "bad"
+    assert response["error"]["code"] == -32700
     assert handled is False
-    await asyncio.gather(core.aclose(), runner.aclose())
+    await input_transport.send("not-json")
+    response = json.loads(await input_transport.receive())
+    assert response["id"] is None
+    assert response["error"]["code"] == -32700
+    await parser.aclose()

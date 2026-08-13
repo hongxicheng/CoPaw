@@ -261,43 +261,45 @@ class CoreLifecycleAdapter:
 
     async def host_state_put(self, params: HostStateParams) -> dict[str, Any]:
         """Write Core-owned host state with generation fencing."""
-        self._check_capability("host_state")
-        self.controller._check_identity(params)
-        expired = (
-            self.controller.lease_expires_at_ms is not None
-            and self.controller._clock_ms()
-            >= self.controller.lease_expires_at_ms
-        )
-        await self.controller._expire_lease_if_needed_async()
-        if expired:
-            raise self.controller._lifecycle_error("LEASE_EXPIRED")
-        self.controller._ensure_state(RunnerState.ACTIVE)
-        self.controller._ensure_json_value(params.value)
-        await self.host_state_store.put(
-            params.key,
-            params.schema_version,
-            params.value,
-        )
-        return {"status": "stored", "key": params.key}
+        async with self.controller._lock:
+            self._check_capability("host_state")
+            self.controller._check_identity(params)
+            expired = (
+                self.controller.lease_expires_at_ms is not None
+                and self.controller._clock_ms()
+                >= self.controller.lease_expires_at_ms
+            )
+            await self.controller._expire_lease_if_needed_async()
+            if expired:
+                raise self.controller._lifecycle_error("LEASE_EXPIRED")
+            self.controller._ensure_state(RunnerState.ACTIVE)
+            self.controller._ensure_json_value(params.value)
+            await self.host_state_store.put(
+                params.key,
+                params.schema_version,
+                params.value,
+            )
+            return {"status": "stored", "key": params.key}
 
     async def host_state_delete(
         self,
         params: HostStateParams,
     ) -> dict[str, Any]:
         """Delete Core-owned host state with generation fencing."""
-        self._check_capability("host_state")
-        self.controller._check_identity(params)
-        expired = (
-            self.controller.lease_expires_at_ms is not None
-            and self.controller._clock_ms()
-            >= self.controller.lease_expires_at_ms
-        )
-        await self.controller._expire_lease_if_needed_async()
-        if expired:
-            raise self.controller._lifecycle_error("LEASE_EXPIRED")
-        self.controller._ensure_state(RunnerState.ACTIVE)
-        await self.host_state_store.delete(params.key)
-        return {"status": "deleted", "key": params.key}
+        async with self.controller._lock:
+            self._check_capability("host_state")
+            self.controller._check_identity(params)
+            expired = (
+                self.controller.lease_expires_at_ms is not None
+                and self.controller._clock_ms()
+                >= self.controller.lease_expires_at_ms
+            )
+            await self.controller._expire_lease_if_needed_async()
+            if expired:
+                raise self.controller._lifecycle_error("LEASE_EXPIRED")
+            self.controller._ensure_state(RunnerState.ACTIVE)
+            await self.host_state_store.delete(params.key)
+            return {"status": "deleted", "key": params.key}
 
 
 class RunnerState(StrEnum):
