@@ -280,7 +280,7 @@ descriptor validator 和聚焦单测机械验证；ADR-035/036 已确认。独�
 
 ### CH-0-003：stdio framing 和传输层
 
-- 状态：[-] 初始实现与验证通过，等待独立 Review。
+- 状态：[x] 独立 Review 和最终验证通过
 
 - [x] 实现严格的 LSP `Content-Length` framing。
 - [x] 处理半帧、粘包、非法 Header、重复 Header、超长 Header、非法 UTF-8 和 EOF。
@@ -298,8 +298,8 @@ descriptor validator 和聚焦单测机械验证；ADR-035/036 已确认。独�
 审查修复覆盖本端显式关闭和 broken pipe 解除既有 pending receive、调用者取消后回收
 内部读取 task，以及 Header 上限内超长十进制 `Content-Length` 返回 `FrameLimitError`
 并关闭双向传输。聚焦测试 `48 passed`，`tests/unit/channel_isolation` 共 `161 passed`；
-目标文件 pre-commit 全部通过，`git diff --check` 通过。本记录保持 `[-]`，待独立 Review
-和最终验证后才能标记完成。
+目标文件 pre-commit 全部通过，`git diff --check` 通过。独立 Review 已通过（用户确认）；
+实现与修复提交为 `c94dd06f` 和 `a972409c`。
 
 ### CH-0-004：JSON-RPC 2.0、Schema 和生命周期
 
