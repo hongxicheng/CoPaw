@@ -344,12 +344,14 @@ JSON-RPC frame、返回值或 Runner 保存的 host context。
 `test_ch_0_004_lifecycle.py`。当前聚焦测试命令
 `conda run -n qwenpaw pytest -q tests/unit/channel_isolation/test_ch_0_004_models.py
 tests/unit/channel_isolation/test_ch_0_004_lifecycle.py
-tests/unit/channel_isolation/test_ch_0_004_rpc.py` 为 `40 passed`，
-`conda run -n qwenpaw pytest -q tests/unit/channel_isolation` 为 `233 passed`；目标文件
+tests/unit/channel_isolation/test_ch_0_004_rpc.py` 为 `48 passed`，
+`conda run -n qwenpaw pytest -q tests/unit/channel_isolation` 为 `241 passed`；目标文件
 pre-commit 全部通过，`git diff --check` 通过。原独立 Review 已通过（用户确认）；原实现
-与修复提交为 `95836112`、`26958f06`、`339766f7` 和 `4cd74739`。CH-0-007 前置检查发现的
-出站操作和 secret handle wire contract 缺口已按 Design 重新实施并验证；本记录更新为
-`[-]`，等待新的独立 Review 和最终验证，通过前不得恢复为 `[x]`。
+与修复提交为 `95836112`、`26958f06`、`339766f7`、`4cd74739` 和 `220aef20`。对
+`220aef20` 的复审发现 secret consumer 错误泄露、prepare cancel 清理、lease/发送并发、
+delivery ID 取消重入、非 ACK target/sequence 及 reaction target 规则问题；当前工作树已按
+Design 修复并验证。本记录继续保持 `[-]`，等待新的独立 Review 和最终验证，通过前不得
+恢复为 `[x]`。
 
 ### CH-0-005：可靠事件、ACK 和幂等原型
 

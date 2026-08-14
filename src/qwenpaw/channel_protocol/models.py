@@ -1128,6 +1128,63 @@ class DeliveryState(StrEnum):
     UNKNOWN = "unknown"
 
 
+_OUTBOUND_RESULT_STATES = {
+    DeliveryState.ACKNOWLEDGED,
+    DeliveryState.FAILED,
+    DeliveryState.TIMEOUT,
+    DeliveryState.UNKNOWN,
+}
+
+
+@dataclass(frozen=True)
+class OutboundResult:
+    """Closed result DTO for one platform-side outbound attempt."""
+
+    delivery_id: str
+    state: DeliveryState
+    reason_code: str | None = None
+    retryable: bool = False
+
+    @classmethod
+    def from_mapping(cls, value: object) -> "OutboundResult":
+        """Validate one terminal outbound result."""
+        data = _object(value)
+        _closed(
+            data,
+            {"delivery_id", "state", "reason_code", "retryable"},
+        )
+        state_value = _string(data.get("state"), "state")
+        try:
+            state = DeliveryState(state_value)
+        except ValueError as exc:
+            raise _error(
+                "unsupported outbound result state",
+                path=("state",),
+            ) from exc
+        if state not in _OUTBOUND_RESULT_STATES:
+            raise _error(
+                "outbound result state must be terminal",
+                path=("state",),
+            )
+        return cls(
+            delivery_id=_string(data.get("delivery_id"), "delivery_id"),
+            state=state,
+            reason_code=_optional_string(data, "reason_code"),
+            retryable=_boolean(data.get("retryable", False), "retryable"),
+        )
+
+    def to_mapping(self) -> dict[str, Any]:
+        """Encode one terminal outbound result."""
+        result: dict[str, Any] = {
+            "delivery_id": self.delivery_id,
+            "state": self.state.value,
+            "retryable": self.retryable,
+        }
+        if self.reason_code is not None:
+            result["reason_code"] = self.reason_code
+        return result
+
+
 @dataclass(frozen=True)
 class DeliveryUpdateParams(IdentityParams):
     """Runner result update for an immutable outbound delivery."""

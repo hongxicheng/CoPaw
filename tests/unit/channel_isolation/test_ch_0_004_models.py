@@ -11,6 +11,8 @@ from qwenpaw.channel_protocol import (
     HostContext,
     HostStateParams,
     LeaseParams,
+    DeliveryState,
+    OutboundResult,
     ProtocolValidationError,
     RpcErrorObject,
     RpcRequest,
@@ -193,6 +195,36 @@ def test_outbound_operation_dtos_are_closed_and_platform_independent() -> None:
                 "reaction": "DONE",
             },
         )
+
+
+def test_outbound_result_is_closed_terminal_and_bound_to_delivery() -> None:
+    """Outbound results expose only stable terminal delivery fields."""
+    result = OutboundResult.from_mapping(
+        {
+            "delivery_id": "delivery-1",
+            "state": "unknown",
+            "reason_code": "PLATFORM_RESULT_UNKNOWN",
+            "retryable": False,
+        },
+    )
+    assert result.state is DeliveryState.UNKNOWN
+    assert result.to_mapping() == {
+        "delivery_id": "delivery-1",
+        "state": "unknown",
+        "reason_code": "PLATFORM_RESULT_UNKNOWN",
+        "retryable": False,
+    }
+    for invalid in (
+        {"delivery_id": "delivery-1", "state": "sending"},
+        {"delivery_id": "delivery-1", "state": "accepted"},
+        {
+            "delivery_id": "delivery-1",
+            "state": "acknowledged",
+            "platform_message_id": "native-1",
+        },
+    ):
+        with pytest.raises(ProtocolValidationError):
+            OutboundResult.from_mapping(invalid)
 
 
 @pytest.mark.parametrize(

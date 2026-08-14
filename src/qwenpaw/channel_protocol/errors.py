@@ -106,6 +106,10 @@ class SecretHandleConsumedError(ValueError):
     """Report a secret handle whose single consumption was attempted."""
 
 
+class PlatformAuthenticationError(ValueError):
+    """Report rejected credentials without carrying their secret value."""
+
+
 def validation_error(
     message: str,
     *,

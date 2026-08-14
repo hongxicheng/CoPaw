@@ -10,12 +10,14 @@ from enum import StrEnum
 from typing import Any, Callable, Mapping
 
 from .errors import (
+    PlatformAuthenticationError,
     ProtocolValidationError,
     RpcError,
     SecretHandleConsumedError,
     SecretHandleInvalidError,
 )
 from .models import (
+    DeliveryState,
     DeliveryUpdateParams,
     EventBatchParams,
     EndpointParams,
@@ -26,6 +28,7 @@ from .models import (
     IdentityParams,
     LeaseParams,
     OutboundOperation,
+    OutboundResult,
     PrepareParams,
     QuiesceParams,
     ReactionParams,
@@ -140,9 +143,12 @@ class FixtureSecretHandleConsumer:
             raise SecretHandleInvalidError("fixture secret handle is invalid")
         secret_value = self._pending.pop(key)
         self._consumed.add(key)
-        result = self._sink(secret_value)
-        if hasattr(result, "__await__"):
-            await result
+        try:
+            result = self._sink(secret_value)
+            if hasattr(result, "__await__"):
+                await result
+        finally:
+            secret_value = None
 
     def __repr__(self) -> str:
         """Return diagnostics that reveal neither handles nor secret values."""
@@ -240,28 +246,34 @@ class CoreLifecycleAdapter:
         params: EventBatchParams,
     ) -> dict[str, Any]:
         """Persist and deduplicate a reliable inbound event batch."""
-        if params.identity is None:
-            raise self.controller._lifecycle_error("INVALID_EVENT_BATCH")
-        self.controller._check_identity(params.identity)
-        await self.controller._expire_lease_if_needed_async()
-        self.controller._ensure_state(RunnerState.ACTIVE)
-        ack = self.inbound_inbox.accept_batch(params)
-        return ack.to_mapping()
+        async with self.controller._outbound_lock:
+            async with self.controller._lock:
+                if params.identity is None:
+                    raise self.controller._lifecycle_error(
+                        "INVALID_EVENT_BATCH",
+                    )
+                self.controller._check_identity(params.identity)
+                await self.controller._expire_lease_if_needed_async()
+                self.controller._ensure_state(RunnerState.ACTIVE)
+                ack = self.inbound_inbox.accept_batch(params)
+                return ack.to_mapping()
 
     async def delivery_update(
         self,
         params: DeliveryUpdateParams,
     ) -> dict[str, Any]:
         """Record a Runner delivery result after identity validation."""
-        self.controller._check_identity(params)
-        await self.controller._expire_lease_if_needed_async()
-        self.controller._ensure_state(RunnerState.ACTIVE)
-        state = self.delivery_ledger.apply(params)
-        return {
-            "status": "recorded",
-            "delivery_id": params.delivery_id,
-            "state": state.value,
-        }
+        async with self.controller._outbound_lock:
+            async with self.controller._lock:
+                self.controller._check_identity(params)
+                await self.controller._expire_lease_if_needed_async()
+                self.controller._ensure_state(RunnerState.ACTIVE)
+                state = self.delivery_ledger.apply(params)
+                return {
+                    "status": "recorded",
+                    "delivery_id": params.delivery_id,
+                    "state": state.value,
+                }
 
     def _check_capability(self, capability: str) -> None:
         """Reject a Core-owned operation without negotiated capability."""
@@ -280,37 +292,42 @@ class CoreLifecycleAdapter:
         params: EndpointParams,
     ) -> dict[str, Any]:
         """Register a Runner-owned endpoint in Core."""
-        self._check_capability("ingress_endpoint")
-        self.controller._check_identity(params)
-        await self.controller._expire_lease_if_needed_async()
-        if self.controller.state == RunnerState.FAILED:
-            raise self.controller._lifecycle_error("LEASE_EXPIRED")
-        if self.controller.state not in {
-            RunnerState.STANDBY,
-            RunnerState.ACTIVE,
-        }:
-            raise self.controller._lifecycle_error("INVALID_STATE_TRANSITION")
-        if self.controller.state != RunnerState.ACTIVE and is_external_host(
-            params.host,
-        ):
-            raise RpcError(
-                RPC_FENCING_ERROR,
-                "standby endpoint cannot be externally exposed",
-                data={"reason_code": "STANDBY_ENDPOINT_FORBIDDEN"},
-            )
-        if is_external_host(params.host) and not params.auth_required:
-            raise RpcError(
-                RPC_AUTH_ERROR,
-                "externally bound endpoint must require authentication",
-                data={"reason_code": "AUTH_FAILED"},
-            )
-        self.endpoints[params.generation] = params
-        self.controller.endpoint = params
-        return {
-            "status": "registered",
-            "generation": params.generation,
-            "readiness": params.readiness,
-        }
+        async with self.controller._outbound_lock:
+            async with self.controller._lock:
+                self._check_capability("ingress_endpoint")
+                self.controller._check_identity(params)
+                await self.controller._expire_lease_if_needed_async()
+                if self.controller.state == RunnerState.FAILED:
+                    raise self.controller._lifecycle_error("LEASE_EXPIRED")
+                if self.controller.state not in {
+                    RunnerState.STANDBY,
+                    RunnerState.ACTIVE,
+                }:
+                    raise self.controller._lifecycle_error(
+                        "INVALID_STATE_TRANSITION",
+                    )
+                if (
+                    self.controller.state != RunnerState.ACTIVE
+                    and is_external_host(params.host)
+                ):
+                    raise RpcError(
+                        RPC_FENCING_ERROR,
+                        "standby endpoint cannot be externally exposed",
+                        data={"reason_code": "STANDBY_ENDPOINT_FORBIDDEN"},
+                    )
+                if is_external_host(params.host) and not params.auth_required:
+                    raise RpcError(
+                        RPC_AUTH_ERROR,
+                        "external endpoint requires authentication",
+                        data={"reason_code": "AUTH_FAILED"},
+                    )
+                self.endpoints[params.generation] = params
+                self.controller.endpoint = params
+                return {
+                    "status": "registered",
+                    "generation": params.generation,
+                    "readiness": params.readiness,
+                }
 
     async def endpoint_update(self, params: EndpointParams) -> dict[str, Any]:
         """Update a Runner-owned endpoint in Core."""
@@ -346,45 +363,47 @@ class CoreLifecycleAdapter:
 
     async def host_state_put(self, params: HostStateParams) -> dict[str, Any]:
         """Write Core-owned host state with generation fencing."""
-        async with self.controller._lock:
-            self._check_capability("host_state")
-            self.controller._check_identity(params)
-            expired = (
-                self.controller.lease_expires_at_ms is not None
-                and self.controller._clock_ms()
-                >= self.controller.lease_expires_at_ms
-            )
-            await self.controller._expire_lease_if_needed_async()
-            if expired:
-                raise self.controller._lifecycle_error("LEASE_EXPIRED")
-            self.controller._ensure_state(RunnerState.ACTIVE)
-            self.controller._ensure_json_value(params.value)
-            await self.host_state_store.put(
-                params.key,
-                params.schema_version,
-                params.value,
-            )
-            return {"status": "stored", "key": params.key}
+        async with self.controller._outbound_lock:
+            async with self.controller._lock:
+                self._check_capability("host_state")
+                self.controller._check_identity(params)
+                expired = (
+                    self.controller.lease_expires_at_ms is not None
+                    and self.controller._clock_ms()
+                    >= self.controller.lease_expires_at_ms
+                )
+                await self.controller._expire_lease_if_needed_async()
+                if expired:
+                    raise self.controller._lifecycle_error("LEASE_EXPIRED")
+                self.controller._ensure_state(RunnerState.ACTIVE)
+                self.controller._ensure_json_value(params.value)
+                await self.host_state_store.put(
+                    params.key,
+                    params.schema_version,
+                    params.value,
+                )
+                return {"status": "stored", "key": params.key}
 
     async def host_state_delete(
         self,
         params: HostStateParams,
     ) -> dict[str, Any]:
         """Delete Core-owned host state with generation fencing."""
-        async with self.controller._lock:
-            self._check_capability("host_state")
-            self.controller._check_identity(params)
-            expired = (
-                self.controller.lease_expires_at_ms is not None
-                and self.controller._clock_ms()
-                >= self.controller.lease_expires_at_ms
-            )
-            await self.controller._expire_lease_if_needed_async()
-            if expired:
-                raise self.controller._lifecycle_error("LEASE_EXPIRED")
-            self.controller._ensure_state(RunnerState.ACTIVE)
-            await self.host_state_store.delete(params.key)
-            return {"status": "deleted", "key": params.key}
+        async with self.controller._outbound_lock:
+            async with self.controller._lock:
+                self._check_capability("host_state")
+                self.controller._check_identity(params)
+                expired = (
+                    self.controller.lease_expires_at_ms is not None
+                    and self.controller._clock_ms()
+                    >= self.controller.lease_expires_at_ms
+                )
+                await self.controller._expire_lease_if_needed_async()
+                if expired:
+                    raise self.controller._lifecycle_error("LEASE_EXPIRED")
+                self.controller._ensure_state(RunnerState.ACTIVE)
+                await self.host_state_store.delete(params.key)
+                return {"status": "deleted", "key": params.key}
 
 
 class RunnerState(StrEnum):
@@ -444,7 +463,7 @@ class LifecycleController:
         self._reaction_handler = reaction_handler
         self._secret_handle_consumer = secret_handle_consumer
         self._secret_handle_attempted = False
-        self._outbound_delivery_ids: set[str] = set()
+        self._outbound_delivery_states: dict[str, DeliveryState] = {}
         self._outbound_targets: dict[str, dict[str, Any]] = {}
         self._endpoint_handler = endpoint_handler
         self._clock_ms = clock_ms or (lambda: time.monotonic_ns() // 1_000_000)
@@ -569,6 +588,11 @@ class LifecycleController:
                     generation=self.generation,
                     consuming=False,
                 ).to_mapping()
+            except asyncio.CancelledError:
+                self.host_context = None
+                self.effective_capabilities = frozenset()
+                self.state = RunnerState.FAILED
+                raise
             except Exception:
                 self.host_context = None
                 self.effective_capabilities = frozenset()
@@ -596,30 +620,35 @@ class LifecycleController:
                 "secret handle consumer is unavailable",
                 data={"reason_code": "SECRET_HANDLE_INVALID"},
             )
+        failure_reason: str | None = None
         try:
             result = consumer(secret_handle, self.generation)
             if hasattr(result, "__await__"):
                 await result
-        except SecretHandleConsumedError as exc:
-            raise RpcError(
-                RPC_AUTH_ERROR,
-                "secret handle was already consumed",
-                data={"reason_code": "SECRET_HANDLE_CONSUMED"},
-            ) from exc
-        except SecretHandleInvalidError as exc:
-            raise RpcError(
-                RPC_AUTH_ERROR,
-                "secret handle is invalid",
-                data={"reason_code": "SECRET_HANDLE_INVALID"},
-            ) from exc
-        except RpcError:
-            raise
-        except Exception as exc:
-            raise RpcError(
-                RPC_AUTH_ERROR,
-                "platform authentication failed",
-                data={"reason_code": "PLATFORM_AUTH_FAILED"},
-            ) from exc
+        except SecretHandleConsumedError:
+            failure_reason = "SECRET_HANDLE_CONSUMED"
+        except SecretHandleInvalidError:
+            failure_reason = "SECRET_HANDLE_INVALID"
+        except PlatformAuthenticationError:
+            failure_reason = "PLATFORM_AUTH_FAILED"
+        except Exception:
+            failure_reason = "PLATFORM_AUTH_FAILED"
+        if failure_reason is not None:
+            raise self._secret_handle_error(failure_reason)
+
+    @staticmethod
+    def _secret_handle_error(reason_code: str) -> RpcError:
+        """Create a fixed secret error without retaining consumer failures."""
+        messages = {
+            "SECRET_HANDLE_CONSUMED": "secret handle was already consumed",
+            "SECRET_HANDLE_INVALID": "secret handle is invalid",
+            "PLATFORM_AUTH_FAILED": "platform authentication failed",
+        }
+        return RpcError(
+            RPC_AUTH_ERROR,
+            messages[reason_code],
+            data={"reason_code": reason_code},
+        )
 
     async def activate(self, params: LeaseParams) -> dict[str, Any]:
         """Grant a provisional lease while retaining standby semantics."""
@@ -641,6 +670,9 @@ class LifecycleController:
         """Turn the provisional lease into the active lease."""
         async with self._lock:
             self._ensure_state(RunnerState.STANDBY)
+            await self._expire_lease_if_needed_async()
+            if self.state is RunnerState.FAILED:
+                raise self._lifecycle_error("LEASE_EXPIRED")
             self._check_lease(params)
             self.state = RunnerState.ACTIVE
             return GenerationStatus(
@@ -652,16 +684,22 @@ class LifecycleController:
 
     async def lease_renew(self, params: LeaseParams) -> dict[str, Any]:
         """Renew a valid standby or active lease."""
-        async with self._lock:
-            self._ensure_state(RunnerState.STANDBY, RunnerState.ACTIVE)
-            self._check_lease(params)
-            self.lease_expires_at_ms = self._clock_ms() + params.lease_ttl_ms
-            return GenerationStatus(
-                state=self.state.value,
-                generation=self.generation,
-                lease_expires_at_ms=self.lease_expires_at_ms,
-                consuming=self.state == RunnerState.ACTIVE,
-            ).to_mapping()
+        async with self._outbound_lock:
+            async with self._lock:
+                self._ensure_state(RunnerState.STANDBY, RunnerState.ACTIVE)
+                await self._expire_lease_if_needed_async()
+                if self.state is RunnerState.FAILED:
+                    raise self._lifecycle_error("LEASE_EXPIRED")
+                self._check_lease(params)
+                self.lease_expires_at_ms = (
+                    self._clock_ms() + params.lease_ttl_ms
+                )
+                return GenerationStatus(
+                    state=self.state.value,
+                    generation=self.generation,
+                    lease_expires_at_ms=self.lease_expires_at_ms,
+                    consuming=self.state == RunnerState.ACTIVE,
+                ).to_mapping()
 
     async def quiesce(self, params: QuiesceParams) -> dict[str, Any]:
         """Stop new work and enter the quiescing state."""
@@ -687,16 +725,17 @@ class LifecycleController:
 
     async def health(self, params: IdentityParams) -> dict[str, Any]:
         """Return read-only lifecycle health."""
-        async with self._lock:
-            self._check_identity(params)
-            if self.state in {RunnerState.STANDBY, RunnerState.ACTIVE}:
-                await self._expire_lease_if_needed_async()
-            return GenerationStatus(
-                state=self.state.value,
-                generation=self.generation,
-                lease_expires_at_ms=self.lease_expires_at_ms,
-                consuming=self.state == RunnerState.ACTIVE,
-            ).to_mapping()
+        async with self._outbound_lock:
+            async with self._lock:
+                self._check_identity(params)
+                if self.state in {RunnerState.STANDBY, RunnerState.ACTIVE}:
+                    await self._expire_lease_if_needed_async()
+                return GenerationStatus(
+                    state=self.state.value,
+                    generation=self.generation,
+                    lease_expires_at_ms=self.lease_expires_at_ms,
+                    consuming=self.state == RunnerState.ACTIVE,
+                ).to_mapping()
 
     async def generation_status(
         self,
@@ -732,21 +771,42 @@ class LifecycleController:
                     raise self._lifecycle_error("LEASE_EXPIRED")
                 self._check_send_capabilities(params)
                 target = self._check_outbound_send_order(params)
+                self._reserve_outbound_delivery(params.delivery_id)
                 callback = self._send_handler
-            if callback is not None:
-                result = callback(params)
-                if hasattr(result, "__await__"):
-                    result = await result
-            else:
-                result = {
-                    "status": "accepted",
-                    "delivery_id": params.delivery_id,
-                }
+            try:
+                if callback is not None:
+                    raw_result = callback(params)
+                    if hasattr(raw_result, "__await__"):
+                        raw_result = await raw_result
+                else:
+                    raw_result = {
+                        "delivery_id": params.delivery_id,
+                        "state": DeliveryState.ACKNOWLEDGED.value,
+                    }
+                result = self._parse_outbound_result(
+                    raw_result,
+                    params.delivery_id,
+                )
+            except asyncio.CancelledError:
+                await self._mark_outbound_unknown(params.delivery_id)
+                raise
+            except Exception:
+                await self._mark_outbound_unknown(params.delivery_id)
+                raise
             async with self._lock:
-                self._record_outbound_send(params, target)
-            if isinstance(result, Mapping):
-                return dict(result)
-            return {"result": result}
+                await self._expire_lease_if_needed_async()
+                if self.state != RunnerState.ACTIVE:
+                    result = OutboundResult(
+                        delivery_id=params.delivery_id,
+                        state=DeliveryState.UNKNOWN,
+                        reason_code="LEASE_EXPIRED",
+                    )
+                self._outbound_delivery_states[
+                    params.delivery_id
+                ] = result.state
+                if result.state is DeliveryState.ACKNOWLEDGED:
+                    self._record_outbound_send(params, target)
+            return result.to_mapping()
 
     def _check_send_capabilities(self, params: SendParams) -> None:
         """Bind each outbound operation to its effective capability."""
@@ -782,7 +842,7 @@ class LifecycleController:
         params: SendParams,
     ) -> dict[str, Any] | None:
         """Validate delivery uniqueness and stream target ordering."""
-        if params.delivery_id in self._outbound_delivery_ids:
+        if params.delivery_id in self._outbound_delivery_states:
             raise self._outbound_order_error("duplicate delivery_id")
         if params.target_delivery_id is None:
             return None
@@ -810,7 +870,6 @@ class LifecycleController:
         target: dict[str, Any] | None,
     ) -> None:
         """Record one successfully accepted outbound operation."""
-        self._outbound_delivery_ids.add(params.delivery_id)
         if params.operation in {
             OutboundOperation.MESSAGE_CREATE,
             OutboundOperation.STREAM_START,
@@ -845,7 +904,7 @@ class LifecycleController:
                             "capability": "reaction",
                         },
                     )
-                if params.delivery_id in self._outbound_delivery_ids:
+                if params.delivery_id in self._outbound_delivery_states:
                     raise self._outbound_order_error(
                         "duplicate delivery_id",
                     )
@@ -865,28 +924,64 @@ class LifecycleController:
                     raise self._outbound_order_error(
                         "invalid reaction target",
                     )
-                if (
-                    target["operation"] is OutboundOperation.STREAM_START
-                    and not target["ended"]
-                ):
-                    raise self._outbound_order_error(
-                        "stream target has not ended",
-                    )
+                self._reserve_outbound_delivery(params.delivery_id)
                 callback = self._reaction_handler
-            if callback is not None:
-                result = callback(params)
-                if hasattr(result, "__await__"):
-                    result = await result
-            else:
-                result = {
-                    "status": "accepted",
-                    "delivery_id": params.delivery_id,
-                }
+            try:
+                if callback is not None:
+                    raw_result = callback(params)
+                    if hasattr(raw_result, "__await__"):
+                        raw_result = await raw_result
+                else:
+                    raw_result = {
+                        "delivery_id": params.delivery_id,
+                        "state": DeliveryState.ACKNOWLEDGED.value,
+                    }
+                result = self._parse_outbound_result(
+                    raw_result,
+                    params.delivery_id,
+                )
+            except asyncio.CancelledError:
+                await self._mark_outbound_unknown(params.delivery_id)
+                raise
+            except Exception:
+                await self._mark_outbound_unknown(params.delivery_id)
+                raise
             async with self._lock:
-                self._outbound_delivery_ids.add(params.delivery_id)
-            if isinstance(result, Mapping):
-                return dict(result)
-            return {"result": result}
+                await self._expire_lease_if_needed_async()
+                if self.state != RunnerState.ACTIVE:
+                    result = OutboundResult(
+                        delivery_id=params.delivery_id,
+                        state=DeliveryState.UNKNOWN,
+                        reason_code="LEASE_EXPIRED",
+                    )
+                self._outbound_delivery_states[
+                    params.delivery_id
+                ] = result.state
+            return result.to_mapping()
+
+    def _reserve_outbound_delivery(self, delivery_id: str) -> None:
+        """Occupy a delivery ID before any platform side effect starts."""
+        self._outbound_delivery_states[delivery_id] = DeliveryState.SENDING
+
+    @staticmethod
+    def _parse_outbound_result(
+        value: object,
+        delivery_id: str,
+    ) -> OutboundResult:
+        """Validate a handler result and bind it to the request ID."""
+        result = OutboundResult.from_mapping(value)
+        if result.delivery_id != delivery_id:
+            raise ProtocolValidationError(
+                "outbound result delivery_id does not match request",
+                path=("delivery_id",),
+                reason_code="SCHEMA_MISMATCH",
+            )
+        return result
+
+    async def _mark_outbound_unknown(self, delivery_id: str) -> None:
+        """Retain an attempted delivery ID after an uncertain outcome."""
+        async with self._lock:
+            self._outbound_delivery_states[delivery_id] = DeliveryState.UNKNOWN
 
     def _outbound_target_error(self) -> RpcError:
         """Create the stable error for an unknown outbound target."""
@@ -960,59 +1055,61 @@ class LifecycleController:
 
     async def host_state_put(self, params: HostStateParams) -> dict[str, Any]:
         """Write host state only from the active generation."""
-        async with self._lock:
-            self._check_identity(params)
-            expired = (
-                self.lease_expires_at_ms is not None
-                and self._clock_ms() >= self.lease_expires_at_ms
-            )
-            await self._expire_lease_if_needed_async()
-            if expired:
-                raise self._lifecycle_error("LEASE_EXPIRED")
-            self._ensure_state(RunnerState.ACTIVE)
-            if "host_state" not in self.effective_capabilities:
-                raise RpcError(
-                    RPC_CAPABILITY_ERROR,
-                    "host state capability was not negotiated",
-                    data={
-                        "reason_code": "CAPABILITY_REQUIRED",
-                        "capability": "host_state",
-                    },
+        async with self._outbound_lock:
+            async with self._lock:
+                self._check_identity(params)
+                expired = (
+                    self.lease_expires_at_ms is not None
+                    and self._clock_ms() >= self.lease_expires_at_ms
                 )
-            self._ensure_json_value(params.value)
-            await self.host_state_store.put(
-                params.key,
-                params.schema_version,
-                params.value,
-            )
-            return {"status": "stored", "key": params.key}
+                await self._expire_lease_if_needed_async()
+                if expired:
+                    raise self._lifecycle_error("LEASE_EXPIRED")
+                self._ensure_state(RunnerState.ACTIVE)
+                if "host_state" not in self.effective_capabilities:
+                    raise RpcError(
+                        RPC_CAPABILITY_ERROR,
+                        "host state capability was not negotiated",
+                        data={
+                            "reason_code": "CAPABILITY_REQUIRED",
+                            "capability": "host_state",
+                        },
+                    )
+                self._ensure_json_value(params.value)
+                await self.host_state_store.put(
+                    params.key,
+                    params.schema_version,
+                    params.value,
+                )
+                return {"status": "stored", "key": params.key}
 
     async def host_state_delete(
         self,
         params: HostStateParams,
     ) -> dict[str, Any]:
         """Delete host state only from the active generation."""
-        async with self._lock:
-            self._check_identity(params)
-            expired = (
-                self.lease_expires_at_ms is not None
-                and self._clock_ms() >= self.lease_expires_at_ms
-            )
-            await self._expire_lease_if_needed_async()
-            if expired:
-                raise self._lifecycle_error("LEASE_EXPIRED")
-            self._ensure_state(RunnerState.ACTIVE)
-            if "host_state" not in self.effective_capabilities:
-                raise RpcError(
-                    RPC_CAPABILITY_ERROR,
-                    "host state capability was not negotiated",
-                    data={
-                        "reason_code": "CAPABILITY_REQUIRED",
-                        "capability": "host_state",
-                    },
+        async with self._outbound_lock:
+            async with self._lock:
+                self._check_identity(params)
+                expired = (
+                    self.lease_expires_at_ms is not None
+                    and self._clock_ms() >= self.lease_expires_at_ms
                 )
-            await self.host_state_store.delete(params.key)
-            return {"status": "deleted", "key": params.key}
+                await self._expire_lease_if_needed_async()
+                if expired:
+                    raise self._lifecycle_error("LEASE_EXPIRED")
+                self._ensure_state(RunnerState.ACTIVE)
+                if "host_state" not in self.effective_capabilities:
+                    raise RpcError(
+                        RPC_CAPABILITY_ERROR,
+                        "host state capability was not negotiated",
+                        data={
+                            "reason_code": "CAPABILITY_REQUIRED",
+                            "capability": "host_state",
+                        },
+                    )
+                await self.host_state_store.delete(params.key)
+                return {"status": "deleted", "key": params.key}
 
     async def _endpoint_change(
         self,
@@ -1020,42 +1117,43 @@ class LifecycleController:
         params: EndpointParams,
     ) -> dict[str, Any]:
         """Apply a register or update operation with generation fencing."""
-        async with self._lock:
-            self._check_identity(params)
-            self._ensure_state(RunnerState.STANDBY, RunnerState.ACTIVE)
-            await self._expire_lease_if_needed_async()
-            if self.state == RunnerState.FAILED:
-                raise self._lifecycle_error("LEASE_EXPIRED")
-            if "ingress_endpoint" not in self.effective_capabilities:
-                raise RpcError(
-                    RPC_CAPABILITY_ERROR,
-                    "ingress endpoint capability was not negotiated",
-                    data={
-                        "reason_code": "CAPABILITY_REQUIRED",
-                        "capability": "ingress_endpoint",
-                    },
-                )
-            if self.state != RunnerState.ACTIVE and is_external_host(
-                params.host,
-            ):
-                raise RpcError(
-                    RPC_FENCING_ERROR,
-                    "standby endpoint cannot be externally exposed",
-                    data={"reason_code": "STANDBY_ENDPOINT_FORBIDDEN"},
-                )
-            self.endpoint = params
-            if self._endpoint_handler is not None:
-                result = self._endpoint_handler(operation, params)
-                if hasattr(result, "__await__"):
-                    await result
-            return {
-                "status": {
-                    "register": "registered",
-                    "update": "updated",
-                }[operation],
-                "generation": self.generation,
-                "readiness": params.readiness,
-            }
+        async with self._outbound_lock:
+            async with self._lock:
+                self._check_identity(params)
+                self._ensure_state(RunnerState.STANDBY, RunnerState.ACTIVE)
+                await self._expire_lease_if_needed_async()
+                if self.state == RunnerState.FAILED:
+                    raise self._lifecycle_error("LEASE_EXPIRED")
+                if "ingress_endpoint" not in self.effective_capabilities:
+                    raise RpcError(
+                        RPC_CAPABILITY_ERROR,
+                        "ingress endpoint capability was not negotiated",
+                        data={
+                            "reason_code": "CAPABILITY_REQUIRED",
+                            "capability": "ingress_endpoint",
+                        },
+                    )
+                if self.state != RunnerState.ACTIVE and is_external_host(
+                    params.host,
+                ):
+                    raise RpcError(
+                        RPC_FENCING_ERROR,
+                        "standby endpoint cannot be externally exposed",
+                        data={"reason_code": "STANDBY_ENDPOINT_FORBIDDEN"},
+                    )
+                self.endpoint = params
+                if self._endpoint_handler is not None:
+                    result = self._endpoint_handler(operation, params)
+                    if hasattr(result, "__await__"):
+                        await result
+                return {
+                    "status": {
+                        "register": "registered",
+                        "update": "updated",
+                    }[operation],
+                    "generation": self.generation,
+                    "readiness": params.readiness,
+                }
 
     def _expire_lease_if_needed(self) -> None:
         """Fence this generation when its lease has expired."""

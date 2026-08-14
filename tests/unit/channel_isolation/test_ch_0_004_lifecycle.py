@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import traceback
 
 import pytest
 
@@ -22,6 +23,7 @@ from qwenpaw.channel_protocol import (
     PrepareParams,
     QuiesceParams,
     RpcError,
+    RpcTimeoutError,
     ProtocolValidationError,
     RunnerState,
     RpcPeer,
@@ -209,7 +211,7 @@ async def test_lifecycle_requires_hello_and_commit() -> None:
             },
         ),
     )
-    assert sent["status"] == "accepted"
+    assert sent["state"] == "acknowledged"
 
 
 @pytest.mark.asyncio
@@ -720,7 +722,7 @@ async def test_outbound_operations_enforce_capabilities_and_order() -> None:
             },
         },
     )
-    assert (await controller.send(approval))["status"] == "accepted"
+    assert (await controller.send(approval))["state"] == "acknowledged"
     stream_start = SendParams.from_mapping(
         {
             **_identity(),
@@ -742,9 +744,9 @@ async def test_outbound_operations_enforce_capabilities_and_order() -> None:
             "reaction": "completed",
         },
     )
-    with pytest.raises(RpcError) as premature:
-        await controller.reaction(premature_reaction)
-    assert premature.value.data["reason_code"] == "OUTBOUND_ORDER_VIOLATION"
+    assert (await controller.reaction(premature_reaction))[
+        "state"
+    ] == "acknowledged"
     sequence_gap = SendParams.from_mapping(
         {
             **_identity(),
@@ -803,7 +805,7 @@ async def test_outbound_operations_enforce_capabilities_and_order() -> None:
             "reaction": "completed",
         },
     )
-    assert (await controller.reaction(reaction))["status"] == "accepted"
+    assert (await controller.reaction(reaction))["state"] == "acknowledged"
     late_delta = SendParams.from_mapping(
         {
             **_identity(),
@@ -913,7 +915,10 @@ async def test_stop_waits_for_inflight_outbound_side_effect() -> None:
         """Pause one platform side effect until the test releases it."""
         started.set()
         await release.wait()
-        return {"status": "accepted"}
+        return {
+            "delivery_id": "blocked-send",
+            "state": "acknowledged",
+        }
 
     controller = LifecycleController(
         channel_key="voice",
@@ -945,7 +950,7 @@ async def test_stop_waits_for_inflight_outbound_side_effect() -> None:
     await asyncio.sleep(0)
     assert not stop.done()
     release.set()
-    assert (await send)["status"] == "accepted"
+    assert (await send)["state"] == "acknowledged"
     assert (await stop)["state"] == "stopped"
     with pytest.raises(RpcError) as stopped:
         await controller.send(
@@ -959,6 +964,306 @@ async def test_stop_waits_for_inflight_outbound_side_effect() -> None:
             ),
         )
     assert stopped.value.data["reason_code"] == "INVALID_STATE_TRANSITION"
+
+
+@pytest.mark.asyncio
+async def test_lease_expiry_linearizes_after_inflight_send() -> None:
+    """Lease expiry cannot accept a result from an expired generation."""
+    clock = Clock()
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def blocked_send(params: SendParams) -> dict[str, object]:
+        """Pause one platform attempt while the lease expires."""
+        started.set()
+        await release.wait()
+        return {
+            "delivery_id": params.delivery_id,
+            "state": "acknowledged",
+        }
+
+    controller = LifecycleController(
+        channel_key="voice",
+        instance_id="instance-1",
+        generation=7,
+        environment_spec_id="ches1_" + "1" * 64,
+        environment_id="ches1_" + "1" * 64 + ".install1_" + "2" * 32,
+        capabilities=("media",),
+        send_handler=blocked_send,
+        clock_ms=clock,
+    )
+    await _activate_outbound_controller(controller, ["media"])
+    params = SendParams.from_mapping(
+        {
+            **_identity(),
+            "delivery_id": "expiring-send",
+            "to_handle": "chat-1",
+            "content_parts": [{"type": "text", "text": "hello"}],
+        },
+    )
+    sending = asyncio.create_task(controller.send(params))
+    await started.wait()
+    clock.now = 1100
+    health = asyncio.create_task(
+        controller.health(IdentityParams.from_mapping(_identity())),
+    )
+    await asyncio.sleep(0)
+    assert not health.done()
+    release.set()
+    result = await sending
+    assert result == {
+        "delivery_id": "expiring-send",
+        "state": "unknown",
+        "reason_code": "LEASE_EXPIRED",
+        "retryable": False,
+    }
+    assert (await health)["state"] == "failed"
+    with pytest.raises(RpcError) as duplicate:
+        await controller.send(params)
+    assert duplicate.value.data["reason_code"] == "INVALID_STATE_TRANSITION"
+
+
+@pytest.mark.asyncio
+async def test_cancelled_and_timed_out_send_ids_cannot_repeat() -> None:
+    """Cancelled RPC attempts keep immutable delivery IDs occupied."""
+    for mode in ("cancel", "timeout"):
+        clock = Clock()
+        started = asyncio.Event()
+        calls = 0
+
+        async def blocked_send(
+            params: SendParams,
+            started_event: asyncio.Event = started,
+        ) -> dict[str, object]:
+            """Wait until RPC cancellation interrupts the platform attempt."""
+            nonlocal calls
+            calls += 1
+            started_event.set()
+            await asyncio.Future()
+            return {
+                "delivery_id": params.delivery_id,
+                "state": "acknowledged",
+            }
+
+        left_transport, right_transport = _transport_pair()
+        core = RpcPeer(left_transport)
+        runner = RpcPeer(right_transport)
+        controller = LifecycleController(
+            channel_key="voice",
+            instance_id="instance-1",
+            generation=7,
+            environment_spec_id="ches1_" + "1" * 64,
+            environment_id=("ches1_" + "1" * 64 + ".install1_" + "2" * 32),
+            capabilities=("media",),
+            send_handler=blocked_send,
+            clock_ms=clock,
+        )
+        controller.register_rpc_methods(runner)
+        CoreLifecycleAdapter(controller).register_rpc_methods(core)
+        await asyncio.gather(core.start(), runner.start())
+        await runner.call("runner.hello", _hello().to_mapping())
+        await core.call(
+            "channel.prepare",
+            {
+                **_identity(),
+                "host_context": {},
+                "capabilities": ["media"],
+            },
+        )
+        lease = LeaseParams.from_mapping(
+            {**_identity(), "lease_token": "rpc", "lease_ttl_ms": 100},
+        )
+        await core.call("channel.activate", lease.to_mapping())
+        await core.call("channel.commit", lease.to_mapping())
+        payload = {
+            **_identity(),
+            "delivery_id": f"{mode}-send",
+            "to_handle": "chat-1",
+            "content_parts": [{"type": "text", "text": "hello"}],
+        }
+        request = asyncio.create_task(
+            core.call(
+                "channel.send",
+                payload,
+                timeout=0.01 if mode == "timeout" else 1.0,
+            ),
+        )
+        await asyncio.wait_for(started.wait(), timeout=1.0)
+        if mode == "cancel":
+            await core.notify(
+                "request.cancel",
+                {"request_id": "rpc-4", "reason": "user_cancelled"},
+            )
+            with pytest.raises(RpcError):
+                await request
+        else:
+            with pytest.raises(RpcTimeoutError):
+                await request
+        with pytest.raises(RpcError) as duplicate:
+            await core.call("channel.send", payload)
+        assert duplicate.value.data["reason_code"] == (
+            "OUTBOUND_ORDER_VIOLATION"
+        )
+        assert calls == 1
+        await asyncio.gather(core.aclose(), runner.aclose())
+
+
+@pytest.mark.asyncio
+async def test_non_acknowledged_send_does_not_establish_target() -> None:
+    """Failed, timeout, and unknown results do not mutate target ordering."""
+    for state in ("failed", "timeout", "unknown"):
+        clock = Clock()
+
+        async def result_handler(
+            params: SendParams,
+            result_state: str = state,
+        ) -> dict[str, object]:
+            """Return one non-acknowledged terminal platform result."""
+            return {
+                "delivery_id": params.delivery_id,
+                "state": result_state,
+            }
+
+        controller = LifecycleController(
+            channel_key="voice",
+            instance_id="instance-1",
+            generation=7,
+            environment_spec_id="ches1_" + "1" * 64,
+            environment_id=("ches1_" + "1" * 64 + ".install1_" + "2" * 32),
+            capabilities=("reaction", "streaming"),
+            send_handler=result_handler,
+            clock_ms=clock,
+        )
+        await _activate_outbound_controller(
+            controller,
+            ["reaction", "streaming"],
+        )
+        start = SendParams.from_mapping(
+            {
+                **_identity(),
+                "delivery_id": f"{state}-stream",
+                "to_handle": "chat-1",
+                "operation": "stream.start",
+                "stream_type": "message",
+                "sequence": 0,
+                "accumulated_text": "",
+            },
+        )
+        assert (await controller.send(start))["state"] == state
+        reaction = ReactionParams.from_mapping(
+            {
+                **_identity(),
+                "delivery_id": f"{state}-reaction",
+                "to_handle": "chat-1",
+                "target_delivery_id": f"{state}-stream",
+                "reaction": "completed",
+            },
+        )
+        with pytest.raises(RpcError) as unknown:
+            await controller.reaction(reaction)
+        assert unknown.value.data["reason_code"] == ("OUTBOUND_TARGET_UNKNOWN")
+
+
+@pytest.mark.asyncio
+async def test_failed_stream_update_does_not_advance_sequence() -> None:
+    """Only acknowledged stream operations advance target ordering."""
+    clock = Clock()
+
+    async def result_handler(params: SendParams) -> dict[str, object]:
+        """Fail the first delta while acknowledging other operations."""
+        state = (
+            "failed"
+            if params.delivery_id == "failed-delta"
+            else "acknowledged"
+        )
+        return {"delivery_id": params.delivery_id, "state": state}
+
+    controller = LifecycleController(
+        channel_key="voice",
+        instance_id="instance-1",
+        generation=7,
+        environment_spec_id="ches1_" + "1" * 64,
+        environment_id="ches1_" + "1" * 64 + ".install1_" + "2" * 32,
+        capabilities=("streaming",),
+        send_handler=result_handler,
+        clock_ms=clock,
+    )
+    await _activate_outbound_controller(controller, ["streaming"])
+    await controller.send(
+        SendParams.from_mapping(
+            {
+                **_identity(),
+                "delivery_id": "sequence-stream",
+                "to_handle": "chat-1",
+                "operation": "stream.start",
+                "stream_type": "message",
+                "sequence": 0,
+                "accumulated_text": "",
+            },
+        ),
+    )
+    failed = SendParams.from_mapping(
+        {
+            **_identity(),
+            "delivery_id": "failed-delta",
+            "to_handle": "chat-1",
+            "operation": "stream.delta",
+            "target_delivery_id": "sequence-stream",
+            "stream_type": "message",
+            "sequence": 1,
+            "accumulated_text": "first",
+        },
+    )
+    assert (await controller.send(failed))["state"] == "failed"
+    retry_with_new_id = SendParams.from_mapping(
+        {
+            **failed.to_mapping(),
+            "delivery_id": "replacement-delta",
+        },
+    )
+    assert (await controller.send(retry_with_new_id))[
+        "state"
+    ] == "acknowledged"
+
+
+@pytest.mark.asyncio
+async def test_outbound_result_id_mismatch_is_unknown_and_not_reused() -> None:
+    """A mismatched handler result cannot release the attempted ID."""
+    clock = Clock()
+    calls = 0
+
+    async def mismatched_result(_: SendParams) -> dict[str, object]:
+        """Return a valid result shape for the wrong delivery ID."""
+        nonlocal calls
+        calls += 1
+        return {"delivery_id": "wrong-id", "state": "acknowledged"}
+
+    controller = LifecycleController(
+        channel_key="voice",
+        instance_id="instance-1",
+        generation=7,
+        environment_spec_id="ches1_" + "1" * 64,
+        environment_id="ches1_" + "1" * 64 + ".install1_" + "2" * 32,
+        capabilities=("media",),
+        send_handler=mismatched_result,
+        clock_ms=clock,
+    )
+    await _activate_outbound_controller(controller, ["media"])
+    params = SendParams.from_mapping(
+        {
+            **_identity(),
+            "delivery_id": "expected-id",
+            "to_handle": "chat-1",
+            "content_parts": [{"type": "text", "text": "hello"}],
+        },
+    )
+    with pytest.raises(ProtocolValidationError) as mismatch:
+        await controller.send(params)
+    assert mismatch.value.reason_code == "SCHEMA_MISMATCH"
+    with pytest.raises(RpcError) as duplicate:
+        await controller.send(params)
+    assert duplicate.value.data["reason_code"] == "OUTBOUND_ORDER_VIOLATION"
+    assert calls == 1
 
 
 @pytest.mark.asyncio
@@ -1048,9 +1353,9 @@ async def test_secret_handle_invalid_and_auth_errors_are_stable() -> None:
         )
     assert invalid.value.data["reason_code"] == "SECRET_HANDLE_INVALID"
 
-    def reject_credentials(_: object) -> None:
+    def reject_credentials(value: object) -> None:
         """Simulate fixture platform authentication failure."""
-        raise ValueError("invalid fixture credential")
+        raise ValueError(f"invalid fixture credential: {value}")
 
     auth_consumer = FixtureSecretHandleConsumer(
         {("auth-handle", 7): "invalid-secret"},
@@ -1077,6 +1382,12 @@ async def test_secret_handle_invalid_and_auth_errors_are_stable() -> None:
             ),
         )
     assert auth_failed.value.data["reason_code"] == "PLATFORM_AUTH_FAILED"
+    auth_traceback = "".join(
+        traceback.format_exception(auth_failed.value),
+    )
+    assert "invalid-secret" not in auth_traceback
+    assert auth_failed.value.__cause__ is None
+    assert auth_failed.value.__context__ is None
     retried_controller = LifecycleController(
         channel_key="voice",
         instance_id="instance-1",
@@ -1125,6 +1436,135 @@ async def test_secret_handle_without_consumer_is_invalid() -> None:
         )
     assert invalid.value.data["reason_code"] == "SECRET_HANDLE_INVALID"
     assert controller.state is RunnerState.FAILED
+
+
+@pytest.mark.asyncio
+async def test_secret_rpc_error_is_sanitized_before_rpc_response() -> None:
+    """Consumer errors cannot copy a secret into an RPC error frame."""
+    clock = Clock()
+    secret_value = "secret-must-not-cross-rpc"
+
+    def leak_rpc_error(value: object) -> None:
+        """Raise a deliberately unsafe consumer error for regression."""
+        raise RpcError(
+            -32012,
+            f"unsafe {value}",
+            data={"credential": value},
+        )
+
+    consumer = FixtureSecretHandleConsumer(
+        {("rpc-error-handle", 7): secret_value},
+        leak_rpc_error,
+    )
+    left_transport, right_transport = _transport_pair()
+    core = RpcPeer(left_transport)
+    runner = RpcPeer(right_transport)
+    controller = LifecycleController(
+        channel_key="voice",
+        instance_id="instance-1",
+        generation=7,
+        environment_spec_id="ches1_" + "1" * 64,
+        environment_id="ches1_" + "1" * 64 + ".install1_" + "2" * 32,
+        secret_handle_consumer=consumer,
+        clock_ms=clock,
+    )
+    controller.register_rpc_methods(runner)
+    CoreLifecycleAdapter(controller).register_rpc_methods(core)
+    await asyncio.gather(core.start(), runner.start())
+    await runner.call("runner.hello", _hello().to_mapping())
+    with pytest.raises(RpcError) as failed:
+        await core.call(
+            "channel.prepare",
+            {
+                **_identity(),
+                "host_context": {"secret_handle": "rpc-error-handle"},
+                "capabilities": [],
+            },
+        )
+    assert failed.value.data == {"reason_code": "PLATFORM_AUTH_FAILED"}
+    assert failed.value.__cause__ is None
+    frames = left_transport.sent_messages + right_transport.sent_messages
+    assert all(secret_value not in frame for frame in frames)
+    assert secret_value not in repr(consumer)
+    await asyncio.gather(core.aclose(), runner.aclose())
+
+
+@pytest.mark.asyncio
+async def test_cancelled_prepare_fails_and_consumes_secret_handle() -> None:
+    """Cancelled prepare clears context but never restores its handle."""
+    clock = Clock()
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def blocked_sink(_: object) -> None:
+        """Block credential initialization until the request is cancelled."""
+        started.set()
+        await release.wait()
+
+    consumer = FixtureSecretHandleConsumer(
+        {("cancelled-handle", 7): "cancelled-secret"},
+        blocked_sink,
+    )
+    left_transport, right_transport = _transport_pair()
+    core = RpcPeer(left_transport)
+    runner = RpcPeer(right_transport)
+    controller = LifecycleController(
+        channel_key="voice",
+        instance_id="instance-1",
+        generation=7,
+        environment_spec_id="ches1_" + "1" * 64,
+        environment_id="ches1_" + "1" * 64 + ".install1_" + "2" * 32,
+        secret_handle_consumer=consumer,
+        clock_ms=clock,
+    )
+    controller.register_rpc_methods(runner)
+    CoreLifecycleAdapter(controller).register_rpc_methods(core)
+    await asyncio.gather(core.start(), runner.start())
+    await runner.call("runner.hello", _hello().to_mapping())
+    prepare = asyncio.create_task(
+        core.call(
+            "channel.prepare",
+            {
+                **_identity(),
+                "host_context": {"secret_handle": "cancelled-handle"},
+                "capabilities": [],
+            },
+            timeout=1.0,
+        ),
+    )
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    await core.notify(
+        "request.cancel",
+        {"request_id": "rpc-1", "reason": "user_cancelled"},
+    )
+    with pytest.raises(RpcError) as cancelled:
+        await prepare
+    assert cancelled.value.data["reason_code"] == "REQUEST_CANCELLED"
+    assert controller.state is RunnerState.FAILED
+    assert controller.host_context is None
+    assert not controller.effective_capabilities
+    repeated = LifecycleController(
+        channel_key="voice",
+        instance_id="instance-1",
+        generation=7,
+        environment_spec_id="ches1_" + "1" * 64,
+        environment_id="ches1_" + "1" * 64 + ".install1_" + "2" * 32,
+        secret_handle_consumer=consumer,
+        clock_ms=clock,
+    )
+    repeated.accept_hello(_hello())
+    with pytest.raises(RpcError) as consumed:
+        await repeated.prepare(
+            PrepareParams.from_mapping(
+                {
+                    **_identity(),
+                    "host_context": {"secret_handle": "cancelled-handle"},
+                    "capabilities": [],
+                },
+            ),
+        )
+    assert consumed.value.data["reason_code"] == "SECRET_HANDLE_CONSUMED"
+    await asyncio.gather(core.aclose(), runner.aclose())
 
 
 @pytest.mark.asyncio
@@ -1191,7 +1631,7 @@ async def test_outbound_and_secret_contract_crosses_rpc_dispatch() -> None:
             },
         },
     )
-    assert created["status"] == "accepted"
+    assert created["state"] == "acknowledged"
     await core.call(
         "channel.send",
         {
@@ -1227,7 +1667,7 @@ async def test_outbound_and_secret_contract_crosses_rpc_dispatch() -> None:
             "reaction": "completed",
         },
     )
-    assert reaction["status"] == "accepted"
+    assert reaction["state"] == "acknowledged"
     assert consumed == [secret_value]
     frames = left_transport.sent_messages + right_transport.sent_messages
     assert any("rpc-fixture-handle" in frame for frame in frames)

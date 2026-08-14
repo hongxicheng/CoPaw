@@ -494,6 +494,14 @@ request.cancel     Either side notification
   `target_delivery_id` 引用先前的 `stream.start`。平台 message/card ID 只保存在 Runner，
   不进入 Core wire DTO。
 
+`channel.send` 和 `channel.reaction` 使用相同的 closed result object，只包含
+`delivery_id`、`state=acknowledged|failed|timeout|unknown`、可选稳定 `reason_code` 和
+`retryable`。返回的 `delivery_id` 必须等于 request；未知字段、非终态或 ID 不一致属于
+Schema mismatch。Runner 在交给可能产生平台副作用的 handler 前占用 `delivery_id`；调用
+被取消、超时、异常终止、lease 在调用期间失效或平台结果不明确时，该 ID 仍保持已使用并
+收敛为 `unknown`，不得以相同 ID 重入。只有 `acknowledged` 结果才能建立后续 target 或推进
+stream sequence；`failed`、`timeout` 和 `unknown` 不得成为 update/reaction target。
+
 `channel.reaction` 使用独立的 closed `ReactionParams`，包含 identity、唯一
 `delivery_id`、`to_handle`、`target_delivery_id` 和 `reaction`。v1 只允许
 `reaction=completed`，目标必须是先前成功接收的 `message.create` 或 `stream.start`；
