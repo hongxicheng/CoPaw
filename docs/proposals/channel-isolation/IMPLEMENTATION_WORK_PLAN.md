@@ -355,7 +355,7 @@ pre-commit 全部通过，`git diff --check` 通过。独立 Review 已通过（
 
 ### CH-0-006：Runner bootstrap 和日志分流原型
 
-- 状态：[-] 实现与审查修复验证通过，等待独立复审和最终验证
+- 状态：[x] 独立 Review 和最终验证通过
 
 - [x] 在导入 Channel SDK 前校验 isolated Python、代码根和 manifest。
 - [x] 保存协议输出句柄，并将普通 stdout/FD 1 输出导向 stderr。
@@ -380,9 +380,10 @@ stderr 后保持可继承；subprocess 级 probe 已证明私有句柄输出合�
 `tests/unit/channel_isolation/test_ch_0_006_bootstrap.py`，fixture 位于
 `tests/fixtures/channel_isolation/bootstrap_code/`。当前聚焦测试 `19 passed`，
 `tests/unit/channel_isolation` 共 `221 passed`；目标文件 pre-commit 全部通过，
-`git diff --check` 通过。macOS 本机验证已通过；同一标准库 subprocess 测试文件需在
-Linux、Windows 和 frozen desktop 发布 CI 复用执行。本记录保持 `[-]`，待独立 Review
-和最终平台验证后才能标记完成。
+`git diff --check` 通过。独立 Review 和最终验证已通过（用户确认）；实现与修复提交为
+`009dc936`、`802876f9`、`1bbafb4f` 和 `b0737373`。macOS 本机验证已通过；未运行
+Linux、真实 Windows 和真实 frozen desktop 发布制品验收，这些限制保留给 G0 和发布
+验收继续验证，不阻塞本任务标记完成。
 
 验收：macOS、Linux、Windows 和 frozen desktop 的 stdout 污染、日志堵塞和句柄继承
 测试通过。
