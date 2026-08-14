@@ -366,12 +366,15 @@ pre-commit 全部通过，`git diff --check` 通过。独立 Review 已通过（
 - [x] 验证 stderr 持续排空和日志 backpressure。
 - [x] 验证后代进程不得继承协议专用句柄。
 
-实现位于 `src/qwenpaw/channel_protocol/runner_bootstrap.py`，使用标准库 standalone
-bootstrap、闭合的任务局部 manifest、显式绝对 `code_root` 和不可继承的私有协议句柄；
-dependency environment 不需要安装 QwenPaw。聚焦测试位于
+实现位于 `src/qwenpaw/channel_protocol/runner_bootstrap.py`。闭合的任务局部 manifest
+只携带 `code_root`/descriptor 完整性和 release target 输入；bootstrap 从通过 CH-0-002
+validator 的 descriptor 唯一取得 `channel_key`、Runner `ChannelDriver` entrypoint 和环境
+透传白名单，并以 CH-0-003 `FramedTransport` 管理不可继承的私有协议句柄。普通 stdout/FD 1
+重定向到 stderr 后保持可继承；dependency environment 不需要安装 QwenPaw，Protocol SDK
+和 Channel 源码只从显式绝对 `code_root` 加载。聚焦测试位于
 `tests/unit/channel_isolation/test_ch_0_006_bootstrap.py`，fixture 位于
-`tests/fixtures/channel_isolation/bootstrap_code/`。当前聚焦测试 `10 passed`，
-`tests/unit/channel_isolation` 共 `212 passed`；目标文件 pre-commit 全部通过，
+`tests/fixtures/channel_isolation/bootstrap_code/`。当前聚焦测试 `15 passed`，
+`tests/unit/channel_isolation` 共 `217 passed`；目标文件 pre-commit 全部通过，
 `git diff --check` 通过。macOS 本机验证已通过；同一标准库 subprocess 测试文件需在
 Linux、Windows 和 frozen desktop 发布 CI 复用执行。本记录保持 `[-]`，待独立 Review
 和最终平台验证后才能标记完成。

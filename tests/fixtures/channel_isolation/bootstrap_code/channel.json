@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "channel_key": "feishu",
+  "source_kind": "builtin",
+  "process_mode": "runner_process",
+  "dispatch_mode": "manager_queue",
+  "ingress_owner": "none",
+  "label": {
+    "en": "Fixture Feishu",
+    "zh": "Fixture Feishu"
+  },
+  "description": {
+    "en": "",
+    "zh": ""
+  },
+  "icon": "",
+  "doc_url": "",
+  "plugin_metadata": null,
+  "entrypoint": {
+    "scope": "runner",
+    "module": "runner_entrypoint",
+    "qualname": "FixtureDriver"
+  },
+  "config_fields": [],
+  "core_requirements": [],
+  "isolated_requirements": [],
+  "condition_fields": [],
+  "supported_python_abis": [
+    "cp313-cp313"
+  ],
+  "supported_platform_tags": [
+    "macosx_11_0_arm64",
+    "manylinux_2_28_x86_64",
+    "win_amd64"
+  ],
+  "capabilities": [],
+  "bot_identity_fields": [],
+  "environment_passthrough_allowlist": [
+    "HTTPS_PROXY",
+    "QWENPAW_FIXTURE_RESULT",
+    "SSL_CERT_FILE",
+    "TELEGRAM_HTTP_PROXY"
+  ]
+}
