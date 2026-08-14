@@ -26,6 +26,7 @@ from qwenpaw.channel_protocol import (
     FramedTransport,
     FramingLimits,
     encode_frame,
+    runner_bootstrap,
 )
 from qwenpaw.channel_protocol.runner_bootstrap import (
     _open_protocol_transport,
@@ -222,25 +223,55 @@ class _BrokenWriteHandle:
 
 
 class _BlockedWriteHandle:
-    """Block a synchronous write until close interrupts it."""
+    """Record whether cancellation prevents one blocked sync write."""
 
     def __init__(self) -> None:
+        self.data = bytearray()
         self.started = threading.Event()
         self.release = threading.Event()
+        self.cancelled = False
         self.closed = False
 
-    def write(self, _data: bytes) -> int:
-        """Wait for close, then expose the interrupted pipe write."""
+    def write(self, data: bytes) -> int:
+        """Wait for release, then either abort or record the write."""
         self.started.set()
         self.release.wait(timeout=1)
-        if self.closed:
-            raise BrokenPipeError("handle is closed")
-        return 0
+        if self.cancelled:
+            raise OSError("synchronous write cancelled")
+        self.data.extend(data)
+        return len(data)
 
     def close(self) -> None:
-        """Interrupt the blocked fake write."""
+        """Mark the fake protocol handle closed."""
         self.closed = True
-        self.release.set()
+
+
+class _FakeWindowsThreadHandle:
+    """Cancel one fake synchronous write and record resource closure."""
+
+    def __init__(
+        self,
+        protocol_handle: _BlockedWriteHandle | None = None,
+        *,
+        miss_first_cancel: bool = False,
+    ) -> None:
+        self._protocol_handle = protocol_handle
+        self._miss_first_cancel = miss_first_cancel
+        self.cancel_calls = 0
+        self.closed = False
+
+    def cancel(self) -> None:
+        """Interrupt the fake write without permitting pending bytes."""
+        self.cancel_calls += 1
+        if self._miss_first_cancel and self.cancel_calls == 1:
+            return
+        if self._protocol_handle is not None:
+            self._protocol_handle.cancelled = True
+            self._protocol_handle.release.set()
+
+    def close(self) -> None:
+        """Record closure of the fake Win32 thread handle."""
+        self.closed = True
 
 
 def _set_entrypoint(
@@ -656,7 +687,13 @@ async def test_windows_adapter_completes_partial_sync_writes(
 ) -> None:
     """The Windows path avoids Proactor and completes every sync write."""
     handle = _PartialWriteHandle()
+    thread_handle = _FakeWindowsThreadHandle()
     monkeypatch.setattr(os, "name", "nt")
+    monkeypatch.setattr(
+        runner_bootstrap,
+        "_open_windows_thread_handle",
+        lambda: thread_handle,
+    )
     transport = await _open_protocol_transport(FramedTransport, handle)
     message = '{"platform":"windows"}'
 
@@ -665,6 +702,7 @@ async def test_windows_adapter_completes_partial_sync_writes(
 
     assert bytes(handle.data) == encode_frame(message)
     assert handle.closed
+    assert thread_handle.closed
 
 
 @pytest.mark.asyncio
@@ -672,7 +710,13 @@ async def test_windows_adapter_preserves_framing_failures(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The Windows adapter retains broken-pipe and timeout semantics."""
+    thread_handle = _FakeWindowsThreadHandle()
     monkeypatch.setattr(os, "name", "nt")
+    monkeypatch.setattr(
+        runner_bootstrap,
+        "_open_windows_thread_handle",
+        lambda: thread_handle,
+    )
     broken = await _open_protocol_transport(
         FramedTransport,
         _BrokenWriteHandle(),
@@ -680,18 +724,44 @@ async def test_windows_adapter_preserves_framing_failures(
     with pytest.raises(FrameWriteError):
         await broken.send("{}")
     await broken.aclose()
+    assert thread_handle.closed
 
+
+@pytest.mark.asyncio
+async def test_windows_timeout_cancels_frame_and_closes_writer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A timed-out frame cannot resume after transport shutdown."""
     blocked_handle = _BlockedWriteHandle()
+    thread_handle = _FakeWindowsThreadHandle(
+        blocked_handle,
+        miss_first_cancel=True,
+    )
+    monkeypatch.setattr(os, "name", "nt")
+    monkeypatch.setattr(
+        runner_bootstrap,
+        "_open_windows_thread_handle",
+        lambda: thread_handle,
+    )
     blocked = await _open_protocol_transport(
         FramedTransport,
         blocked_handle,
-        limits=FramingLimits(write_timeout=0.02),
+        limits=FramingLimits(write_timeout=0.05),
     )
     with pytest.raises(FrameTimeoutError):
         await blocked.send("{}")
     assert blocked_handle.started.wait(timeout=1)
     assert blocked.is_closed
     await blocked.aclose()
+
+    assert thread_handle.cancel_calls >= 2
+    assert thread_handle.closed
+    assert blocked_handle.closed
+
+    blocked_handle.release.set()
+    await asyncio.sleep(0.01)
+
+    assert blocked_handle.data == b""
 
 
 @pytest.mark.asyncio

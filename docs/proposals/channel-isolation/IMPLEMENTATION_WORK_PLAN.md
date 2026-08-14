@@ -371,13 +371,15 @@ pre-commit 全部通过，`git diff --check` 通过。独立 Review 已通过（
 validator 的 descriptor 唯一取得 `channel_key`、Runner `ChannelDriver` entrypoint 和环境
 透传白名单，并以 CH-0-003 `FramedTransport` 管理不可继承的私有协议句柄。POSIX 使用
 asyncio pipe transport；Windows 使用线程托管的同步 pipe writer，避免把继承 stdout 注册到
-Proactor，同时继续复用同一有界队列、单 writer 和错误语义。普通 stdout/FD 1 重定向到
+Proactor，同时继续复用同一有界队列、单 writer 和错误语义；关闭时取消 active 同步 I/O、
+丢弃排队写入，并跨同步写启动竞态重试取消，直至 writer 线程退出且协议与线程句柄关闭。
+回归测试证明写超时后即使 pipe 恢复可写也不会发送迟到 frame。普通 stdout/FD 1 重定向到
 stderr 后保持可继承；subprocess 级 probe 已证明私有句柄输出合法 frame，SDK、`print()` 和
 原生 FD 1 输出仅进入 stderr。dependency environment 不需要安装 QwenPaw，Protocol SDK
 和 Channel 源码只从显式绝对 `code_root` 加载。聚焦测试位于
 `tests/unit/channel_isolation/test_ch_0_006_bootstrap.py`，fixture 位于
-`tests/fixtures/channel_isolation/bootstrap_code/`。当前聚焦测试 `18 passed`，
-`tests/unit/channel_isolation` 共 `220 passed`；目标文件 pre-commit 全部通过，
+`tests/fixtures/channel_isolation/bootstrap_code/`。当前聚焦测试 `19 passed`，
+`tests/unit/channel_isolation` 共 `221 passed`；目标文件 pre-commit 全部通过，
 `git diff --check` 通过。macOS 本机验证已通过；同一标准库 subprocess 测试文件需在
 Linux、Windows 和 frozen desktop 发布 CI 复用执行。本记录保持 `[-]`，待独立 Review
 和最终平台验证后才能标记完成。

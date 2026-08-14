@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import asyncio
+import ctypes
+from ctypes import wintypes
 import hashlib
 import importlib
 import json
@@ -40,6 +42,8 @@ _STARTUP_ENVIRONMENT = frozenset(
     },
 )
 _AMBIENT_IMPORT_ENVIRONMENT = frozenset({"PYTHONHOME", "PYTHONPATH"})
+_THREAD_TERMINATE = 0x0001
+_ERROR_NOT_FOUND = 1168
 
 
 class BootstrapError(RuntimeError):
@@ -72,6 +76,58 @@ class _RunnerProcess:
         self._driver = driver_class()
 
 
+class _WindowsThreadHandle:
+    """Own one cancellable Win32 handle for the writer thread."""
+
+    def __init__(self, kernel32: Any, handle: int) -> None:
+        self._kernel32 = kernel32
+        self._handle = handle
+        self._closed = False
+
+    def cancel(self) -> None:
+        """Cancel synchronous I/O currently issued by the writer thread."""
+        if self._closed:
+            return
+        if self._kernel32.CancelSynchronousIo(self._handle):
+            return
+        error = ctypes.get_last_error()
+        if error != _ERROR_NOT_FOUND:
+            raise OSError(error, "Unable to cancel protocol pipe write")
+
+    def close(self) -> None:
+        """Close the real Win32 thread handle exactly once."""
+        if self._closed:
+            return
+        self._closed = True
+        if not self._kernel32.CloseHandle(self._handle):
+            error = ctypes.get_last_error()
+            raise OSError(error, "Unable to close protocol writer thread")
+
+
+def _open_windows_thread_handle() -> _WindowsThreadHandle:
+    """Open the current writer thread for synchronous I/O cancellation."""
+    win_dll = getattr(ctypes, "WinDLL")
+    kernel32 = win_dll("kernel32", use_last_error=True)
+    kernel32.GetCurrentThreadId.argtypes = []
+    kernel32.GetCurrentThreadId.restype = wintypes.DWORD
+    kernel32.OpenThread.argtypes = [
+        wintypes.DWORD,
+        wintypes.BOOL,
+        wintypes.DWORD,
+    ]
+    kernel32.OpenThread.restype = wintypes.HANDLE
+    kernel32.CancelSynchronousIo.argtypes = [wintypes.HANDLE]
+    kernel32.CancelSynchronousIo.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    thread_id = kernel32.GetCurrentThreadId()
+    handle = kernel32.OpenThread(_THREAD_TERMINATE, False, thread_id)
+    if not handle:
+        error = ctypes.get_last_error()
+        raise OSError(error, "Unable to open protocol writer thread")
+    return _WindowsThreadHandle(kernel32, handle)
+
+
 class _ThreadPipeWriter:
     """Adapt one synchronous pipe to the asyncio writer interface."""
 
@@ -84,6 +140,11 @@ class _ThreadPipeWriter:
             bytes,
         ] | None = None
         self._pending_future: asyncio.Future[None] | None = None
+        self._thread_handle: Any | None = None
+        self._startup_error: OSError | None = None
+        self._ready = threading.Event()
+        self._exited = threading.Event()
+        self._active = False
         self._closed = False
         self._thread = threading.Thread(
             target=self._run,
@@ -91,6 +152,10 @@ class _ThreadPipeWriter:
             daemon=True,
         )
         self._thread.start()
+        self._ready.wait()
+        if self._startup_error is not None:
+            self._exited.wait()
+            raise self._startup_error
 
     @staticmethod
     def _consume_future_error(future: asyncio.Future[None]) -> None:
@@ -116,6 +181,9 @@ class _ThreadPipeWriter:
         view = memoryview(data)
         written = 0
         while written < len(view):
+            with self._condition:
+                if self._closed:
+                    raise BrokenPipeError("protocol pipe is closed")
             count = self._handle.write(view[written:])
             if not isinstance(count, int) or count <= 0:
                 raise OSError("protocol pipe write made no progress")
@@ -125,7 +193,17 @@ class _ThreadPipeWriter:
 
     def _run(self) -> None:
         """Process one write at a time outside the asyncio event loop."""
+        thread_handle: Any | None = None
         try:
+            try:
+                thread_handle = _open_windows_thread_handle()
+            except OSError as exc:
+                self._startup_error = exc
+                self._ready.set()
+                return
+            with self._condition:
+                self._thread_handle = thread_handle
+                self._ready.set()
             while True:
                 with self._condition:
                     while self._request is None and not self._closed:
@@ -134,17 +212,31 @@ class _ThreadPipeWriter:
                         return
                     loop, future, data = self._request
                     self._request = None
+                    self._active = True
                 error: BaseException | None = None
                 try:
                     self._write_all(data)
                 except (BrokenPipeError, ConnectionError, OSError) as exc:
                     error = exc
+                with self._condition:
+                    self._active = False
+                    if self._closed and error is None:
+                        error = BrokenPipeError("protocol pipe is closed")
                 try:
                     loop.call_soon_threadsafe(self._complete, future, error)
                 except RuntimeError:
                     return
         finally:
-            self._handle.close()
+            if not self._ready.is_set():
+                self._ready.set()
+            try:
+                self._handle.close()
+            finally:
+                try:
+                    if thread_handle is not None:
+                        thread_handle.close()
+                finally:
+                    self._exited.set()
 
     def write(self, data: bytes) -> None:
         """Hand one complete frame to the dedicated writer thread."""
@@ -173,16 +265,40 @@ class _ThreadPipeWriter:
 
     def close(self) -> None:
         """Close the pipe and wake the dedicated writer thread."""
+        queued: tuple[
+            asyncio.AbstractEventLoop,
+            asyncio.Future[None],
+            bytes,
+        ] | None = None
         with self._condition:
             if self._closed:
                 return
             self._closed = True
+            queued = self._request
+            self._request = None
+            if self._active and self._thread_handle is not None:
+                self._thread_handle.cancel()
             self._condition.notify()
+        if queued is not None:
+            loop, future, _ = queued
+            loop.call_soon_threadsafe(
+                self._complete,
+                future,
+                BrokenPipeError("protocol pipe is closed"),
+            )
 
     async def wait_closed(self) -> None:
         """Wait asynchronously for the dedicated writer thread to stop."""
-        while self._thread.is_alive():
-            await asyncio.sleep(0.01)
+        await asyncio.to_thread(self._cancel_until_exited)
+
+    def _cancel_until_exited(self) -> None:
+        """Retry cancellation across the synchronous I/O startup race."""
+        while not self._exited.wait(timeout=0.01):
+            with self._condition:
+                thread_handle = self._thread_handle
+                active = self._active
+            if active and thread_handle is not None:
+                thread_handle.cancel()
 
 
 def _fail(reason_code: str, message: str) -> BootstrapError:
@@ -579,7 +695,14 @@ async def _open_protocol_transport(
 ) -> Any:
     """Connect the private pipe directly to CH-0-003 framing."""
     if os.name == "nt":
-        writer: Any = _ThreadPipeWriter(protocol_handle)
+        try:
+            writer: Any = _ThreadPipeWriter(protocol_handle)
+        except OSError as exc:
+            protocol_handle.close()
+            raise _fail(
+                "PROTOCOL_HANDLE_INVALID",
+                "Unable to connect protocol stdout",
+            ) from exc
     else:
         loop = asyncio.get_running_loop()
 
