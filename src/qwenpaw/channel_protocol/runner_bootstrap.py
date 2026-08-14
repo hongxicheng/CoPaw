@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import re
 import sys
+import threading
 import types
 from typing import Any
 
@@ -69,6 +70,119 @@ class _RunnerProcess:
                 "Runner entrypoint must be a ChannelDriver class",
             )
         self._driver = driver_class()
+
+
+class _ThreadPipeWriter:
+    """Adapt one synchronous pipe to the asyncio writer interface."""
+
+    def __init__(self, handle: Any) -> None:
+        self._handle = handle
+        self._condition = threading.Condition()
+        self._request: tuple[
+            asyncio.AbstractEventLoop,
+            asyncio.Future[None],
+            bytes,
+        ] | None = None
+        self._pending_future: asyncio.Future[None] | None = None
+        self._closed = False
+        self._thread = threading.Thread(
+            target=self._run,
+            name="qwenpaw-protocol-writer",
+            daemon=True,
+        )
+        self._thread.start()
+
+    @staticmethod
+    def _consume_future_error(future: asyncio.Future[None]) -> None:
+        """Mark an adapter failure observed even after drain cancellation."""
+        if not future.cancelled():
+            future.exception()
+
+    @staticmethod
+    def _complete(
+        future: asyncio.Future[None],
+        error: BaseException | None,
+    ) -> None:
+        """Complete one pipe write on its owning event loop."""
+        if future.done():
+            return
+        if error is None:
+            future.set_result(None)
+        else:
+            future.set_exception(error)
+
+    def _write_all(self, data: bytes) -> None:
+        """Write every byte through a possibly partial sync pipe."""
+        view = memoryview(data)
+        written = 0
+        while written < len(view):
+            count = self._handle.write(view[written:])
+            if not isinstance(count, int) or count <= 0:
+                raise OSError("protocol pipe write made no progress")
+            if count > len(view) - written:
+                raise OSError("protocol pipe write exceeded input length")
+            written += count
+
+    def _run(self) -> None:
+        """Process one write at a time outside the asyncio event loop."""
+        try:
+            while True:
+                with self._condition:
+                    while self._request is None and not self._closed:
+                        self._condition.wait()
+                    if self._request is None:
+                        return
+                    loop, future, data = self._request
+                    self._request = None
+                error: BaseException | None = None
+                try:
+                    self._write_all(data)
+                except (BrokenPipeError, ConnectionError, OSError) as exc:
+                    error = exc
+                try:
+                    loop.call_soon_threadsafe(self._complete, future, error)
+                except RuntimeError:
+                    return
+        finally:
+            self._handle.close()
+
+    def write(self, data: bytes) -> None:
+        """Hand one complete frame to the dedicated writer thread."""
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        future.add_done_callback(self._consume_future_error)
+        with self._condition:
+            if self._closed:
+                raise BrokenPipeError("protocol pipe is closed")
+            if self._pending_future is not None:
+                raise RuntimeError("protocol pipe write is already pending")
+            self._pending_future = future
+            self._request = (loop, future, bytes(data))
+            self._condition.notify()
+
+    async def drain(self) -> None:
+        """Wait until the dedicated thread completes the pending write."""
+        future = self._pending_future
+        if future is None:
+            return
+        try:
+            await asyncio.shield(future)
+        finally:
+            if future.done() and self._pending_future is future:
+                self._pending_future = None
+
+    def close(self) -> None:
+        """Close the pipe and wake the dedicated writer thread."""
+        with self._condition:
+            if self._closed:
+                return
+            self._closed = True
+            self._condition.notify()
+
+    async def wait_closed(self) -> None:
+        """Wait asynchronously for the dedicated writer thread to stop."""
+        while self._thread.is_alive():
+            await asyncio.sleep(0.01)
 
 
 def _fail(reason_code: str, message: str) -> BootstrapError:
@@ -464,28 +578,31 @@ async def _open_protocol_transport(
     limits: Any | None = None,
 ) -> Any:
     """Connect the private pipe directly to CH-0-003 framing."""
-    loop = asyncio.get_running_loop()
+    if os.name == "nt":
+        writer: Any = _ThreadPipeWriter(protocol_handle)
+    else:
+        loop = asyncio.get_running_loop()
 
-    def protocol_factory() -> asyncio.Protocol:
-        return asyncio.streams.FlowControlMixin(loop=loop)
+        def protocol_factory() -> asyncio.Protocol:
+            return asyncio.streams.FlowControlMixin(loop=loop)
 
-    try:
-        write_transport, write_protocol = await loop.connect_write_pipe(
-            protocol_factory,
-            protocol_handle,
+        try:
+            write_transport, write_protocol = await loop.connect_write_pipe(
+                protocol_factory,
+                protocol_handle,
+            )
+        except (OSError, ValueError) as exc:
+            protocol_handle.close()
+            raise _fail(
+                "PROTOCOL_HANDLE_INVALID",
+                "Unable to connect protocol stdout",
+            ) from exc
+        writer = asyncio.StreamWriter(
+            write_transport,
+            write_protocol,
+            None,
+            loop,
         )
-    except (OSError, ValueError) as exc:
-        protocol_handle.close()
-        raise _fail(
-            "PROTOCOL_HANDLE_INVALID",
-            "Unable to connect protocol stdout",
-        ) from exc
-    writer = asyncio.StreamWriter(
-        write_transport,
-        write_protocol,
-        None,
-        loop,
-    )
     return framed_transport_class(
         asyncio.StreamReader(),
         writer,

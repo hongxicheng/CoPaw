@@ -11,6 +11,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from typing import Any
 import venv
@@ -45,6 +46,7 @@ FIXTURE_SOURCE_ROOT = (
     / "channel_isolation"
     / "bootstrap_code"
 ).resolve()
+PROTOCOL_OUTPUT_PROBE = FIXTURE_SOURCE_ROOT / "protocol_output_probe.py"
 ALLOWED_PLATFORM_TAGS = [
     "macosx_11_0_arm64",
     "manylinux_2_28_x86_64",
@@ -186,6 +188,59 @@ def _read_pipe(fd: int, expected_bytes: int) -> bytes:
     finally:
         os.close(fd)
     return bytes(data)
+
+
+class _PartialWriteHandle:
+    """Record bytes while accepting only a small prefix per write."""
+
+    def __init__(self) -> None:
+        self.data = bytearray()
+        self.closed = False
+
+    def write(self, data: bytes) -> int:
+        """Accept at most three bytes to exercise complete writes."""
+        if self.closed:
+            raise BrokenPipeError("handle is closed")
+        accepted = min(3, len(data))
+        self.data.extend(data[:accepted])
+        return accepted
+
+    def close(self) -> None:
+        """Mark the fake handle closed."""
+        self.closed = True
+
+
+class _BrokenWriteHandle:
+    """Fail every synchronous pipe write."""
+
+    def write(self, _data: bytes) -> int:
+        """Raise the OS error exposed by a closed peer."""
+        raise BrokenPipeError("peer closed")
+
+    def close(self) -> None:
+        """Match the synchronous handle interface."""
+
+
+class _BlockedWriteHandle:
+    """Block a synchronous write until close interrupts it."""
+
+    def __init__(self) -> None:
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.closed = False
+
+    def write(self, _data: bytes) -> int:
+        """Wait for close, then expose the interrupted pipe write."""
+        self.started.set()
+        self.release.wait(timeout=1)
+        if self.closed:
+            raise BrokenPipeError("handle is closed")
+        return 0
+
+    def close(self) -> None:
+        """Interrupt the blocked fake write."""
+        self.closed = True
+        self.release.set()
 
 
 def _set_entrypoint(
@@ -361,6 +416,24 @@ def test_descriptor_constructs_driver_and_controls_environment(
     assert b"runner-print" in result.stderr
     assert b"runner-logging" in result.stderr
     assert b"runner-fd1" in result.stderr
+
+
+def test_private_protocol_handle_emits_only_framed_output() -> None:
+    """Production-order stdout isolation keeps frames and logs separate."""
+    result = subprocess.run(
+        [sys.executable, str(PROTOCOL_OUTPUT_PROBE)],
+        cwd=FIXTURE_SOURCE_ROOT,
+        capture_output=True,
+        check=False,
+        timeout=5,
+    )
+
+    assert result.returncode == 0
+    assert _decode_frames(result.stdout) == ['{"probe":"ready"}']
+    assert b"feishu-sdk-print" in result.stderr
+    assert b"feishu-sdk-fd1" in result.stderr
+    assert b"probe-print" in result.stderr
+    assert b"probe-fd1" in result.stderr
 
 
 def test_rejects_legacy_callback_entrypoint_without_calling_it(
@@ -575,6 +648,50 @@ async def test_protocol_adapter_uses_framed_transport_single_writer() -> None:
     data = await reader
 
     assert _decode_frames(data) == messages
+
+
+@pytest.mark.asyncio
+async def test_windows_adapter_completes_partial_sync_writes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Windows path avoids Proactor and completes every sync write."""
+    handle = _PartialWriteHandle()
+    monkeypatch.setattr(os, "name", "nt")
+    transport = await _open_protocol_transport(FramedTransport, handle)
+    message = '{"platform":"windows"}'
+
+    await transport.send(message)
+    await transport.aclose()
+
+    assert bytes(handle.data) == encode_frame(message)
+    assert handle.closed
+
+
+@pytest.mark.asyncio
+async def test_windows_adapter_preserves_framing_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Windows adapter retains broken-pipe and timeout semantics."""
+    monkeypatch.setattr(os, "name", "nt")
+    broken = await _open_protocol_transport(
+        FramedTransport,
+        _BrokenWriteHandle(),
+    )
+    with pytest.raises(FrameWriteError):
+        await broken.send("{}")
+    await broken.aclose()
+
+    blocked_handle = _BlockedWriteHandle()
+    blocked = await _open_protocol_transport(
+        FramedTransport,
+        blocked_handle,
+        limits=FramingLimits(write_timeout=0.02),
+    )
+    with pytest.raises(FrameTimeoutError):
+        await blocked.send("{}")
+    assert blocked_handle.started.wait(timeout=1)
+    assert blocked.is_closed
+    await blocked.aclose()
 
 
 @pytest.mark.asyncio
