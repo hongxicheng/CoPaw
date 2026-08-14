@@ -17,6 +17,7 @@ from .identifiers import validate_channel_key, validate_digest
 JSONRPC_VERSION = "2.0"
 PROTOCOL_VERSION = 1
 MAX_METHOD_LENGTH = 128
+MAX_SECRET_HANDLE_LENGTH = 256
 
 
 def _error(
@@ -178,11 +179,30 @@ def _optional_string(
     name: str,
     *,
     path: tuple[str | int, ...] = (),
+    non_empty: bool = True,
 ) -> str | None:
     """Read an optional nullable string."""
     if name not in value or value[name] is None:
         return None
-    return _string(value[name], name, path=path)
+    return _string(
+        value[name],
+        name,
+        path=path,
+        non_empty=non_empty,
+    )
+
+
+def _optional_integer(
+    value: Mapping[str, Any],
+    name: str,
+    *,
+    path: tuple[str | int, ...] = (),
+    minimum: int | None = None,
+) -> int | None:
+    """Read an optional nullable integer."""
+    if name not in value or value[name] is None:
+        return None
+    return _integer(value[name], name, path=path, minimum=minimum)
 
 
 def _request_id(value: object) -> str | int:
@@ -484,7 +504,7 @@ class HostContext:
 
     media_work_dir: str | None = None
     config_snapshot: Mapping[str, Any] = field(default_factory=dict)
-    secret_handle: str | None = None
+    secret_handle: str | None = field(default=None, repr=False)
 
     def to_mapping(self) -> dict[str, Any]:
         """Encode host context without secret values."""
@@ -519,6 +539,20 @@ class HostContext:
                 path=("config_snapshot",),
             )
         secret_handle = _optional_string(data, "secret_handle")
+        if secret_handle is not None:
+            if len(secret_handle) > MAX_SECRET_HANDLE_LENGTH:
+                raise _error(
+                    "secret_handle exceeds the maximum length",
+                    path=("secret_handle",),
+                )
+            if any(
+                ord(character) < 32 or ord(character) == 127
+                for character in secret_handle
+            ):
+                raise _error(
+                    "secret_handle must not contain control characters",
+                    path=("secret_handle",),
+                )
         return cls(
             media_work_dir=media_work_dir,
             config_snapshot=dict(config_snapshot),
@@ -1154,13 +1188,237 @@ class DeliveryUpdateParams(IdentityParams):
         return result
 
 
+class OutboundOperation(StrEnum):
+    """Platform-independent outbound operations carried by channel.send."""
+
+    MESSAGE_CREATE = "message.create"
+    MESSAGE_UPDATE = "message.update"
+    STREAM_START = "stream.start"
+    STREAM_DELTA = "stream.delta"
+    STREAM_END = "stream.end"
+
+
+class StreamType(StrEnum):
+    """Stable stream categories produced by Core event aggregation."""
+
+    REASONING = "reasoning"
+    MESSAGE = "message"
+
+
+class ApprovalSeverity(StrEnum):
+    """Stable tool-approval severity values."""
+
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+    CRITICAL = "critical"
+
+
+@dataclass(frozen=True)
+class ApprovalCardParams:
+    """Platform-independent tool approval card semantics."""
+
+    request_id: str
+    tool_name: str
+    severity: ApprovalSeverity
+
+    @classmethod
+    def from_mapping(cls, value: object) -> "ApprovalCardParams":
+        """Validate a closed approval card object."""
+        data = _object(value, path=("approval",))
+        _closed(
+            data,
+            {"request_id", "tool_name", "severity"},
+            path=("approval",),
+        )
+        severity_value = _string(
+            data.get("severity"),
+            "severity",
+            path=("approval",),
+        )
+        try:
+            severity = ApprovalSeverity(severity_value)
+        except ValueError as exc:
+            raise _error(
+                "unsupported approval severity",
+                path=("approval", "severity"),
+            ) from exc
+        return cls(
+            request_id=_string(
+                data.get("request_id"),
+                "request_id",
+                path=("approval",),
+            ),
+            tool_name=_string(
+                data.get("tool_name"),
+                "tool_name",
+                path=("approval",),
+            ),
+            severity=severity,
+        )
+
+    def to_mapping(self) -> dict[str, Any]:
+        """Encode platform-independent approval semantics."""
+        return {
+            "request_id": self.request_id,
+            "tool_name": self.tool_name,
+            "severity": self.severity.value,
+        }
+
+
+def _reject_operation_fields(
+    data: Mapping[str, Any],
+    names: tuple[str, ...],
+    operation: OutboundOperation,
+) -> None:
+    """Reject fields that are not valid for one outbound operation."""
+    for name in names:
+        if name in data:
+            raise _error(
+                f"{name} is not valid for {operation.value}",
+                path=(name,),
+                reason_code="SCHEMA_MISMATCH",
+            )
+
+
+def _require_send_parts(parts: tuple[dict[str, Any], ...]) -> None:
+    """Require one outbound operation to carry content parts."""
+    if not parts:
+        raise _error(
+            "content_parts must not be empty",
+            path=("content_parts",),
+        )
+
+
+def _require_send_target(target_delivery_id: str | None) -> None:
+    """Require one outbound operation to reference an existing target."""
+    if target_delivery_id is None:
+        raise _error(
+            "target_delivery_id is required",
+            path=("target_delivery_id",),
+        )
+
+
+def _require_send_sequence(sequence: int | None) -> None:
+    """Require a positive sequence for one outbound update."""
+    if sequence is None or sequence < 1:
+        raise _error(
+            "sequence must be at least 1",
+            path=("sequence",),
+        )
+
+
+def _require_send_stream(
+    stream_type: StreamType | None,
+    accumulated_text: str | None,
+) -> None:
+    """Require stable stream identity and accumulated text."""
+    if stream_type is None:
+        raise _error(
+            "stream_type is required",
+            path=("stream_type",),
+        )
+    if accumulated_text is None:
+        raise _error(
+            "accumulated_text is required",
+            path=("accumulated_text",),
+        )
+
+
+def _parse_outbound_operation(data: Mapping[str, Any]) -> OutboundOperation:
+    """Parse the operation with message.create as the v1 default."""
+    value = data.get("operation", OutboundOperation.MESSAGE_CREATE.value)
+    try:
+        return OutboundOperation(_string(value, "operation"))
+    except ValueError as exc:
+        raise _error(
+            "unsupported outbound operation",
+            path=("operation",),
+        ) from exc
+
+
+def _parse_stream_type(data: Mapping[str, Any]) -> StreamType | None:
+    """Parse an optional stable stream type."""
+    if "stream_type" not in data or data["stream_type"] is None:
+        return None
+    value = _string(data["stream_type"], "stream_type")
+    try:
+        return StreamType(value)
+    except ValueError as exc:
+        raise _error(
+            "unsupported stream type",
+            path=("stream_type",),
+        ) from exc
+
+
+def _validate_send_fields(
+    data: Mapping[str, Any],
+    operation: OutboundOperation,
+    parts: tuple[dict[str, Any], ...],
+    target_delivery_id: str | None,
+    stream_type: StreamType | None,
+    sequence: int | None,
+    accumulated_text: str | None,
+) -> None:
+    """Validate the field combination for one outbound operation."""
+    if operation is OutboundOperation.MESSAGE_CREATE:
+        _require_send_parts(parts)
+        _reject_operation_fields(
+            data,
+            (
+                "target_delivery_id",
+                "stream_type",
+                "sequence",
+                "accumulated_text",
+            ),
+            operation,
+        )
+        return
+    if operation is OutboundOperation.MESSAGE_UPDATE:
+        _require_send_sequence(sequence)
+        _require_send_parts(parts)
+        _require_send_target(target_delivery_id)
+        _reject_operation_fields(
+            data,
+            ("stream_type", "accumulated_text", "approval"),
+            operation,
+        )
+        return
+    _require_send_stream(stream_type, accumulated_text)
+    if operation is OutboundOperation.STREAM_START:
+        if sequence != 0:
+            raise _error(
+                "stream.start sequence must be 0",
+                path=("sequence",),
+            )
+        _reject_operation_fields(
+            data,
+            ("content_parts", "target_delivery_id", "approval"),
+            operation,
+        )
+        return
+    _require_send_sequence(sequence)
+    _require_send_target(target_delivery_id)
+    _reject_operation_fields(
+        data,
+        ("content_parts", "approval"),
+        operation,
+    )
+
+
 @dataclass(frozen=True)
 class SendParams(IdentityParams):
-    """Platform-independent outbound message DTO."""
+    """Platform-independent outbound operation DTO."""
 
     delivery_id: str
     to_handle: str
-    content_parts: tuple[dict[str, Any], ...]
+    operation: OutboundOperation
+    content_parts: tuple[dict[str, Any], ...] = ()
+    target_delivery_id: str | None = None
+    stream_type: StreamType | None = None
+    sequence: int | None = None
+    accumulated_text: str | None = None
+    approval: ApprovalCardParams | None = None
 
     @classmethod
     def from_mapping(cls, value: object) -> "SendParams":
@@ -1174,7 +1432,13 @@ class SendParams(IdentityParams):
                 "generation",
                 "delivery_id",
                 "to_handle",
+                "operation",
                 "content_parts",
+                "target_delivery_id",
+                "stream_type",
+                "sequence",
+                "accumulated_text",
+                "approval",
             },
         )
         identity = IdentityParams.from_mapping(
@@ -1183,26 +1447,123 @@ class SendParams(IdentityParams):
                 for key in ("channel_key", "instance_id", "generation")
             },
         )
-        parts = _list(data.get("content_parts"), "content_parts")
-        if not parts:
+        operation = _parse_outbound_operation(data)
+        raw_parts = _list(data.get("content_parts", []), "content_parts")
+        parts = tuple(validate_content_part(item) for item in raw_parts)
+        target_delivery_id = _optional_string(data, "target_delivery_id")
+        sequence = _optional_integer(data, "sequence", minimum=0)
+        accumulated_text = _optional_string(
+            data,
+            "accumulated_text",
+            non_empty=False,
+        )
+        stream_type = _parse_stream_type(data)
+        approval = None
+        if "approval" in data and data["approval"] is not None:
+            approval = ApprovalCardParams.from_mapping(data["approval"])
+        _validate_send_fields(
+            data,
+            operation,
+            parts,
+            target_delivery_id,
+            stream_type,
+            sequence,
+            accumulated_text,
+        )
+        return cls(
+            **identity.__dict__,
+            delivery_id=_string(data.get("delivery_id"), "delivery_id"),
+            to_handle=_string(data.get("to_handle"), "to_handle"),
+            operation=operation,
+            content_parts=parts,
+            target_delivery_id=target_delivery_id,
+            stream_type=stream_type,
+            sequence=sequence,
+            accumulated_text=accumulated_text,
+            approval=approval,
+        )
+
+    def to_mapping(self) -> dict[str, Any]:
+        """Encode outbound message DTO."""
+        result: dict[str, Any] = {
+            **super().to_mapping(),
+            "delivery_id": self.delivery_id,
+            "to_handle": self.to_handle,
+            "operation": self.operation.value,
+        }
+        if self.content_parts:
+            result["content_parts"] = [
+                dict(part) for part in self.content_parts
+            ]
+        if self.target_delivery_id is not None:
+            result["target_delivery_id"] = self.target_delivery_id
+        if self.stream_type is not None:
+            result["stream_type"] = self.stream_type.value
+        if self.sequence is not None:
+            result["sequence"] = self.sequence
+        if self.accumulated_text is not None:
+            result["accumulated_text"] = self.accumulated_text
+        if self.approval is not None:
+            result["approval"] = self.approval.to_mapping()
+        return result
+
+
+@dataclass(frozen=True)
+class ReactionParams(IdentityParams):
+    """Platform-independent reaction operation DTO."""
+
+    delivery_id: str
+    to_handle: str
+    target_delivery_id: str
+    reaction: str
+
+    @classmethod
+    def from_mapping(cls, value: object) -> "ReactionParams":
+        """Validate the v1 completed reaction operation."""
+        data = _object(value)
+        _closed(
+            data,
+            {
+                "channel_key",
+                "instance_id",
+                "generation",
+                "delivery_id",
+                "to_handle",
+                "target_delivery_id",
+                "reaction",
+            },
+        )
+        identity = IdentityParams.from_mapping(
+            {
+                key: data[key]
+                for key in ("channel_key", "instance_id", "generation")
+            },
+        )
+        reaction = _string(data.get("reaction"), "reaction")
+        if reaction != "completed":
             raise _error(
-                "content_parts must not be empty",
-                path=("content_parts",),
+                "unsupported reaction",
+                path=("reaction",),
             )
         return cls(
             **identity.__dict__,
             delivery_id=_string(data.get("delivery_id"), "delivery_id"),
             to_handle=_string(data.get("to_handle"), "to_handle"),
-            content_parts=tuple(validate_content_part(item) for item in parts),
+            target_delivery_id=_string(
+                data.get("target_delivery_id"),
+                "target_delivery_id",
+            ),
+            reaction=reaction,
         )
 
     def to_mapping(self) -> dict[str, Any]:
-        """Encode outbound message DTO."""
+        """Encode a platform-independent reaction operation."""
         return {
             **super().to_mapping(),
             "delivery_id": self.delivery_id,
             "to_handle": self.to_handle,
-            "content_parts": list(self.content_parts),
+            "target_delivery_id": self.target_delivery_id,
+            "reaction": self.reaction,
         }
 
 
@@ -1569,6 +1930,7 @@ METHOD_SCHEMAS: dict[str, type[Any]] = {
     "channel.generation_status": IdentityParams,
     "channel.stop": IdentityParams,
     "channel.send": SendParams,
+    "channel.reaction": ReactionParams,
     "event.batch": EventBatchParams,
     "delivery.update": DeliveryUpdateParams,
     "ingress.endpoint.register": EndpointParams,

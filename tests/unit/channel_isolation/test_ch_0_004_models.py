@@ -6,6 +6,7 @@ from __future__ import annotations
 import pytest
 
 from qwenpaw.channel_protocol import (
+    ApprovalSeverity,
     EndpointParams,
     HostContext,
     HostStateParams,
@@ -14,7 +15,10 @@ from qwenpaw.channel_protocol import (
     RpcErrorObject,
     RpcRequest,
     RpcResponse,
+    ReactionParams,
     SendParams,
+    OutboundOperation,
+    StreamType,
     VoiceEventKind,
     VoiceSetup,
     VoiceStatusCallback,
@@ -99,6 +103,7 @@ def test_media_locator_and_send_schema_are_closed() -> None:
         },
     )
     assert send.content_parts[0]["type"] == "image"
+    assert send.operation is OutboundOperation.MESSAGE_CREATE
     with pytest.raises(ProtocolValidationError):
         validate_content_part(
             {
@@ -107,6 +112,136 @@ def test_media_locator_and_send_schema_are_closed() -> None:
                 "bytes": "bad",
             },
         )
+
+
+def test_outbound_operation_dtos_are_closed_and_platform_independent() -> None:
+    """Send and reaction DTOs express stable operations without native IDs."""
+    approval = SendParams.from_mapping(
+        {
+            **_identity(),
+            "delivery_id": "approval-1",
+            "to_handle": "chat-1",
+            "operation": "message.create",
+            "content_parts": [{"type": "text", "text": "Approve?"}],
+            "approval": {
+                "request_id": "request-1",
+                "tool_name": "shell",
+                "severity": "high",
+            },
+        },
+    )
+    assert approval.approval is not None
+    assert approval.approval.severity is ApprovalSeverity.HIGH
+    stream_start = SendParams.from_mapping(
+        {
+            **_identity(),
+            "delivery_id": "stream-1",
+            "to_handle": "chat-1",
+            "operation": "stream.start",
+            "stream_type": "message",
+            "sequence": 0,
+            "accumulated_text": "",
+        },
+    )
+    assert stream_start.stream_type is StreamType.MESSAGE
+    stream_delta = SendParams.from_mapping(
+        {
+            **_identity(),
+            "delivery_id": "stream-delta-1",
+            "to_handle": "chat-1",
+            "operation": "stream.delta",
+            "target_delivery_id": "stream-1",
+            "stream_type": "message",
+            "sequence": 1,
+            "accumulated_text": "hello",
+        },
+    )
+    assert stream_delta.operation is OutboundOperation.STREAM_DELTA
+    update = SendParams.from_mapping(
+        {
+            **_identity(),
+            "delivery_id": "update-1",
+            "to_handle": "chat-1",
+            "operation": "message.update",
+            "target_delivery_id": "stream-1",
+            "sequence": 2,
+            "content_parts": [{"type": "text", "text": "hello"}],
+        },
+    )
+    assert update.target_delivery_id == "stream-1"
+    reaction = ReactionParams.from_mapping(
+        {
+            **_identity(),
+            "delivery_id": "reaction-1",
+            "to_handle": "chat-1",
+            "target_delivery_id": "stream-1",
+            "reaction": "completed",
+        },
+    )
+    assert reaction.to_mapping()["reaction"] == "completed"
+    with pytest.raises(ProtocolValidationError):
+        SendParams.from_mapping(
+            {
+                **approval.to_mapping(),
+                "platform_card": {"tag": "interactive"},
+            },
+        )
+    with pytest.raises(ProtocolValidationError):
+        ReactionParams.from_mapping(
+            {
+                **reaction.to_mapping(),
+                "reaction": "DONE",
+            },
+        )
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        {
+            "operation": "stream.start",
+            "stream_type": "message",
+            "sequence": 1,
+            "accumulated_text": "",
+        },
+        {
+            "operation": "stream.delta",
+            "target_delivery_id": "stream-1",
+            "stream_type": "message",
+            "sequence": 0,
+            "accumulated_text": "hello",
+        },
+        {
+            "operation": "message.update",
+            "target_delivery_id": "stream-1",
+            "sequence": 1,
+        },
+    ],
+)
+def test_outbound_operation_field_combinations_are_strict(
+    params: dict[str, object],
+) -> None:
+    """Each outbound operation accepts only its required field shape."""
+    with pytest.raises(ProtocolValidationError):
+        SendParams.from_mapping(
+            {
+                **_identity(),
+                "delivery_id": "invalid-1",
+                "to_handle": "chat-1",
+                **params,
+            },
+        )
+
+
+def test_secret_handle_is_opaque_bounded_and_redacted() -> None:
+    """The wire model validates but never interprets an opaque handle."""
+    context = HostContext.from_mapping({"secret_handle": "fixture-handle"})
+    assert context.to_mapping()["secret_handle"] == "fixture-handle"
+    assert "fixture-handle" not in repr(context)
+    with pytest.raises(ProtocolValidationError):
+        HostContext.from_mapping({"secret_handle": "bad\nhandle"})
+    with pytest.raises(ProtocolValidationError):
+        HostContext.from_mapping({"secret_handle": "x" * 257})
 
 
 def test_endpoint_rejects_unauthenticated_external_binding() -> None:

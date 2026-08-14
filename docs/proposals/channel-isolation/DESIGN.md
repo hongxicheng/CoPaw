@@ -471,6 +471,42 @@ request.cancel     Either side notification
 需要 `ingress.endpoint.update`。具体必需方法必须在 descriptor capability 和对应 Schema
 中明确，不能仅依赖方法表中的 optional 标记。
 
+`channel.send` 是平台无关出站操作的唯一消息方法，不为卡片、streaming 或消息更新新增
+平台专属 RPC。v1 `SendParams` 是 closed object，包含共同的 identity、唯一
+`delivery_id`、`to_handle` 和 `operation`；为兼容最初的 v1 实现，缺省 `operation` 等价于
+`message.create`。`operation` 只允许 `message.create`、`message.update`、
+`stream.start`、`stream.delta` 和 `stream.end`。
+
+- `message.create` 携带非空 `content_parts`。可选 `approval` 是 closed object，只包含
+  `request_id`、`tool_name` 和 `severity=low|medium|high|critical`；按钮语义固定为
+  `approve`/`deny`，Runner 负责生成平台原生卡片和回调 payload。不支持卡片时使用同一
+  `content_parts` 作为 Core 已生成的 fallback，不允许 Core 传入飞书、企微或其他平台
+  原生卡片 JSON。
+- `stream.start` 携带 `stream_type=reasoning|message`、`sequence=0` 和当前完整的
+  `accumulated_text`，其 `delivery_id` 同时成为后续更新的稳定目标。
+- `stream.delta` 和 `stream.end` 携带 `target_delivery_id`、相同的 `stream_type`、严格
+  单调且连续的 `sequence` 及当前完整的 `accumulated_text`。`stream.end` 后不得继续更新
+  同一目标。
+- `message.update` 只服务 v1 streaming 产生的平台消息更新，携带
+  `target_delivery_id`、严格单调且连续的 `sequence` 和非空 `content_parts`；目标必须是
+  先前成功接收的 `stream.start`。任意非 streaming 消息编辑不属于 v1。
+- 每个可能产生平台副作用的 request 使用新的 `delivery_id`；update/delta/end 通过
+  `target_delivery_id` 引用先前的 `stream.start`。平台 message/card ID 只保存在 Runner，
+  不进入 Core wire DTO。
+
+`channel.reaction` 使用独立的 closed `ReactionParams`，包含 identity、唯一
+`delivery_id`、`to_handle`、`target_delivery_id` 和 `reaction`。v1 只允许
+`reaction=completed`，目标必须是先前成功接收的 `message.create` 或 `stream.start`；
+平台 emoji/reaction key 由 Runner 映射，不进入协议。
+
+出站 capability 绑定是协议事实来源：非文本 ContentPart 要求 `media`；所有 stream 操作
+和 `message.update` 要求 `streaming`；带 `approval` 的 `message.create` 要求
+`approval_card`；`channel.reaction` 要求 `reaction`。缺少 capability 返回
+`CAPABILITY_REQUIRED`；未知 target 返回 `OUTBOUND_TARGET_UNKNOWN`；重复 delivery、非法
+target、stream type 不一致、sequence 跳跃或结束后更新返回
+`OUTBOUND_ORDER_VIOLATION`。所有出站操作还必须通过 active generation、有效 lease 和
+identity fencing。
+
 `runner.hello` 必须包含：`protocol_min/max`、`qwenpaw_version`、`channel_key`、
 `instance_id`、`environment_spec_id`、`environment_id`、`lock_sha256`、Python ABI、
 platform tag 和 capability 声明。Core 校验失败时拒绝激活。
@@ -517,6 +553,11 @@ TEMPORARY_UNAVAILABLE
 MESSAGE_DUPLICATE
 CHECKPOINT_UNSUPPORTED
 RUNNER_SHUTTING_DOWN
+CAPABILITY_REQUIRED
+OUTBOUND_TARGET_UNKNOWN
+OUTBOUND_ORDER_VIOLATION
+SECRET_HANDLE_INVALID
+SECRET_HANDLE_CONSUMED
 INGRESS_CONNECTION_UNKNOWN
 INGRESS_ORDER_VIOLATION
 INGRESS_BACKPRESSURE
@@ -1474,6 +1515,20 @@ environment 已不匹配时，必须停止并报告 `repair_required`，不能�
   handle。host context 至少包含 Core 按现有配置规则解析的 `media_work_dir`；Runner
   完成 import、配置和平台鉴权探测后，Core 才能提交配置变更；失败时保留旧配置和旧
   active generation。
+- `secret_handle` 是 prepare-attempt 和 generation scoped 的不透明引用，不是路径、FD
+  数字、Windows HANDLE 或 secret value。wire value 是有长度上限且不含控制字符的非空
+  token；协议层不得解释其平台表示。handle 只允许出现在 `channel.prepare.host_context`，
+  Runner 进入 `preparing` 后、返回 prepare response 前发起一次消费。消费尝试开始即失效，
+  无论成功或失败都不得复用；prepare 结束后也不得保存在 standby/active 的 host context、
+  日志、诊断或持久状态中。
+- 未知、跨 generation 或没有可用 consumer 的 handle 返回 `SECRET_HANDLE_INVALID`；已经
+  消费、过期或重复使用返回 `SECRET_HANDLE_CONSUMED`。handle 解析成功但平台凭证无效仍
+  返回 `PLATFORM_AUTH_FAILED`，不得混淆为 handle 错误。Phase 0 允许使用只存在于测试进程
+  的 fixture consumer 验证这些 wire 语义；真实 POSIX pipe/FD、Windows HANDLE 的创建、
+  继承、读取和销毁属于 CH-1-006。
+- secret value 始终不得进入 JSON-RPC、命令行、日志、descriptor、diagnostic、返回值或
+  持久环境。fixture consumer 也只能在进程内把解析值交给初始化逻辑，不能把值返回协议
+  层。Runner 保存的 host context 必须删除 `secret_handle`。
 - 上述旧实例继续服务只适用于新配置/新声明仍处于 staging、尚未 commit 的情况；此时
   当前生效声明没有变化，不属于版本回退。新声明一旦 commit，任何不满足它的旧
   environment 或旧源码都不得重新启动。

@@ -9,7 +9,12 @@ import time
 from enum import StrEnum
 from typing import Any, Callable, Mapping
 
-from .errors import ProtocolValidationError, RpcError
+from .errors import (
+    ProtocolValidationError,
+    RpcError,
+    SecretHandleConsumedError,
+    SecretHandleInvalidError,
+)
 from .models import (
     DeliveryUpdateParams,
     EventBatchParams,
@@ -20,8 +25,10 @@ from .models import (
     HostStateParams,
     IdentityParams,
     LeaseParams,
+    OutboundOperation,
     PrepareParams,
     QuiesceParams,
+    ReactionParams,
     SendParams,
     is_external_host,
 )
@@ -108,6 +115,41 @@ class HostStateStore:
         """Atomically delete one value."""
         async with self._lock:
             self._values.pop(key, None)
+
+
+class FixtureSecretHandleConsumer:
+    """Consume in-memory fixture secrets without exposing them on the wire."""
+
+    def __init__(
+        self,
+        handles: Mapping[tuple[str, int], object],
+        sink: Callable[[object], Any],
+    ) -> None:
+        self._pending = dict(handles)
+        self._consumed: set[tuple[str, int]] = set()
+        self._sink = sink
+
+    async def __call__(self, handle: str, generation: int) -> None:
+        """Consume one fixture handle before invoking its in-process sink."""
+        key = (handle, generation)
+        if key in self._consumed:
+            raise SecretHandleConsumedError(
+                "fixture secret handle was already consumed",
+            )
+        if key not in self._pending:
+            raise SecretHandleInvalidError("fixture secret handle is invalid")
+        secret_value = self._pending.pop(key)
+        self._consumed.add(key)
+        result = self._sink(secret_value)
+        if hasattr(result, "__await__"):
+            await result
+
+    def __repr__(self) -> str:
+        """Return diagnostics that reveal neither handles nor secret values."""
+        return (
+            f"{type(self).__name__}(pending={len(self._pending)}, "
+            f"consumed={len(self._consumed)})"
+        )
 
 
 # pylint: disable=protected-access
@@ -373,6 +415,8 @@ class LifecycleController:
         capabilities: tuple[str, ...] = (),
         qwenpaw_version: str = "",
         send_handler: Callable[[SendParams], Any] | None = None,
+        reaction_handler: Callable[[ReactionParams], Any] | None = None,
+        secret_handle_consumer: Callable[[str, int], Any] | None = None,
         endpoint_handler: Callable[[str, EndpointParams | None], Any]
         | None = None,
         host_state_store: HostStateStore | None = None,
@@ -397,9 +441,15 @@ class LifecycleController:
         self.negotiated_capabilities: frozenset[str] = frozenset()
         self.effective_capabilities: frozenset[str] = frozenset()
         self._send_handler = send_handler
+        self._reaction_handler = reaction_handler
+        self._secret_handle_consumer = secret_handle_consumer
+        self._secret_handle_attempted = False
+        self._outbound_delivery_ids: set[str] = set()
+        self._outbound_targets: dict[str, dict[str, Any]] = {}
         self._endpoint_handler = endpoint_handler
         self._clock_ms = clock_ms or (lambda: time.monotonic_ns() // 1_000_000)
         self._lock = asyncio.Lock()
+        self._outbound_lock = asyncio.Lock()
 
     def _identity_error(self, reason: str) -> RpcError:
         """Create an identity or fencing error."""
@@ -504,14 +554,72 @@ class LifecycleController:
                     },
                 )
             self.state = RunnerState.PREPARING
-            self.host_context = params.host_context
-            self.effective_capabilities = frozenset(requested)
-            self.state = RunnerState.STANDBY
-            return GenerationStatus(
-                state=self.state.value,
-                generation=self.generation,
-                consuming=False,
-            ).to_mapping()
+            try:
+                await self._consume_secret_handle_locked(
+                    params.host_context.secret_handle,
+                )
+                self.host_context = HostContext(
+                    media_work_dir=params.host_context.media_work_dir,
+                    config_snapshot=params.host_context.config_snapshot,
+                )
+                self.effective_capabilities = frozenset(requested)
+                self.state = RunnerState.STANDBY
+                return GenerationStatus(
+                    state=self.state.value,
+                    generation=self.generation,
+                    consuming=False,
+                ).to_mapping()
+            except Exception:
+                self.host_context = None
+                self.effective_capabilities = frozenset()
+                self.state = RunnerState.FAILED
+                raise
+
+    async def _consume_secret_handle_locked(
+        self,
+        secret_handle: str | None,
+    ) -> None:
+        """Consume one opaque prepare-scoped handle without retaining it."""
+        if secret_handle is None:
+            return
+        if self._secret_handle_attempted:
+            raise RpcError(
+                RPC_AUTH_ERROR,
+                "secret handle was already consumed",
+                data={"reason_code": "SECRET_HANDLE_CONSUMED"},
+            )
+        self._secret_handle_attempted = True
+        consumer = self._secret_handle_consumer
+        if consumer is None:
+            raise RpcError(
+                RPC_AUTH_ERROR,
+                "secret handle consumer is unavailable",
+                data={"reason_code": "SECRET_HANDLE_INVALID"},
+            )
+        try:
+            result = consumer(secret_handle, self.generation)
+            if hasattr(result, "__await__"):
+                await result
+        except SecretHandleConsumedError as exc:
+            raise RpcError(
+                RPC_AUTH_ERROR,
+                "secret handle was already consumed",
+                data={"reason_code": "SECRET_HANDLE_CONSUMED"},
+            ) from exc
+        except SecretHandleInvalidError as exc:
+            raise RpcError(
+                RPC_AUTH_ERROR,
+                "secret handle is invalid",
+                data={"reason_code": "SECRET_HANDLE_INVALID"},
+            ) from exc
+        except RpcError:
+            raise
+        except Exception as exc:
+            raise RpcError(
+                RPC_AUTH_ERROR,
+                "platform authentication failed",
+                data={"reason_code": "PLATFORM_AUTH_FAILED"},
+            ) from exc
 
     async def activate(self, params: LeaseParams) -> dict[str, Any]:
         """Grant a provisional lease while retaining standby semantics."""
@@ -557,24 +665,25 @@ class LifecycleController:
 
     async def quiesce(self, params: QuiesceParams) -> dict[str, Any]:
         """Stop new work and enter the quiescing state."""
-        async with self._lock:
-            self._check_identity(params)
-            self._ensure_state(RunnerState.ACTIVE, RunnerState.STANDBY)
-            await self._expire_lease_if_needed_async()
-            if self.state == RunnerState.FAILED:
-                raise self._lifecycle_error("LEASE_EXPIRED")
-            if self.state == RunnerState.ACTIVE:
-                if self.lease_token is None:
-                    raise self._lifecycle_error("LEASE_REQUIRED")
-            await self._unregister_endpoint_locked()
-            self.state = RunnerState.QUIESCING
-            self.lease_token = None
-            self.lease_expires_at_ms = None
-            return GenerationStatus(
-                state=self.state.value,
-                generation=self.generation,
-                consuming=False,
-            ).to_mapping()
+        async with self._outbound_lock:
+            async with self._lock:
+                self._check_identity(params)
+                self._ensure_state(RunnerState.ACTIVE, RunnerState.STANDBY)
+                await self._expire_lease_if_needed_async()
+                if self.state == RunnerState.FAILED:
+                    raise self._lifecycle_error("LEASE_EXPIRED")
+                if self.state == RunnerState.ACTIVE:
+                    if self.lease_token is None:
+                        raise self._lifecycle_error("LEASE_REQUIRED")
+                await self._unregister_endpoint_locked()
+                self.state = RunnerState.QUIESCING
+                self.lease_token = None
+                self.lease_expires_at_ms = None
+                return GenerationStatus(
+                    state=self.state.value,
+                    generation=self.generation,
+                    consuming=False,
+                ).to_mapping()
 
     async def health(self, params: IdentityParams) -> dict[str, Any]:
         """Return read-only lifecycle health."""
@@ -598,51 +707,202 @@ class LifecycleController:
 
     async def stop(self, params: IdentityParams) -> dict[str, Any]:
         """Stop the Runner from any non-terminal state."""
-        async with self._lock:
-            self._check_identity(params)
-            await self._unregister_endpoint_locked()
-            if self.state != RunnerState.STOPPED:
-                self.state = RunnerState.STOPPED
-            self.lease_token = None
-            self.lease_expires_at_ms = None
-            return GenerationStatus(
-                state=self.state.value,
-                generation=self.generation,
-                consuming=False,
-            ).to_mapping()
+        async with self._outbound_lock:
+            async with self._lock:
+                self._check_identity(params)
+                await self._unregister_endpoint_locked()
+                if self.state != RunnerState.STOPPED:
+                    self.state = RunnerState.STOPPED
+                self.lease_token = None
+                self.lease_expires_at_ms = None
+                return GenerationStatus(
+                    state=self.state.value,
+                    generation=self.generation,
+                    consuming=False,
+                ).to_mapping()
 
     async def send(self, params: SendParams) -> dict[str, Any]:
         """Send only from the committed active generation."""
-        async with self._lock:
-            self._check_identity(params)
-            self._ensure_state(RunnerState.ACTIVE)
-            await self._expire_lease_if_needed_async()
-            if self.state != RunnerState.ACTIVE:
-                raise self._lifecycle_error("LEASE_EXPIRED")
-            if (
-                any(
-                    part.get("type") != "text" for part in params.content_parts
+        async with self._outbound_lock:
+            async with self._lock:
+                self._check_identity(params)
+                self._ensure_state(RunnerState.ACTIVE)
+                await self._expire_lease_if_needed_async()
+                if self.state != RunnerState.ACTIVE:
+                    raise self._lifecycle_error("LEASE_EXPIRED")
+                self._check_send_capabilities(params)
+                target = self._check_outbound_send_order(params)
+                callback = self._send_handler
+            if callback is not None:
+                result = callback(params)
+                if hasattr(result, "__await__"):
+                    result = await result
+            else:
+                result = {
+                    "status": "accepted",
+                    "delivery_id": params.delivery_id,
+                }
+            async with self._lock:
+                self._record_outbound_send(params, target)
+            if isinstance(result, Mapping):
+                return dict(result)
+            return {"result": result}
+
+    def _check_send_capabilities(self, params: SendParams) -> None:
+        """Bind each outbound operation to its effective capability."""
+        required: list[str] = []
+        if params.operation in {
+            OutboundOperation.MESSAGE_UPDATE,
+            OutboundOperation.STREAM_START,
+            OutboundOperation.STREAM_DELTA,
+            OutboundOperation.STREAM_END,
+        }:
+            required.append("streaming")
+        if params.approval is not None:
+            required.append("approval_card")
+        if any(part.get("type") != "text" for part in params.content_parts):
+            required.append("media")
+        missing = [
+            capability
+            for capability in required
+            if capability not in self.effective_capabilities
+        ]
+        if missing:
+            raise RpcError(
+                RPC_CAPABILITY_ERROR,
+                f"{missing[0]} capability was not negotiated",
+                data={
+                    "reason_code": "CAPABILITY_REQUIRED",
+                    "capability": missing[0],
+                },
+            )
+
+    def _check_outbound_send_order(
+        self,
+        params: SendParams,
+    ) -> dict[str, Any] | None:
+        """Validate delivery uniqueness and stream target ordering."""
+        if params.delivery_id in self._outbound_delivery_ids:
+            raise self._outbound_order_error("duplicate delivery_id")
+        if params.target_delivery_id is None:
+            return None
+        target = self._outbound_targets.get(params.target_delivery_id)
+        if target is None:
+            raise self._outbound_target_error()
+        if (
+            target["operation"] is not OutboundOperation.STREAM_START
+            or target["to_handle"] != params.to_handle
+            or target["ended"]
+        ):
+            raise self._outbound_order_error("invalid outbound target")
+        if params.sequence != target["sequence"] + 1:
+            raise self._outbound_order_error("non-contiguous sequence")
+        if (
+            params.stream_type is not None
+            and params.stream_type is not target["stream_type"]
+        ):
+            raise self._outbound_order_error("stream type mismatch")
+        return target
+
+    def _record_outbound_send(
+        self,
+        params: SendParams,
+        target: dict[str, Any] | None,
+    ) -> None:
+        """Record one successfully accepted outbound operation."""
+        self._outbound_delivery_ids.add(params.delivery_id)
+        if params.operation in {
+            OutboundOperation.MESSAGE_CREATE,
+            OutboundOperation.STREAM_START,
+        }:
+            self._outbound_targets[params.delivery_id] = {
+                "operation": params.operation,
+                "to_handle": params.to_handle,
+                "stream_type": params.stream_type,
+                "sequence": params.sequence,
+                "ended": False,
+            }
+        if target is not None:
+            target["sequence"] = params.sequence
+            if params.operation is OutboundOperation.STREAM_END:
+                target["ended"] = True
+
+    async def reaction(self, params: ReactionParams) -> dict[str, Any]:
+        """Apply the v1 completed reaction to an accepted outbound target."""
+        async with self._outbound_lock:
+            async with self._lock:
+                self._check_identity(params)
+                self._ensure_state(RunnerState.ACTIVE)
+                await self._expire_lease_if_needed_async()
+                if self.state != RunnerState.ACTIVE:
+                    raise self._lifecycle_error("LEASE_EXPIRED")
+                if "reaction" not in self.effective_capabilities:
+                    raise RpcError(
+                        RPC_CAPABILITY_ERROR,
+                        "reaction capability was not negotiated",
+                        data={
+                            "reason_code": "CAPABILITY_REQUIRED",
+                            "capability": "reaction",
+                        },
+                    )
+                if params.delivery_id in self._outbound_delivery_ids:
+                    raise self._outbound_order_error(
+                        "duplicate delivery_id",
+                    )
+                target = self._outbound_targets.get(
+                    params.target_delivery_id,
                 )
-                and "media" not in self.effective_capabilities
-            ):
-                raise RpcError(
-                    RPC_CAPABILITY_ERROR,
-                    "media capability was not negotiated",
-                    data={
-                        "reason_code": "CAPABILITY_REQUIRED",
-                        "capability": "media",
-                    },
-                )
-            callback = self._send_handler
-        if callback is not None:
-            result = callback(params)
-            if hasattr(result, "__await__"):
-                result = await result
-        else:
-            result = {"status": "accepted", "delivery_id": params.delivery_id}
-        if isinstance(result, Mapping):
-            return dict(result)
-        return {"result": result}
+                if target is None:
+                    raise self._outbound_target_error()
+                if (
+                    target["operation"]
+                    not in {
+                        OutboundOperation.MESSAGE_CREATE,
+                        OutboundOperation.STREAM_START,
+                    }
+                    or target["to_handle"] != params.to_handle
+                ):
+                    raise self._outbound_order_error(
+                        "invalid reaction target",
+                    )
+                if (
+                    target["operation"] is OutboundOperation.STREAM_START
+                    and not target["ended"]
+                ):
+                    raise self._outbound_order_error(
+                        "stream target has not ended",
+                    )
+                callback = self._reaction_handler
+            if callback is not None:
+                result = callback(params)
+                if hasattr(result, "__await__"):
+                    result = await result
+            else:
+                result = {
+                    "status": "accepted",
+                    "delivery_id": params.delivery_id,
+                }
+            async with self._lock:
+                self._outbound_delivery_ids.add(params.delivery_id)
+            if isinstance(result, Mapping):
+                return dict(result)
+            return {"result": result}
+
+    def _outbound_target_error(self) -> RpcError:
+        """Create the stable error for an unknown outbound target."""
+        return RpcError(
+            RPC_LIFECYCLE_ERROR,
+            "outbound target is unknown",
+            data={"reason_code": "OUTBOUND_TARGET_UNKNOWN"},
+        )
+
+    def _outbound_order_error(self, message: str) -> RpcError:
+        """Create the stable error for invalid outbound ordering."""
+        return RpcError(
+            RPC_LIFECYCLE_ERROR,
+            message,
+            data={"reason_code": "OUTBOUND_ORDER_VIOLATION"},
+        )
 
     async def endpoint_register(
         self,
@@ -864,11 +1124,16 @@ class LifecycleController:
             "channel.send",
             lambda params, _: self.send(params),
         )
+        peer.register_method(
+            "channel.reaction",
+            lambda params, _: self.reaction(params),
+        )
 
 
 __all__ = [
     "LifecycleController",
     "CoreLifecycleAdapter",
+    "FixtureSecretHandleConsumer",
     "HostStateStore",
     "RPC_AUTH_ERROR",
     "RPC_FENCING_ERROR",

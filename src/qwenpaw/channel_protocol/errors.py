@@ -98,6 +98,14 @@ class RpcCancelledError(asyncio.CancelledError):
     """Report a request cancelled through the protocol."""
 
 
+class SecretHandleInvalidError(ValueError):
+    """Report an unknown or generation-mismatched secret handle."""
+
+
+class SecretHandleConsumedError(ValueError):
+    """Report a secret handle whose single consumption was attempted."""
+
+
 def validation_error(
     message: str,
     *,

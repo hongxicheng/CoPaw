@@ -303,7 +303,7 @@ descriptor validator 和聚焦单测机械验证；ADR-035/036 已确认。独�
 
 ### CH-0-004：JSON-RPC 2.0、Schema 和生命周期
 
-- 状态：[x] 独立 Review 和最终验证通过。
+- 状态：[-] 协议缺口已重新实施并验证，等待独立 Review。
 
 - [x] 实现 JSON-RPC 2.0 request、response、notification、error 和 cancel。
 - [x] 实现 pending request 上限、request timeout、未知方法和重复 response 处理。
@@ -324,10 +324,19 @@ descriptor validator 和聚焦单测机械验证；ADR-035/036 已确认。独�
 - [x] 定义 created、preparing、standby、active、quiescing、stopped、failed 状态转换。
 - [x] 实现 protocol version、capability negotiation 和稳定错误码。
 - [x] 校验 `channel_key`、`instance_id`、generation 和 environment identity。
+- [x] 冻结并实现 `channel.send` 的 message create/update、stream start/delta/end 和
+  approval card 平台无关 DTO，以及 `channel.reaction` 的 completed reaction DTO；不得
+  新增 Design §7.3 之外的 RPC 方法。
+- [x] 冻结 `secret_handle` 的不透明、prepare/generation scoped、一次性消费和稳定错误
+  语义；Phase 0 只实现 fixture consumer，真实跨平台 pipe/handle 留给 CH-1-006。
 
 验收：mock Core/Runner 能完成 hello、prepare、activate、commit、lease renewal、
 health、cancel 和 stop；commit 前不能正式消费。非法状态转换、Schema 不匹配、超时和
-协议版本不兼容均返回稳定结果。
+协议版本不兼容均返回稳定结果。`channel.send` 能以平台无关 DTO 表达 message
+create/update、stream start/delta/end 和 approval card，`channel.reaction` 能表达
+completed reaction；capability、target、sequence、lease 和 generation 门禁返回稳定
+结果。fixture secret handle 只在 prepare 中按 generation 消费一次，secret value 不进入
+JSON-RPC frame、返回值或 Runner 保存的 host context。
 
 实现位于 `src/qwenpaw/channel_protocol/models.py`、`rpc.py` 和 `lifecycle.py`，
 公共导出与错误类型位于 `__init__.py`、`errors.py`；聚焦测试位于
@@ -335,10 +344,12 @@ health、cancel 和 stop；commit 前不能正式消费。非法状态转换、S
 `test_ch_0_004_lifecycle.py`。当前聚焦测试命令
 `conda run -n qwenpaw pytest -q tests/unit/channel_isolation/test_ch_0_004_models.py
 tests/unit/channel_isolation/test_ch_0_004_lifecycle.py
-tests/unit/channel_isolation/test_ch_0_004_rpc.py` 为 `28 passed`，
-`conda run -n qwenpaw pytest -q tests/unit/channel_isolation` 为 `189 passed`；目标文件
-pre-commit 全部通过，`git diff --check` 通过。独立 Review 已通过（用户确认）；实现与
-修复提交为 `95836112`、`26958f06`、`339766f7` 和 `4cd74739`。任务状态更新为 `[x]`。
+tests/unit/channel_isolation/test_ch_0_004_rpc.py` 为 `40 passed`，
+`conda run -n qwenpaw pytest -q tests/unit/channel_isolation` 为 `233 passed`；目标文件
+pre-commit 全部通过，`git diff --check` 通过。原独立 Review 已通过（用户确认）；原实现
+与修复提交为 `95836112`、`26958f06`、`339766f7` 和 `4cd74739`。CH-0-007 前置检查发现的
+出站操作和 secret handle wire contract 缺口已按 Design 重新实施并验证；本记录更新为
+`[-]`，等待新的独立 Review 和最终验证，通过前不得恢复为 `[x]`。
 
 ### CH-0-005：可靠事件、ACK 和幂等原型
 
