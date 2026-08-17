@@ -72,6 +72,17 @@ def _recover_request_id(
 
 RequestHandler = Callable[[Any, RpcRequest], Any]
 NotificationHandler = Callable[[Any, RpcNotification], Any]
+PublicationCallback = Callable[[], Any]
+PublicationAbortCallback = Callable[[str], Any]
+
+
+@dataclass(frozen=True)
+class RpcResponsePublication:
+    """Bind an internal result to response publication callbacks."""
+
+    result: object
+    on_published: PublicationCallback
+    on_aborted: PublicationAbortCallback
 
 
 @dataclass(frozen=True)
@@ -369,6 +380,9 @@ class RpcPeer:
 
     def _resolve_response(self, response: RpcResponse) -> None:
         """Complete one pending call and ignore late duplicate responses."""
+        if response.id is None:
+            self._duplicate_responses += 1
+            return
         pending = self._pending.get(response.id)
         if pending is None:
             self._duplicate_responses += 1
@@ -387,6 +401,7 @@ class RpcPeer:
         else:
             pending.future.set_result(response.result)
 
+    # pylint: disable=too-many-branches
     async def _dispatch_request(
         self,
         request: RpcRequest,
@@ -394,6 +409,8 @@ class RpcPeer:
     ) -> None:
         """Run one request handler and return exactly one response."""
         token = _CURRENT_CANCELLATION.set(cancellation)
+        publication: RpcResponsePublication | None = None
+        response_sent = False
         try:
             handler = self._handlers.get(request.method)
             if handler is None:
@@ -408,10 +425,24 @@ class RpcPeer:
             result = handler(params, request)
             if inspect.isawaitable(result):
                 result = await result
+            if isinstance(result, RpcResponsePublication):
+                publication = result
+                result = publication.result
             if cancellation.requested:
                 raise asyncio.CancelledError
             await self._send(RpcResponse(request.id, result=result))
+            response_sent = True
+            if publication is not None:
+                await self._run_publication_callback(
+                    publication.on_published,
+                )
         except ProtocolValidationError as exc:
+            if await self._abort_response_publication(
+                publication,
+                response_sent,
+                "PLATFORM_RESULT_UNKNOWN",
+            ):
+                return
             await self._send_error(
                 request.id,
                 JSONRPC_INVALID_PARAMS,
@@ -419,6 +450,12 @@ class RpcPeer:
                 data={"reason_code": exc.reason_code, "path": list(exc.path)},
             )
         except RpcError as exc:
+            if await self._abort_response_publication(
+                publication,
+                response_sent,
+                "PLATFORM_RESULT_UNKNOWN",
+            ):
+                return
             await self._send_error(
                 request.id,
                 exc.code,
@@ -426,6 +463,12 @@ class RpcPeer:
                 data=exc.data,
             )
         except asyncio.CancelledError:
+            if await self._abort_response_publication(
+                publication,
+                response_sent,
+                "REQUEST_CANCELLED",
+            ):
+                return
             await self._send_error(
                 request.id,
                 JSONRPC_INTERNAL_ERROR,
@@ -433,6 +476,12 @@ class RpcPeer:
                 data={"reason_code": "REQUEST_CANCELLED"},
             )
         except Exception as exc:
+            if await self._abort_response_publication(
+                publication,
+                response_sent,
+                "PLATFORM_RESULT_UNKNOWN",
+            ):
+                return
             await self._send_error(
                 request.id,
                 JSONRPC_INTERNAL_ERROR,
@@ -442,6 +491,37 @@ class RpcPeer:
             _ = exc
         finally:
             _CURRENT_CANCELLATION.reset(token)
+
+    async def _abort_response_publication(
+        self,
+        publication: RpcResponsePublication | None,
+        response_sent: bool,
+        reason_code: str,
+    ) -> bool:
+        """Abort provisional state unless its response was already sent."""
+        if response_sent:
+            return True
+        if publication is not None:
+            await self._run_publication_callback(
+                lambda: publication.on_aborted(reason_code),
+            )
+        return False
+
+    async def _run_publication_callback(
+        self,
+        callback: PublicationCallback,
+    ) -> None:
+        """Complete publication bookkeeping despite task cancellation."""
+        result = callback()
+        if not inspect.isawaitable(result):
+            return
+        cleanup = asyncio.ensure_future(result)
+        while not cleanup.done():
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                continue
+        cleanup.result()
 
     async def _dispatch_notification(
         self,

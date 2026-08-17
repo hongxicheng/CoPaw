@@ -327,7 +327,7 @@ class RpcNotification:
 class RpcResponse:
     """JSON-RPC response envelope."""
 
-    id: str | int
+    id: str | int | None
     result: object = None
     error: RpcErrorObject | None = None
 
@@ -335,6 +335,8 @@ class RpcResponse:
         """Require exactly one of result or error semantically."""
         if self.error is not None and self.result is not None:
             raise ValueError("response cannot contain both result and error")
+        if self.id is None and self.error is None:
+            raise ValueError("only error responses may use a null id")
 
     def to_mapping(self) -> dict[str, Any]:
         """Encode the response envelope."""
@@ -361,7 +363,6 @@ class RpcResponse:
             )
         if "id" not in data:
             raise _error("response must contain id", path=("id",))
-        response_id = _request_id(data["id"])
         has_result = "result" in data
         has_error = "error" in data
         if has_result == has_error:
@@ -369,6 +370,16 @@ class RpcResponse:
                 "response must contain exactly one result or error",
                 reason_code="SCHEMA_MISMATCH",
             )
+        if data["id"] is None:
+            if not has_error:
+                raise _error(
+                    "only error responses may use a null id",
+                    path=("id",),
+                    reason_code="SCHEMA_MISMATCH",
+                )
+            response_id = None
+        else:
+            response_id = _request_id(data["id"])
         return cls(
             id=response_id,
             result=data.get("result"),

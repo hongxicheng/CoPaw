@@ -37,7 +37,7 @@ from .models import (
     is_external_host,
 )
 from .reliability import InboundInbox, OutboundDeliveryLedger
-from .rpc import RpcPeer, request_was_cancelled
+from .rpc import RpcPeer, RpcResponsePublication, request_was_cancelled
 
 
 RPC_LIFECYCLE_ERROR = -32010
@@ -177,22 +177,9 @@ class CoreLifecycleAdapter:
         self.inbound_inbox = inbound_inbox or InboundInbox()
         self.controller.host_state_store = self.host_state_store
         self.endpoints: dict[int, EndpointParams] = {}
-        previous_handler = self.controller._endpoint_handler
+        self.controller._endpoint_registry_handler = self._endpoint_handler
 
-        async def endpoint_handler(
-            operation: str,
-            params: EndpointParams | None,
-        ) -> None:
-            """Forward lifecycle callbacks and update the Core registry."""
-            if previous_handler is not None:
-                result = previous_handler(operation, params)
-                if hasattr(result, "__await__"):
-                    await result
-            await self._endpoint_handler(operation, params)
-
-        self.controller._endpoint_handler = endpoint_handler
-
-    async def _endpoint_handler(
+    def _endpoint_handler(
         self,
         operation: str,
         params: EndpointParams | None,
@@ -423,6 +410,11 @@ class _OutboundAttempt:
     task: asyncio.Task[Any]
     target: dict[str, Any] | None = None
     forced_reason: str | None = None
+    drain_deadline: float | None = None
+    terminal_result: OutboundResult | None = None
+    send_params: SendParams | None = None
+    provisional: bool = False
+    drain_timer: asyncio.TimerHandle | None = None
     done: asyncio.Event = field(default_factory=asyncio.Event)
 
 
@@ -476,6 +468,10 @@ class LifecycleController:
         self._outbound_attempts: dict[str, _OutboundAttempt] = {}
         self._lifecycle_epoch = 0
         self._endpoint_handler = endpoint_handler
+        self._endpoint_registry_handler: Callable[
+            [str, EndpointParams | None],
+            None,
+        ] | None = None
         self._clock_ms = clock_ms or (lambda: time.monotonic_ns() // 1_000_000)
         self._lock = asyncio.Lock()
 
@@ -719,14 +715,26 @@ class LifecycleController:
                 raise self._lifecycle_error("LEASE_EXPIRED")
             if self.state == RunnerState.ACTIVE and self.lease_token is None:
                 raise self._lifecycle_error("LEASE_REQUIRED")
-            await self._unregister_endpoint_locked()
+            endpoint_hook = self._detach_endpoint_locked()
             self.state = RunnerState.QUIESCING
             self.lease_token = None
             self.lease_expires_at_ms = None
+            drain_deadline = (
+                asyncio.get_running_loop().time()
+                + params.drain_timeout_ms / 1000
+            )
             attempts = self._fence_outbound_attempts_locked()
+            for attempt in attempts:
+                attempt.drain_deadline = drain_deadline
+                attempt.drain_timer = asyncio.get_running_loop().call_at(
+                    drain_deadline,
+                    self._expire_outbound_drain,
+                    attempt,
+                )
+        await self._wait_for_endpoint_hook(endpoint_hook, drain_deadline)
         pending = await self._wait_for_outbound_attempts(
             attempts,
-            params.drain_timeout_ms,
+            drain_deadline,
         )
         if pending:
             async with self._lock:
@@ -766,7 +774,7 @@ class LifecycleController:
         """Stop the Runner from any non-terminal state."""
         async with self._lock:
             self._check_identity(params)
-            await self._unregister_endpoint_locked()
+            endpoint_hook = self._detach_endpoint_locked()
             if self.state != RunnerState.STOPPED:
                 self.state = RunnerState.STOPPED
                 attempts = self._fence_outbound_attempts_locked()
@@ -778,13 +786,20 @@ class LifecycleController:
                     )
             self.lease_token = None
             self.lease_expires_at_ms = None
-            return GenerationStatus(
+            result = GenerationStatus(
                 state=self.state.value,
                 generation=self.generation,
                 consuming=False,
             ).to_mapping()
+        self._schedule_endpoint_hook(endpoint_hook)
+        return result
 
-    async def send(self, params: SendParams) -> dict[str, Any]:
+    async def send(
+        self,
+        params: SendParams,
+        *,
+        defer_response_publication: bool = False,
+    ) -> dict[str, Any] | RpcResponsePublication:
         """Send only from the committed active generation."""
         async with self._lock:
             self._check_identity(params)
@@ -819,6 +834,7 @@ class LifecycleController:
                 attempt,
                 result,
                 send_params=params,
+                defer_completion=defer_response_publication,
             )
         except asyncio.CancelledError:
             await self._finish_outbound_unknown_resilient(
@@ -832,7 +848,10 @@ class LifecycleController:
                 "PLATFORM_RESULT_UNKNOWN",
             )
             raise
-        return result.to_mapping()
+        mapping = result.to_mapping()
+        if not defer_response_publication:
+            return mapping
+        return self._outbound_response_publication(attempt, mapping)
 
     def _check_send_capabilities(self, params: SendParams) -> None:
         """Bind each outbound operation to its effective capability."""
@@ -915,7 +934,12 @@ class LifecycleController:
             if params.operation is OutboundOperation.STREAM_END:
                 target["ended"] = True
 
-    async def reaction(self, params: ReactionParams) -> dict[str, Any]:
+    async def reaction(
+        self,
+        params: ReactionParams,
+        *,
+        defer_response_publication: bool = False,
+    ) -> dict[str, Any] | RpcResponsePublication:
         """Apply the v1 completed reaction to an accepted outbound target."""
         async with self._lock:
             self._check_identity(params)
@@ -934,18 +958,7 @@ class LifecycleController:
                 )
             if params.delivery_id in self._outbound_delivery_states:
                 raise self._outbound_order_error("duplicate delivery_id")
-            target = self._outbound_targets.get(params.target_delivery_id)
-            if target is None:
-                raise self._outbound_target_error()
-            if (
-                target["operation"]
-                not in {
-                    OutboundOperation.MESSAGE_CREATE,
-                    OutboundOperation.STREAM_START,
-                }
-                or target["to_handle"] != params.to_handle
-            ):
-                raise self._outbound_order_error("invalid reaction target")
+            self._check_reaction_target(params)
             attempt = self._reserve_outbound_delivery(params.delivery_id)
             callback = self._reaction_handler
         try:
@@ -964,7 +977,11 @@ class LifecycleController:
             )
             if request_was_cancelled():
                 raise asyncio.CancelledError
-            result = await self._finish_outbound_attempt(attempt, result)
+            result = await self._finish_outbound_attempt(
+                attempt,
+                result,
+                defer_completion=defer_response_publication,
+            )
         except asyncio.CancelledError:
             await self._finish_outbound_unknown_resilient(
                 attempt,
@@ -977,7 +994,27 @@ class LifecycleController:
                 "PLATFORM_RESULT_UNKNOWN",
             )
             raise
-        return result.to_mapping()
+        mapping = result.to_mapping()
+        if not defer_response_publication:
+            return mapping
+        return self._outbound_response_publication(attempt, mapping)
+
+    def _check_reaction_target(self, params: ReactionParams) -> None:
+        """Require a published create or stream target for reactions."""
+        target = self._outbound_targets.get(params.target_delivery_id)
+        if target is None:
+            raise self._outbound_target_error()
+        if target.get("pending_delivery_id") is not None:
+            raise self._outbound_order_error("outbound target is busy")
+        if (
+            target["operation"]
+            not in {
+                OutboundOperation.MESSAGE_CREATE,
+                OutboundOperation.STREAM_START,
+            }
+            or target["to_handle"] != params.to_handle
+        ):
+            raise self._outbound_order_error("invalid reaction target")
 
     def _reserve_outbound_delivery(
         self,
@@ -1021,39 +1058,106 @@ class LifecycleController:
         result: OutboundResult,
         *,
         send_params: SendParams | None = None,
+        defer_completion: bool = False,
     ) -> OutboundResult:
         """Commit a terminal attempt result at one lifecycle boundary."""
         async with self._lock:
             await self._expire_lease_if_needed_async()
-            if attempt.forced_reason is not None:
-                result = self._unknown_outbound_result(
-                    attempt.delivery_id,
-                    attempt.forced_reason,
-                )
-            elif self.state not in {
-                RunnerState.ACTIVE,
-                RunnerState.QUIESCING,
-            }:
-                result = self._unknown_outbound_result(
-                    attempt.delivery_id,
-                    "LIFECYCLE_FENCED",
-                )
-            elif (
-                self.state is RunnerState.ACTIVE
-                and attempt.epoch != self._lifecycle_epoch
-            ):
-                result = self._unknown_outbound_result(
-                    attempt.delivery_id,
-                    "LIFECYCLE_FENCED",
-                )
-            self._outbound_delivery_states[attempt.delivery_id] = result.state
-            if (
-                send_params is not None
-                and result.state is DeliveryState.ACKNOWLEDGED
-            ):
-                self._record_outbound_send(send_params, attempt.target)
-            self._complete_outbound_attempt_locked(attempt)
+            result = self._fence_outbound_result_locked(attempt, result)
+            if defer_completion:
+                attempt.terminal_result = result
+                attempt.send_params = send_params
+                attempt.provisional = True
+                return result
+            self._commit_outbound_result_locked(
+                attempt,
+                result,
+                send_params,
+            )
             return result
+
+    def _outbound_response_publication(
+        self,
+        attempt: _OutboundAttempt,
+        result: dict[str, Any],
+    ) -> RpcResponsePublication:
+        """Keep an outbound result retractable until its response is sent."""
+        return RpcResponsePublication(
+            result=result,
+            on_published=lambda: self._publish_outbound_attempt(attempt),
+            on_aborted=lambda reason_code: self._finish_outbound_unknown(
+                attempt,
+                reason_code,
+            ),
+        )
+
+    async def _publish_outbound_attempt(
+        self,
+        attempt: _OutboundAttempt,
+    ) -> None:
+        """Finalize one provisional attempt after response publication."""
+        async with self._lock:
+            if self._outbound_attempts.get(attempt.delivery_id) is attempt:
+                result = attempt.terminal_result
+                if result is None:
+                    return
+                self._commit_outbound_result_locked(
+                    attempt,
+                    result,
+                    attempt.send_params,
+                )
+
+    def _commit_outbound_result_locked(
+        self,
+        attempt: _OutboundAttempt,
+        result: OutboundResult,
+        send_params: SendParams | None,
+    ) -> None:
+        """Make one terminal result and its ordering effects visible."""
+        self._outbound_delivery_states[attempt.delivery_id] = result.state
+        if (
+            send_params is not None
+            and result.state is DeliveryState.ACKNOWLEDGED
+        ):
+            self._record_outbound_send(send_params, attempt.target)
+        attempt.provisional = False
+        attempt.terminal_result = None
+        attempt.send_params = None
+        self._complete_outbound_attempt_locked(attempt)
+
+    def _fence_outbound_result_locked(
+        self,
+        attempt: _OutboundAttempt,
+        result: OutboundResult,
+    ) -> OutboundResult:
+        """Apply lifecycle, drain, and lease fencing before result commit."""
+        if attempt.forced_reason is not None:
+            return self._unknown_outbound_result(
+                attempt.delivery_id,
+                attempt.forced_reason,
+            )
+        if (
+            attempt.drain_deadline is not None
+            and asyncio.get_running_loop().time() >= attempt.drain_deadline
+        ):
+            return self._unknown_outbound_result(
+                attempt.delivery_id,
+                "DRAIN_TIMEOUT",
+            )
+        if self.state not in {RunnerState.ACTIVE, RunnerState.QUIESCING}:
+            return self._unknown_outbound_result(
+                attempt.delivery_id,
+                "LIFECYCLE_FENCED",
+            )
+        if (
+            self.state is RunnerState.ACTIVE
+            and attempt.epoch != self._lifecycle_epoch
+        ):
+            return self._unknown_outbound_result(
+                attempt.delivery_id,
+                "LIFECYCLE_FENCED",
+            )
+        return result
 
     async def _finish_outbound_unknown_resilient(
         self,
@@ -1098,6 +1202,9 @@ class LifecycleController:
         ):
             attempt.target["pending_delivery_id"] = None
         self._outbound_attempts.pop(attempt.delivery_id, None)
+        if attempt.drain_timer is not None:
+            attempt.drain_timer.cancel()
+            attempt.drain_timer = None
         attempt.done.set()
 
     @staticmethod
@@ -1120,16 +1227,17 @@ class LifecycleController:
     async def _wait_for_outbound_attempts(
         self,
         attempts: list[_OutboundAttempt],
-        timeout_ms: int,
+        deadline: float,
     ) -> list[_OutboundAttempt]:
         """Wait at most the declared drain duration for attempt completion."""
-        if attempts and timeout_ms > 0:
+        remaining = deadline - asyncio.get_running_loop().time()
+        if attempts and remaining > 0:
             try:
                 await asyncio.wait_for(
                     asyncio.gather(
                         *(attempt.done.wait() for attempt in attempts),
                     ),
-                    timeout=timeout_ms / 1000,
+                    timeout=remaining,
                 )
             except asyncio.TimeoutError:
                 pass
@@ -1145,12 +1253,26 @@ class LifecycleController:
         """Fence one unfinished attempt without waiting for its handler."""
         if self._outbound_attempts.get(attempt.delivery_id) is not attempt:
             return
+        was_provisional = attempt.provisional
         attempt.forced_reason = reason_code
+        attempt.provisional = False
+        attempt.terminal_result = None
+        attempt.send_params = None
         self._outbound_delivery_states[
             attempt.delivery_id
         ] = DeliveryState.UNKNOWN
         self._complete_outbound_attempt_locked(attempt)
-        if cancel and not attempt.task.done():
+        if (cancel or was_provisional) and not attempt.task.done():
+            attempt.task.cancel()
+
+    @staticmethod
+    def _expire_outbound_drain(attempt: _OutboundAttempt) -> None:
+        """Fence and interrupt one drain cohort at its absolute deadline."""
+        if attempt.done.is_set():
+            return
+        if attempt.forced_reason is None:
+            attempt.forced_reason = "DRAIN_TIMEOUT"
+        if not attempt.task.done():
             attempt.task.cancel()
 
     def _outbound_target_error(self) -> RpcError:
@@ -1187,17 +1309,65 @@ class LifecycleController:
         """Unregister the endpoint for this generation."""
         async with self._lock:
             self._check_identity(params)
-            await self._unregister_endpoint_locked()
-            return {"status": "unregistered", "generation": self.generation}
+            endpoint_hook = self._detach_endpoint_locked()
+        self._schedule_endpoint_hook(endpoint_hook)
+        return {"status": "unregistered", "generation": self.generation}
 
-    async def _unregister_endpoint_locked(self) -> None:
-        """Clear the endpoint and invoke the unregister hook once if needed."""
+    def _detach_endpoint_locked(self) -> Any:
+        """Clear routing state and return optional best-effort hook work."""
         had_endpoint = self.endpoint is not None
         self.endpoint = None
-        if had_endpoint and self._endpoint_handler is not None:
-            result = self._endpoint_handler("unregister", None)
-            if hasattr(result, "__await__"):
-                await result
+        if not had_endpoint:
+            return None
+        if self._endpoint_registry_handler is not None:
+            self._endpoint_registry_handler("unregister", None)
+        endpoint_handler = self._endpoint_handler
+        if endpoint_handler is None:
+            return None
+
+        async def notify_endpoint_handler() -> None:
+            """Invoke unregister cleanup after releasing the state lock."""
+            try:
+                result = endpoint_handler("unregister", None)
+                if hasattr(result, "__await__"):
+                    await result
+            except Exception:
+                return
+
+        return notify_endpoint_handler()
+
+    @staticmethod
+    def _consume_endpoint_hook(task: asyncio.Future[Any]) -> None:
+        """Consume completion of a detached best-effort endpoint hook."""
+        if task.cancelled():
+            return
+        try:
+            task.exception()
+        except Exception:
+            return
+
+    def _schedule_endpoint_hook(self, result: Any) -> None:
+        """Run a detached endpoint hook without blocking lifecycle state."""
+        if not hasattr(result, "__await__"):
+            return
+        task = asyncio.ensure_future(result)
+        task.add_done_callback(self._consume_endpoint_hook)
+
+    async def _wait_for_endpoint_hook(
+        self,
+        result: Any,
+        deadline: float,
+    ) -> None:
+        """Wait for unregister only within the quiesce drain deadline."""
+        if not hasattr(result, "__await__"):
+            return
+        task = asyncio.ensure_future(result)
+        task.add_done_callback(self._consume_endpoint_hook)
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining > 0:
+            await asyncio.wait({task}, timeout=remaining)
+        if not task.done():
+            task.cancel()
 
     async def host_state_get(self, params: HostStateParams) -> dict[str, Any]:
         """Read instance-scoped host state."""
@@ -1309,6 +1479,8 @@ class LifecycleController:
                     data={"reason_code": "STANDBY_ENDPOINT_FORBIDDEN"},
                 )
             self.endpoint = params
+            if self._endpoint_registry_handler is not None:
+                self._endpoint_registry_handler(operation, params)
             if self._endpoint_handler is not None:
                 result = self._endpoint_handler(operation, params)
                 if hasattr(result, "__await__"):
@@ -1347,7 +1519,7 @@ class LifecycleController:
                     cancel=False,
                 )
             if had_endpoint:
-                await self._unregister_endpoint_locked()
+                self._schedule_endpoint_hook(self._detach_endpoint_locked())
 
     @staticmethod
     def _ensure_json_value(value: object) -> None:
@@ -1396,11 +1568,17 @@ class LifecycleController:
         )
         peer.register_method(
             "channel.send",
-            lambda params, _: self.send(params),
+            lambda params, _: self.send(
+                params,
+                defer_response_publication=True,
+            ),
         )
         peer.register_method(
             "channel.reaction",
-            lambda params, _: self.reaction(params),
+            lambda params, _: self.reaction(
+                params,
+                defer_response_publication=True,
+            ),
         )
 
 

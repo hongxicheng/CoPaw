@@ -106,6 +106,36 @@ async def test_unknown_method_and_duplicate_response() -> None:
 
 
 @pytest.mark.asyncio
+async def test_null_id_error_never_resolves_a_pending_request() -> None:
+    """An uncorrelated JSON-RPC error cannot complete a normal call."""
+    left_transport, right_transport = _transport_pair()
+    core = RpcPeer(left_transport)
+    runner = RpcPeer(right_transport)
+    started = asyncio.Event()
+
+    async def never_respond(_: object, __: object) -> None:
+        """Keep one correlated request pending for the null-ID response."""
+        started.set()
+        await asyncio.Future()
+
+    runner.register_method("never.respond", never_respond)
+    await asyncio.gather(core.start(), runner.start())
+    pending = asyncio.create_task(core.call("never.respond", timeout=1.0))
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    await right_transport.send(
+        '{"jsonrpc":"2.0","id":null,"error":'
+        '{"code":-32700,"message":"Parse error"}}',
+    )
+    await asyncio.sleep(0)
+    assert not pending.done()
+    assert core.duplicate_responses == 1
+    pending.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await pending
+    await asyncio.gather(core.aclose(), runner.aclose())
+
+
+@pytest.mark.asyncio
 async def test_pending_limit_timeout_and_cancel_notification() -> None:
     """The peer bounds pending calls and emits cancellation on timeout."""
     left_transport, right_transport = _transport_pair()

@@ -66,6 +66,45 @@ class MemoryTransport:
             await self.peer.inbox.put(None)
 
 
+class BlockingSendResponseTransport(MemoryTransport):
+    """Block the acknowledged response for one outbound RPC request."""
+
+    def __init__(self, request_id: str) -> None:
+        super().__init__()
+        self.request_id = request_id
+        self.response_started = asyncio.Event()
+        self.release_response = asyncio.Event()
+
+    async def send(self, message: str) -> None:
+        """Pause only the selected successful response publication."""
+        if (
+            f'"id":"{self.request_id}"' in message
+            and '"state":"acknowledged"' in message
+        ):
+            self.response_started.set()
+            await self.release_response.wait()
+        await super().send(message)
+
+
+class FailingSendResponseTransport(MemoryTransport):
+    """Fail the acknowledged response for one outbound RPC request."""
+
+    def __init__(self, request_id: str) -> None:
+        super().__init__()
+        self.request_id = request_id
+        self.response_failed = asyncio.Event()
+
+    async def send(self, message: str) -> None:
+        """Raise once the selected successful response is published."""
+        if (
+            f'"id":"{self.request_id}"' in message
+            and '"state":"acknowledged"' in message
+        ):
+            self.response_failed.set()
+            raise ConnectionError("response write failed")
+        await super().send(message)
+
+
 def _transport_pair() -> tuple[MemoryTransport, MemoryTransport]:
     """Create two linked memory transports."""
     left = MemoryTransport()
@@ -132,6 +171,24 @@ def _hello() -> HelloParams:
                 "reaction",
                 "streaming",
             ],
+        },
+    )
+
+
+def _endpoint() -> EndpointParams:
+    """Return one loopback Runner-owned endpoint fixture."""
+    return EndpointParams.from_mapping(
+        {
+            **_identity(),
+            "protocol": "http",
+            "host": "127.0.0.1",
+            "port": 8080,
+            "path": "/voice",
+            "public_base_url": None,
+            "readiness": "ready",
+            "bound_externally": False,
+            "auth_required": False,
+            "quiescing": False,
         },
     )
 
@@ -583,6 +640,98 @@ async def test_lease_expiry_removes_core_endpoint_registry() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["quiesce", "stop"])
+async def test_shutdown_detaches_endpoint_before_blocked_hook(
+    operation: str,
+) -> None:
+    """Endpoint cleanup cannot delay lifecycle fencing or Core removal."""
+    clock = Clock()
+    hook_started = asyncio.Event()
+
+    async def blocked_hook(_: str, __: EndpointParams | None) -> None:
+        """Model external unregister cleanup with no natural deadline."""
+        hook_started.set()
+        await asyncio.Future()
+
+    controller = LifecycleController(
+        channel_key="voice",
+        instance_id="instance-1",
+        generation=7,
+        environment_spec_id="ches1_" + "1" * 64,
+        environment_id="ches1_" + "1" * 64 + ".install1_" + "2" * 32,
+        capabilities=("ingress_endpoint",),
+        endpoint_handler=blocked_hook,
+        clock_ms=clock,
+    )
+    adapter = CoreLifecycleAdapter(controller)
+    await _activate_outbound_controller(controller, ["ingress_endpoint"])
+    await adapter.endpoint_register(_endpoint())
+    assert adapter.endpoints
+    if operation == "quiesce":
+        result = await asyncio.wait_for(
+            controller.quiesce(
+                QuiesceParams.from_mapping(
+                    {**_identity(), "drain_timeout_ms": 10},
+                ),
+            ),
+            timeout=0.1,
+        )
+        assert result["state"] == "quiescing"
+    else:
+        result = await asyncio.wait_for(
+            controller.stop(IdentityParams.from_mapping(_identity())),
+            timeout=0.1,
+        )
+        assert result["state"] == "stopped"
+    await asyncio.wait_for(hook_started.wait(), timeout=0.1)
+    assert controller.endpoint is None
+    assert not adapter.endpoints
+
+
+@pytest.mark.asyncio
+async def test_endpoint_unregister_hook_can_reenter_lifecycle() -> None:
+    """Unregister callbacks run after releasing the lifecycle lock."""
+    clock = Clock()
+    callback_state: list[str] = []
+    controller: LifecycleController
+
+    async def reentrant_hook(
+        operation: str,
+        _: EndpointParams | None,
+    ) -> None:
+        """Read lifecycle health from an unregister callback."""
+        if operation == "unregister":
+            health = await controller.health(
+                IdentityParams.from_mapping(_identity()),
+            )
+            callback_state.append(health["state"])
+
+    controller = LifecycleController(
+        channel_key="voice",
+        instance_id="instance-1",
+        generation=7,
+        environment_spec_id="ches1_" + "1" * 64,
+        environment_id="ches1_" + "1" * 64 + ".install1_" + "2" * 32,
+        capabilities=("ingress_endpoint",),
+        endpoint_handler=reentrant_hook,
+        clock_ms=clock,
+    )
+    adapter = CoreLifecycleAdapter(controller)
+    await _activate_outbound_controller(controller, ["ingress_endpoint"])
+    await adapter.endpoint_register(_endpoint())
+    result = await asyncio.wait_for(
+        controller.quiesce(
+            QuiesceParams.from_mapping(
+                {**_identity(), "drain_timeout_ms": 20},
+            ),
+        ),
+        timeout=0.1,
+    )
+    assert result["state"] == "quiescing"
+    assert callback_state == ["quiescing"]
+
+
+@pytest.mark.asyncio
 async def test_core_host_state_put_linearizes_before_stop() -> None:
     """A blocked state write holds the lifecycle lock across Store mutation."""
     clock = Clock()
@@ -699,6 +848,45 @@ async def _activate_outbound_controller(
     )
     await controller.activate(lease)
     await controller.commit(lease)
+
+
+async def _active_outbound_rpc_pair(
+    right_transport: MemoryTransport,
+    capabilities: list[str],
+) -> tuple[LifecycleController, RpcPeer, RpcPeer]:
+    """Create one active RPC pair for outbound publication tests."""
+    left_transport = MemoryTransport()
+    left_transport.peer = right_transport
+    right_transport.peer = left_transport
+    core = RpcPeer(left_transport)
+    runner = RpcPeer(right_transport)
+    controller = LifecycleController(
+        channel_key="voice",
+        instance_id="instance-1",
+        generation=7,
+        environment_spec_id="ches1_" + "1" * 64,
+        environment_id="ches1_" + "1" * 64 + ".install1_" + "2" * 32,
+        capabilities=tuple(capabilities),
+        clock_ms=Clock(),
+    )
+    controller.register_rpc_methods(runner)
+    CoreLifecycleAdapter(controller).register_rpc_methods(core)
+    await asyncio.gather(core.start(), runner.start())
+    await runner.call("runner.hello", _hello().to_mapping())
+    await core.call(
+        "channel.prepare",
+        {
+            **_identity(),
+            "host_context": {},
+            "capabilities": capabilities,
+        },
+    )
+    lease = LeaseParams.from_mapping(
+        {**_identity(), "lease_token": "publication", "lease_ttl_ms": 100},
+    )
+    await core.call("channel.activate", lease.to_mapping())
+    await core.call("channel.commit", lease.to_mapping())
+    return controller, core, runner
 
 
 @pytest.mark.asyncio
@@ -1294,6 +1482,69 @@ async def test_quiesce_honors_zero_drain_timeout() -> None:
 
 
 @pytest.mark.asyncio
+async def test_quiesce_deadline_prevents_late_ack_commit() -> None:
+    """An attempt waiting on the state lock cannot ACK after deadline."""
+    clock = Clock()
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def finishing_send(params: SendParams) -> dict[str, object]:
+        """Finish platform work while finalization is lock-blocked."""
+        started.set()
+        await release.wait()
+        return {
+            "delivery_id": params.delivery_id,
+            "state": "acknowledged",
+        }
+
+    controller = LifecycleController(
+        channel_key="voice",
+        instance_id="instance-1",
+        generation=7,
+        environment_spec_id="ches1_" + "1" * 64,
+        environment_id="ches1_" + "1" * 64 + ".install1_" + "2" * 32,
+        capabilities=("media",),
+        send_handler=finishing_send,
+        clock_ms=clock,
+    )
+    await _activate_outbound_controller(controller, ["media"])
+    sending = asyncio.create_task(
+        controller.send(
+            SendParams.from_mapping(
+                {
+                    **_identity(),
+                    "delivery_id": "deadline-send",
+                    "to_handle": "chat-1",
+                    "content_parts": [{"type": "text", "text": "hello"}],
+                },
+            ),
+        ),
+    )
+    await started.wait()
+    quiescing = asyncio.create_task(
+        controller.quiesce(
+            QuiesceParams.from_mapping(
+                {**_identity(), "drain_timeout_ms": 10},
+            ),
+        ),
+    )
+    while controller.state is not RunnerState.QUIESCING:
+        await asyncio.sleep(0)
+    await controller._lock.acquire()
+    release.set()
+    await asyncio.sleep(0.03)
+    controller._lock.release()
+    with pytest.raises(asyncio.CancelledError):
+        await sending
+    assert (
+        controller._outbound_delivery_states["deadline-send"].value
+        == "unknown"
+    )
+    assert (await quiescing)["state"] == "quiescing"
+    assert "deadline-send" not in controller._outbound_targets
+
+
+@pytest.mark.asyncio
 async def test_swallowed_send_cancel_stays_unknown() -> None:
     """Explicit cancellation wins over a handler's late ACK result."""
     clock = Clock()
@@ -1363,6 +1614,159 @@ async def test_swallowed_send_cancel_stays_unknown() -> None:
     with pytest.raises(RpcError) as duplicate:
         await core.call("channel.send", payload)
     assert duplicate.value.data["reason_code"] == ("OUTBOUND_ORDER_VIOLATION")
+    await asyncio.gather(core.aclose(), runner.aclose())
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_response_publication_rolls_back_ack() -> None:
+    """Cancellation before response publication retracts ACK ordering."""
+    right_transport = BlockingSendResponseTransport("rpc-4")
+    controller, core, runner = await _active_outbound_rpc_pair(
+        right_transport,
+        ["media"],
+    )
+    payload = {
+        **_identity(),
+        "delivery_id": "publication-send",
+        "to_handle": "chat-1",
+        "content_parts": [{"type": "text", "text": "hello"}],
+    }
+    request = asyncio.create_task(core.call("channel.send", payload))
+    await asyncio.wait_for(
+        right_transport.response_started.wait(),
+        timeout=1.0,
+    )
+    await core.notify(
+        "request.cancel",
+        {"request_id": "rpc-4", "reason": "user_cancelled"},
+    )
+    with pytest.raises(RpcError) as cancelled:
+        await request
+    assert cancelled.value.data["reason_code"] == "REQUEST_CANCELLED"
+    assert (
+        controller._outbound_delivery_states["publication-send"].value
+        == "unknown"
+    )
+    assert "publication-send" not in controller._outbound_targets
+    with pytest.raises(RpcError) as duplicate:
+        await core.call("channel.send", payload)
+    assert duplicate.value.data["reason_code"] == ("OUTBOUND_ORDER_VIOLATION")
+    right_transport.release_response.set()
+    await asyncio.gather(core.aclose(), runner.aclose())
+
+
+@pytest.mark.asyncio
+async def test_publication_cancel_preserves_outbound_order() -> None:
+    """Unpublished updates and reactions leave no ordering side effects."""
+    right_transport = BlockingSendResponseTransport("rpc-5")
+    controller, core, runner = await _active_outbound_rpc_pair(
+        right_transport,
+        ["reaction", "streaming"],
+    )
+    await core.call(
+        "channel.send",
+        {
+            **_identity(),
+            "delivery_id": "published-stream",
+            "to_handle": "chat-1",
+            "operation": "stream.start",
+            "stream_type": "message",
+            "sequence": 0,
+            "accumulated_text": "",
+        },
+    )
+    delta = asyncio.create_task(
+        core.call(
+            "channel.send",
+            {
+                **_identity(),
+                "delivery_id": "unpublished-delta",
+                "to_handle": "chat-1",
+                "operation": "stream.delta",
+                "target_delivery_id": "published-stream",
+                "stream_type": "message",
+                "sequence": 1,
+                "accumulated_text": "hello",
+            },
+        ),
+    )
+    await asyncio.wait_for(
+        right_transport.response_started.wait(),
+        timeout=1.0,
+    )
+    await core.notify(
+        "request.cancel",
+        {"request_id": "rpc-5", "reason": "user_cancelled"},
+    )
+    with pytest.raises(RpcError):
+        await delta
+    target = controller._outbound_targets["published-stream"]
+    assert target["sequence"] == 0
+    right_transport.release_response.set()
+
+    right_transport.request_id = "rpc-6"
+    right_transport.response_started = asyncio.Event()
+    right_transport.release_response = asyncio.Event()
+    reaction = asyncio.create_task(
+        core.call(
+            "channel.reaction",
+            {
+                **_identity(),
+                "delivery_id": "unpublished-reaction",
+                "to_handle": "chat-1",
+                "target_delivery_id": "published-stream",
+                "reaction": "completed",
+            },
+        ),
+    )
+    await asyncio.wait_for(
+        right_transport.response_started.wait(),
+        timeout=1.0,
+    )
+    await core.notify(
+        "request.cancel",
+        {"request_id": "rpc-6", "reason": "user_cancelled"},
+    )
+    with pytest.raises(RpcError):
+        await reaction
+    assert (
+        controller._outbound_delivery_states["unpublished-reaction"].value
+        == "unknown"
+    )
+    assert controller._outbound_targets["published-stream"] is target
+    right_transport.release_response.set()
+    await asyncio.gather(core.aclose(), runner.aclose())
+
+
+@pytest.mark.asyncio
+async def test_response_write_failure_converges_outbound_to_unknown() -> None:
+    """A failed response publication never leaves an acknowledged target."""
+    right_transport = FailingSendResponseTransport("rpc-4")
+    controller, core, runner = await _active_outbound_rpc_pair(
+        right_transport,
+        ["media"],
+    )
+    request = asyncio.create_task(
+        core.call(
+            "channel.send",
+            {
+                **_identity(),
+                "delivery_id": "failed-publication",
+                "to_handle": "chat-1",
+                "content_parts": [{"type": "text", "text": "hello"}],
+            },
+            timeout=0.02,
+        ),
+    )
+    await asyncio.wait_for(right_transport.response_failed.wait(), timeout=1.0)
+    with pytest.raises(RpcError) as failed:
+        await request
+    assert failed.value.data["reason_code"] == "INTERNAL_ERROR"
+    assert (
+        controller._outbound_delivery_states["failed-publication"].value
+        == "unknown"
+    )
+    assert "failed-publication" not in controller._outbound_targets
     await asyncio.gather(core.aclose(), runner.aclose())
 
 

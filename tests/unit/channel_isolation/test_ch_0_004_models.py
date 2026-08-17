@@ -72,6 +72,24 @@ def test_rpc_error_uses_integer_code_and_stable_reason_data() -> None:
     }
 
 
+def test_rpc_parse_error_allows_only_error_response_null_id() -> None:
+    """Only uncorrelated JSON-RPC errors may carry a null response ID."""
+    response = RpcResponse.from_mapping(
+        {
+            "jsonrpc": "2.0",
+            "id": None,
+            "error": {"code": -32700, "message": "Parse error"},
+        },
+    )
+    assert response.id is None
+    assert response.to_mapping()["id"] is None
+    with pytest.raises(ProtocolValidationError) as invalid_success:
+        RpcResponse.from_mapping(
+            {"jsonrpc": "2.0", "id": None, "result": None},
+        )
+    assert invalid_success.value.reason_code == "SCHEMA_MISMATCH"
+
+
 def test_host_context_requires_cross_platform_absolute_media_path() -> None:
     """The media work directory is absolute on POSIX and Windows forms."""
     assert (

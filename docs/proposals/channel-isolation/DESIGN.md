@@ -428,6 +428,9 @@ v1 只允许一个 Header：`Content-Length`。Header 大小、帧大小、读�
 
 - 使用 JSON-RPC 2.0 request、response 和 notification；
 - request 的 `id` 为字符串或整数，不使用 null；
+- 与正常 request 关联的 response 继续使用同一个字符串或整数 `id`；只有 parse error
+  无法恢复 request ID 时，error response 才按 JSON-RPC 2.0 使用 `id=null`。`id=null`
+  的 error 不得匹配任何 pending request，success response 不得使用 `id=null`；
 - 一个 request 只能有一个 response；
 - notification 不需要 response，不用于要求可靠 ACK 的事件；
 - 方法名使用 `runner.*`、`channel.*`、`event.*`、`delivery.*`、`ingress.*`、
@@ -509,6 +512,10 @@ stop 或 generation 撤销关闭新准入并推进 epoch；不属于 quiesce dra
 不得在撤销后提交 ACK，而应收敛为 `unknown`。request cancel 是独立于 handler 异常传播的
 协议事实；即使 handler 捕获 `CancelledError` 并返回 ACK，或取消发生在 handler 返回后的
 结果提交阶段，attempt 仍必须先完成不可中断的 `unknown` 清理，不能停留在 `sending`。
+对于 `channel.send` 和 `channel.reaction`，handler 结果在 JSON-RPC response 成功写入前只
+是 provisional：此时不得最终建立 target 或推进 stream sequence。response publication
+期间收到 cancel，或 response 写入失败时，attempt 必须收敛为 `unknown`；只有 response
+成功写入后才能提交 ACK 及 ordering 状态。
 
 `channel.reaction` 使用独立的 closed `ReactionParams`，包含 identity、唯一
 `delivery_id`、`to_handle`、`target_delivery_id` 和 `reaction`。v1 只允许
@@ -558,6 +565,10 @@ expiry 内正常提交。`channel.quiesce` 必须先原子进入 `quiescing`、�
 的 attempt 收敛为 `unknown`，方法不得无限等待。`channel.stop` 同样不得被永久阻塞的平台
 handler 卡住；它先进入 `stopped` 并将未确定 attempt 收敛为 `unknown`，进程级 terminate/
 kill 仍由 Core 按 §13.3 的关闭流程执行。
+endpoint 的路由登记必须在 quiesce/stop/lease fencing 的生命周期临界区内同步摘除；可能
+阻塞或发起反向 RPC 的平台 unregister hook 在锁外执行，并受同一 drain deadline 或
+best-effort 语义约束，不得延迟状态转换。drain cohort 使用绝对 monotonic deadline；一旦
+deadline 到达，即使 attempt 正在等待生命周期锁，也不得再提交 ACK、target 或 sequence。
 
 provisional lease 不单列为生命周期状态；Runner 在收到 `channel.commit` 前仍对外表现为
 `standby`。它可以完成连接预热和资源准备，但不能绑定正式 ingress、消费平台事件或
