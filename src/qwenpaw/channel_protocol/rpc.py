@@ -8,6 +8,7 @@ import contextlib
 import inspect
 import json
 from collections.abc import Callable, Mapping
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any
 
@@ -104,6 +105,36 @@ class _PendingRequest:
     timeout: float
 
 
+@dataclass
+class _RequestCancellation:
+    """Track cancellation independently from task exception handling."""
+
+    requested: bool = False
+
+
+@dataclass
+class _IncomingRequest:
+    """Bind one inbound request task to its cancellation state."""
+
+    task: asyncio.Task[Any]
+    cancellation: _RequestCancellation
+
+
+_CURRENT_CANCELLATION: ContextVar[_RequestCancellation | None] = ContextVar(
+    "channel_protocol_request_cancellation",
+    default=None,
+)
+
+
+def request_was_cancelled() -> bool:
+    """Return whether the current request or task was cancelled."""
+    cancellation = _CURRENT_CANCELLATION.get()
+    if cancellation is not None and cancellation.requested:
+        return True
+    task = asyncio.current_task()
+    return task is not None and task.cancelling() > 0
+
+
 class RpcPeer:
     """Run a continuously reading, bidirectional JSON-RPC peer."""
 
@@ -118,7 +149,7 @@ class RpcPeer:
         self._handlers: dict[str, RequestHandler] = {}
         self._notification_handlers: dict[str, NotificationHandler] = {}
         self._pending: dict[str | int, _PendingRequest] = {}
-        self._incoming: dict[str | int, asyncio.Task[Any]] = {}
+        self._incoming: dict[str | int, _IncomingRequest] = {}
         self._request_counter = 0
         self._reader_task: asyncio.Task[None] | None = None
         self._closed = False
@@ -315,8 +346,14 @@ class RpcPeer:
             task = asyncio.create_task(self._dispatch_notification(message))
             task.add_done_callback(self._consume_task_exception)
             return
-        task = asyncio.create_task(self._dispatch_request(message))
-        self._incoming[message.id] = task
+        cancellation = _RequestCancellation()
+        task = asyncio.create_task(
+            self._dispatch_request(message, cancellation),
+        )
+        self._incoming[message.id] = _IncomingRequest(
+            task=task,
+            cancellation=cancellation,
+        )
         task.add_done_callback(self._request_callback(message.id))
 
     def _request_callback(
@@ -350,22 +387,29 @@ class RpcPeer:
         else:
             pending.future.set_result(response.result)
 
-    async def _dispatch_request(self, request: RpcRequest) -> None:
+    async def _dispatch_request(
+        self,
+        request: RpcRequest,
+        cancellation: _RequestCancellation,
+    ) -> None:
         """Run one request handler and return exactly one response."""
-        handler = self._handlers.get(request.method)
-        if handler is None:
-            await self._send_error(
-                request.id,
-                JSONRPC_METHOD_NOT_FOUND,
-                "method not found",
-                data={"reason_code": "METHOD_NOT_FOUND"},
-            )
-            return
+        token = _CURRENT_CANCELLATION.set(cancellation)
         try:
+            handler = self._handlers.get(request.method)
+            if handler is None:
+                await self._send_error(
+                    request.id,
+                    JSONRPC_METHOD_NOT_FOUND,
+                    "method not found",
+                    data={"reason_code": "METHOD_NOT_FOUND"},
+                )
+                return
             params = validate_method_params(request.method, request.params)
             result = handler(params, request)
             if inspect.isawaitable(result):
                 result = await result
+            if cancellation.requested:
+                raise asyncio.CancelledError
             await self._send(RpcResponse(request.id, result=result))
         except ProtocolValidationError as exc:
             await self._send_error(
@@ -396,6 +440,8 @@ class RpcPeer:
                 data={"reason_code": "INTERNAL_ERROR"},
             )
             _ = exc
+        finally:
+            _CURRENT_CANCELLATION.reset(token)
 
     async def _dispatch_notification(
         self,
@@ -422,9 +468,10 @@ class RpcPeer:
             cancel = CancelParams.from_mapping(params)
         except ProtocolValidationError:
             return
-        task = self._incoming.get(cancel.request_id)
-        if task is not None and not task.done():
-            task.cancel()
+        incoming = self._incoming.get(cancel.request_id)
+        if incoming is not None and not incoming.task.done():
+            incoming.cancellation.requested = True
+            incoming.task.cancel()
             return
 
         pending = self._pending.get(cancel.request_id)
@@ -485,8 +532,10 @@ class RpcPeer:
                 return
             self._closed = True
             current = asyncio.current_task()
-            for task in self._incoming.values():
+            for incoming in self._incoming.values():
+                task = incoming.task
                 if task is not current and not task.done():
+                    incoming.cancellation.requested = True
                     task.cancel()
             self._incoming.clear()
             await self._fail_pending()
@@ -500,6 +549,7 @@ __all__ = [
     "JSONRPC_INTERNAL_ERROR",
     "JSONRPC_METHOD_NOT_FOUND",
     "JSONRPC_PARSE_ERROR",
+    "request_was_cancelled",
     "RpcLimits",
     "RpcPeer",
 ]

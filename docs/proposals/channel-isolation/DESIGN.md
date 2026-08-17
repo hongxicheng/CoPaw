@@ -502,6 +502,14 @@ Schema mismatch。Runner 在交给可能产生平台副作用的 handler 前占�
 收敛为 `unknown`，不得以相同 ID 重入。只有 `acknowledged` 结果才能建立后续 target 或推进
 stream sequence；`failed`、`timeout` 和 `unknown` 不得成为 update/reaction target。
 
+出站 attempt 的准入和结果提交是生命周期短临界区；平台 handler 在临界区外执行，不得跨
+handler await 阻塞 `channel.lease_renew` 或 Runner→Core 反向 RPC。attempt 开始时记录当前
+generation 的 fencing epoch；正常续租只延长 expiry，不改变 epoch。lease 过期、quiesce、
+stop 或 generation 撤销关闭新准入并推进 epoch；不属于 quiesce drain cohort 的旧 attempt
+不得在撤销后提交 ACK，而应收敛为 `unknown`。request cancel 是独立于 handler 异常传播的
+协议事实；即使 handler 捕获 `CancelledError` 并返回 ACK，或取消发生在 handler 返回后的
+结果提交阶段，attempt 仍必须先完成不可中断的 `unknown` 清理，不能停留在 `sending`。
+
 `channel.reaction` 使用独立的 closed `ReactionParams`，包含 identity、唯一
 `delivery_id`、`to_handle`、`target_delivery_id` 和 `reaction`。v1 只允许
 `reaction=completed`，目标必须是先前成功接收的 `message.create` 或 `stream.start`；
@@ -542,6 +550,14 @@ generation、不可猜测 lease token 和 `lease_ttl_ms`；Core 使用
 IPC 断开、token 不匹配或 lease 过期后 Runner 必须停止消费，并拒绝旧 generation 的
 state、event 和 delivery 写入。`channel.quiesce` 停止新入站和新发送、排空有界工作并
 导出 checkpoint；`channel.stop` 可从任一非终态进入 `stopped`。
+
+`channel.lease_renew` 到达 Runner 后不得排在慢平台 handler 之后；只要它在原 lease 过期
+前取得生命周期临界区并通过 token/generation 校验，就更新 expiry，且既有 attempt 可在新
+expiry 内正常提交。`channel.quiesce` 必须先原子进入 `quiescing`、撤销 endpoint/lease 并
+关闭新准入，再最多等待 `drain_timeout_ms`；deadline 内完成的既有 attempt 可提交结果，超时
+的 attempt 收敛为 `unknown`，方法不得无限等待。`channel.stop` 同样不得被永久阻塞的平台
+handler 卡住；它先进入 `stopped` 并将未确定 attempt 收敛为 `unknown`，进程级 terminate/
+kill 仍由 Core 按 §13.3 的关闭流程执行。
 
 provisional lease 不单列为生命周期状态；Runner 在收到 `channel.commit` 前仍对外表现为
 `standby`。它可以完成连接预热和资源准备，但不能绑定正式 ingress、消费平台事件或
@@ -1529,6 +1545,9 @@ environment 已不匹配时，必须停止并报告 `repair_required`，不能�
   Runner 进入 `preparing` 后、返回 prepare response 前发起一次消费。消费尝试开始即失效，
   无论成功或失败都不得复用；prepare 结束后也不得保存在 standby/active 的 host context、
   日志、诊断或持久状态中。
+- `request.cancel` 是 prepare attempt 的独立协议状态，不能依赖 secret consumer 是否重新
+  抛出取消异常。即使 consumer/sink 捕获取消并正常返回，Runner 也必须在提交 host context
+  和 `standby` 前检测取消，将 prepare 收敛到 `failed`，同时保持 handle 已消费且不可复用。
 - 未知、跨 generation 或没有可用 consumer 的 handle 返回 `SECRET_HANDLE_INVALID`；已经
   消费、过期或重复使用返回 `SECRET_HANDLE_CONSUMED`。handle 解析成功但平台凭证无效仍
   返回 `PLATFORM_AUTH_FAILED`，不得混淆为 handle 错误。Phase 0 允许使用只存在于测试进程

@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 """Tests for CH-0-004 Runner lifecycle and fencing."""
 
+# pylint: disable=protected-access
+
 from __future__ import annotations
 
 import asyncio
@@ -905,8 +907,8 @@ async def test_outbound_capability_bindings_use_effective_set() -> None:
 
 
 @pytest.mark.asyncio
-async def test_stop_waits_for_inflight_outbound_side_effect() -> None:
-    """Stop linearizes after an outbound handler already in progress."""
+async def test_stop_fences_inflight_outbound_without_waiting() -> None:
+    """Stop returns without waiting for an unbounded platform handler."""
     clock = Clock()
     started = asyncio.Event()
     release = asyncio.Event()
@@ -948,10 +950,13 @@ async def test_stop_waits_for_inflight_outbound_side_effect() -> None:
         controller.stop(IdentityParams.from_mapping(_identity())),
     )
     await asyncio.sleep(0)
-    assert not stop.done()
-    release.set()
-    assert (await send)["state"] == "acknowledged"
+    assert stop.done()
     assert (await stop)["state"] == "stopped"
+    with pytest.raises(asyncio.CancelledError):
+        await send
+    delivery_states = controller._outbound_delivery_states
+    assert delivery_states["blocked-send"].value == "unknown"
+    release.set()
     with pytest.raises(RpcError) as stopped:
         await controller.send(
             SendParams.from_mapping(
@@ -1008,7 +1013,8 @@ async def test_lease_expiry_linearizes_after_inflight_send() -> None:
         controller.health(IdentityParams.from_mapping(_identity())),
     )
     await asyncio.sleep(0)
-    assert not health.done()
+    assert health.done()
+    assert (await health)["state"] == "failed"
     release.set()
     result = await sending
     assert result == {
@@ -1017,7 +1023,6 @@ async def test_lease_expiry_linearizes_after_inflight_send() -> None:
         "reason_code": "LEASE_EXPIRED",
         "retryable": False,
     }
-    assert (await health)["state"] == "failed"
     with pytest.raises(RpcError) as duplicate:
         await controller.send(params)
     assert duplicate.value.data["reason_code"] == "INVALID_STATE_TRANSITION"
@@ -1106,6 +1111,313 @@ async def test_cancelled_and_timed_out_send_ids_cannot_repeat() -> None:
         )
         assert calls == 1
         await asyncio.gather(core.aclose(), runner.aclose())
+
+
+@pytest.mark.asyncio
+async def test_timely_lease_renewal_is_not_blocked_by_slow_send() -> None:
+    """A renewal received before expiry proceeds during platform I/O."""
+    clock = Clock()
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def blocked_send(params: SendParams) -> dict[str, object]:
+        """Hold platform I/O across the original lease deadline."""
+        started.set()
+        await release.wait()
+        return {
+            "delivery_id": params.delivery_id,
+            "state": "acknowledged",
+        }
+
+    controller = LifecycleController(
+        channel_key="voice",
+        instance_id="instance-1",
+        generation=7,
+        environment_spec_id="ches1_" + "1" * 64,
+        environment_id="ches1_" + "1" * 64 + ".install1_" + "2" * 32,
+        capabilities=("media",),
+        send_handler=blocked_send,
+        clock_ms=clock,
+    )
+    await _activate_outbound_controller(controller, ["media"])
+    sending = asyncio.create_task(
+        controller.send(
+            SendParams.from_mapping(
+                {
+                    **_identity(),
+                    "delivery_id": "renewed-send",
+                    "to_handle": "chat-1",
+                    "content_parts": [{"type": "text", "text": "hello"}],
+                },
+            ),
+        ),
+    )
+    await started.wait()
+    clock.now = 1050
+    renewed = await controller.lease_renew(
+        LeaseParams.from_mapping(
+            {
+                **_identity(),
+                "lease_token": "outbound",
+                "lease_ttl_ms": 100,
+            },
+        ),
+    )
+    assert renewed["lease_expires_at_ms"] == 1150
+    clock.now = 1110
+    release.set()
+    assert (await sending)["state"] == "acknowledged"
+    assert controller.state is RunnerState.ACTIVE
+
+
+@pytest.mark.asyncio
+async def test_send_handler_can_call_reverse_host_state_rpc() -> None:
+    """Platform handlers can call Core-owned methods without lock cycles."""
+    clock = Clock()
+    left_transport, right_transport = _transport_pair()
+    core = RpcPeer(left_transport)
+    runner = RpcPeer(right_transport)
+
+    async def send_with_state(params: SendParams) -> dict[str, object]:
+        """Write Core-owned state before acknowledging the platform send."""
+        await runner.call(
+            "host.state.put",
+            {
+                **_identity(),
+                "key": "reverse-send",
+                "value": {"delivery_id": params.delivery_id},
+            },
+        )
+        return {
+            "delivery_id": params.delivery_id,
+            "state": "acknowledged",
+        }
+
+    controller = LifecycleController(
+        channel_key="voice",
+        instance_id="instance-1",
+        generation=7,
+        environment_spec_id="ches1_" + "1" * 64,
+        environment_id="ches1_" + "1" * 64 + ".install1_" + "2" * 32,
+        capabilities=("host_state",),
+        send_handler=send_with_state,
+        clock_ms=clock,
+    )
+    controller.register_rpc_methods(runner)
+    adapter = CoreLifecycleAdapter(controller)
+    adapter.register_rpc_methods(core)
+    await asyncio.gather(core.start(), runner.start())
+    await runner.call("runner.hello", _hello().to_mapping())
+    await core.call(
+        "channel.prepare",
+        {
+            **_identity(),
+            "host_context": {},
+            "capabilities": ["host_state"],
+        },
+    )
+    lease = LeaseParams.from_mapping(
+        {**_identity(), "lease_token": "reverse", "lease_ttl_ms": 100},
+    )
+    await core.call("channel.activate", lease.to_mapping())
+    await core.call("channel.commit", lease.to_mapping())
+    result = await core.call(
+        "channel.send",
+        {
+            **_identity(),
+            "delivery_id": "reverse-send",
+            "to_handle": "chat-1",
+            "content_parts": [{"type": "text", "text": "hello"}],
+        },
+    )
+    assert result["state"] == "acknowledged"
+    assert await adapter.host_state_store.get("reverse-send") == (
+        1,
+        {"delivery_id": "reverse-send"},
+    )
+    await asyncio.gather(core.aclose(), runner.aclose())
+
+
+@pytest.mark.asyncio
+async def test_quiesce_honors_zero_drain_timeout() -> None:
+    """Quiesce closes admission and returns at its declared deadline."""
+    clock = Clock()
+    started = asyncio.Event()
+
+    async def blocked_send(_: SendParams) -> dict[str, object]:
+        """Model platform work that has no natural completion deadline."""
+        started.set()
+        await asyncio.Future()
+        return {"delivery_id": "quiesce-send", "state": "acknowledged"}
+
+    controller = LifecycleController(
+        channel_key="voice",
+        instance_id="instance-1",
+        generation=7,
+        environment_spec_id="ches1_" + "1" * 64,
+        environment_id="ches1_" + "1" * 64 + ".install1_" + "2" * 32,
+        capabilities=("media",),
+        send_handler=blocked_send,
+        clock_ms=clock,
+    )
+    await _activate_outbound_controller(controller, ["media"])
+    params = SendParams.from_mapping(
+        {
+            **_identity(),
+            "delivery_id": "quiesce-send",
+            "to_handle": "chat-1",
+            "content_parts": [{"type": "text", "text": "hello"}],
+        },
+    )
+    sending = asyncio.create_task(controller.send(params))
+    await started.wait()
+    result = await asyncio.wait_for(
+        controller.quiesce(
+            QuiesceParams.from_mapping(
+                {**_identity(), "drain_timeout_ms": 0},
+            ),
+        ),
+        timeout=0.1,
+    )
+    assert result["state"] == "quiescing"
+    with pytest.raises(asyncio.CancelledError):
+        await sending
+    delivery_states = controller._outbound_delivery_states
+    assert delivery_states["quiesce-send"].value == "unknown"
+    with pytest.raises(RpcError) as closed:
+        await controller.send(
+            SendParams.from_mapping(
+                {**params.to_mapping(), "delivery_id": "late-quiesce"},
+            ),
+        )
+    assert closed.value.data["reason_code"] == "INVALID_STATE_TRANSITION"
+
+
+@pytest.mark.asyncio
+async def test_swallowed_send_cancel_stays_unknown() -> None:
+    """Explicit cancellation wins over a handler's late ACK result."""
+    clock = Clock()
+    started = asyncio.Event()
+    left_transport, right_transport = _transport_pair()
+    core = RpcPeer(left_transport)
+    runner = RpcPeer(right_transport)
+
+    async def swallowing_send(params: SendParams) -> dict[str, object]:
+        """Suppress task cancellation and return a misleading ACK."""
+        started.set()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            pass
+        return {
+            "delivery_id": params.delivery_id,
+            "state": "acknowledged",
+        }
+
+    controller = LifecycleController(
+        channel_key="voice",
+        instance_id="instance-1",
+        generation=7,
+        environment_spec_id="ches1_" + "1" * 64,
+        environment_id="ches1_" + "1" * 64 + ".install1_" + "2" * 32,
+        capabilities=("media",),
+        send_handler=swallowing_send,
+        clock_ms=clock,
+    )
+    controller.register_rpc_methods(runner)
+    CoreLifecycleAdapter(controller).register_rpc_methods(core)
+    await asyncio.gather(core.start(), runner.start())
+    await runner.call("runner.hello", _hello().to_mapping())
+    await core.call(
+        "channel.prepare",
+        {
+            **_identity(),
+            "host_context": {},
+            "capabilities": ["media"],
+        },
+    )
+    lease = LeaseParams.from_mapping(
+        {**_identity(), "lease_token": "cancel", "lease_ttl_ms": 100},
+    )
+    await core.call("channel.activate", lease.to_mapping())
+    await core.call("channel.commit", lease.to_mapping())
+    payload = {
+        **_identity(),
+        "delivery_id": "swallowed-cancel",
+        "to_handle": "chat-1",
+        "content_parts": [{"type": "text", "text": "hello"}],
+    }
+    request = asyncio.create_task(core.call("channel.send", payload))
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    await core.notify(
+        "request.cancel",
+        {"request_id": "rpc-4", "reason": "user_cancelled"},
+    )
+    with pytest.raises(RpcError) as cancelled:
+        await request
+    assert cancelled.value.data["reason_code"] == "REQUEST_CANCELLED"
+    delivery_states = controller._outbound_delivery_states
+    targets = controller._outbound_targets
+    assert delivery_states["swallowed-cancel"].value == "unknown"
+    assert "swallowed-cancel" not in targets
+    with pytest.raises(RpcError) as duplicate:
+        await core.call("channel.send", payload)
+    assert duplicate.value.data["reason_code"] == ("OUTBOUND_ORDER_VIOLATION")
+    await asyncio.gather(core.aclose(), runner.aclose())
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_send_finalization_cannot_leave_sending() -> None:
+    """Cancellation while reacquiring the state lock converges to unknown."""
+    clock = Clock()
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def finishing_send(params: SendParams) -> dict[str, object]:
+        """Return an ACK only after the test blocks finalization."""
+        started.set()
+        await release.wait()
+        return {
+            "delivery_id": params.delivery_id,
+            "state": "acknowledged",
+        }
+
+    controller = LifecycleController(
+        channel_key="voice",
+        instance_id="instance-1",
+        generation=7,
+        environment_spec_id="ches1_" + "1" * 64,
+        environment_id="ches1_" + "1" * 64 + ".install1_" + "2" * 32,
+        capabilities=("media",),
+        send_handler=finishing_send,
+        clock_ms=clock,
+    )
+    await _activate_outbound_controller(controller, ["media"])
+    params = SendParams.from_mapping(
+        {
+            **_identity(),
+            "delivery_id": "finalizing-cancel",
+            "to_handle": "chat-1",
+            "content_parts": [{"type": "text", "text": "hello"}],
+        },
+    )
+    sending = asyncio.create_task(controller.send(params))
+    await started.wait()
+    state_lock = controller._lock
+    await state_lock.acquire()
+    try:
+        release.set()
+        await asyncio.sleep(0)
+        sending.cancel()
+        await asyncio.sleep(0)
+    finally:
+        state_lock.release()
+    with pytest.raises(asyncio.CancelledError):
+        await sending
+    delivery_states = controller._outbound_delivery_states
+    targets = controller._outbound_targets
+    assert delivery_states["finalizing-cancel"].value == "unknown"
+    assert "finalizing-cancel" not in targets
 
 
 @pytest.mark.asyncio
@@ -1559,6 +1871,85 @@ async def test_cancelled_prepare_fails_and_consumes_secret_handle() -> None:
                 {
                     **_identity(),
                     "host_context": {"secret_handle": "cancelled-handle"},
+                    "capabilities": [],
+                },
+            ),
+        )
+    assert consumed.value.data["reason_code"] == "SECRET_HANDLE_CONSUMED"
+    await asyncio.gather(core.aclose(), runner.aclose())
+
+
+@pytest.mark.asyncio
+async def test_swallowed_secret_cancel_fails_prepare() -> None:
+    """Prepare cancellation cannot be converted into a standby success."""
+    clock = Clock()
+    started = asyncio.Event()
+
+    async def swallowing_sink(_: object) -> None:
+        """Suppress cancellation after fixture credential initialization."""
+        started.set()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            pass
+
+    consumer = FixtureSecretHandleConsumer(
+        {("swallowed-handle", 7): "swallowed-secret"},
+        swallowing_sink,
+    )
+    left_transport, right_transport = _transport_pair()
+    core = RpcPeer(left_transport)
+    runner = RpcPeer(right_transport)
+    controller = LifecycleController(
+        channel_key="voice",
+        instance_id="instance-1",
+        generation=7,
+        environment_spec_id="ches1_" + "1" * 64,
+        environment_id="ches1_" + "1" * 64 + ".install1_" + "2" * 32,
+        secret_handle_consumer=consumer,
+        clock_ms=clock,
+    )
+    controller.register_rpc_methods(runner)
+    CoreLifecycleAdapter(controller).register_rpc_methods(core)
+    await asyncio.gather(core.start(), runner.start())
+    await runner.call("runner.hello", _hello().to_mapping())
+    prepare = asyncio.create_task(
+        core.call(
+            "channel.prepare",
+            {
+                **_identity(),
+                "host_context": {"secret_handle": "swallowed-handle"},
+                "capabilities": [],
+            },
+        ),
+    )
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    await core.notify(
+        "request.cancel",
+        {"request_id": "rpc-1", "reason": "user_cancelled"},
+    )
+    with pytest.raises(RpcError) as cancelled:
+        await prepare
+    assert cancelled.value.data["reason_code"] == "REQUEST_CANCELLED"
+    assert controller.state is RunnerState.FAILED
+    assert controller.host_context is None
+    assert not controller.effective_capabilities
+    repeated = LifecycleController(
+        channel_key="voice",
+        instance_id="instance-1",
+        generation=7,
+        environment_spec_id="ches1_" + "1" * 64,
+        environment_id="ches1_" + "1" * 64 + ".install1_" + "2" * 32,
+        secret_handle_consumer=consumer,
+        clock_ms=clock,
+    )
+    repeated.accept_hello(_hello())
+    with pytest.raises(RpcError) as consumed:
+        await repeated.prepare(
+            PrepareParams.from_mapping(
+                {
+                    **_identity(),
+                    "host_context": {"secret_handle": "swallowed-handle"},
                     "capabilities": [],
                 },
             ),
