@@ -238,6 +238,15 @@ class FramedTransport:
             raise FrameProtocolError("prepared frame must be text")
         return encode_frame(message, limits=self._limits)
 
+    async def _wait_write_accepted(self) -> None:
+        """Wait when an adapter defers actual frame acceptance."""
+        callback = getattr(self._writer, "wait_write_accepted", None)
+        if callback is None:
+            return
+        result = callback()
+        if inspect.isawaitable(result):
+            await result
+
     @staticmethod
     def _rollback_write_item(item: _WriteItem) -> None:
         """Rollback one prepared item before transport cleanup."""
@@ -259,6 +268,10 @@ class FramedTransport:
                 if item.future.done():
                     return
                 self._writer.write(data)
+                await asyncio.wait_for(
+                    self._wait_write_accepted(),
+                    timeout=self._limits.write_timeout,
+                )
                 visible = True
                 if item.on_write_succeeded is not None:
                     item.on_write_succeeded()

@@ -1135,7 +1135,7 @@ class LifecycleController:
         self,
         attempt: _OutboundAttempt,
     ) -> None:
-        """Finalize one result after writer.write accepted its frame."""
+        """Finalize one result after output accepted its complete frame."""
         attempt.publication_result = None
         attempt.publication_created_target = False
         attempt.publication_target_snapshot = None
@@ -1176,7 +1176,7 @@ class LifecycleController:
         self,
         attempt: _OutboundAttempt,
     ) -> None:
-        """Retract a prepared result when writer.write rejected its frame."""
+        """Retract a result when output rejected its complete frame."""
         try:
             if attempt.publication_result is None:
                 return

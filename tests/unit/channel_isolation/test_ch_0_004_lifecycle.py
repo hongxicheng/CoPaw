@@ -7,9 +7,11 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import math
 import traceback
 from collections.abc import Awaitable, Callable
+from typing import Any
 
 import pytest
 
@@ -29,11 +31,13 @@ from qwenpaw.channel_protocol import (
     QuiesceParams,
     RpcError,
     RpcTimeoutError,
+    RpcClosedError,
     ProtocolValidationError,
     RunnerState,
     RpcPeer,
     ReactionParams,
     SendParams,
+    runner_bootstrap,
 )
 
 
@@ -244,6 +248,35 @@ class LinkedFrameWriter:
 
     async def wait_closed(self) -> None:
         """Match the asyncio writer shutdown API."""
+
+
+class RejectingPipeHandle:
+    """Reject a Windows pipe frame without accepting any bytes."""
+
+    def __init__(self) -> None:
+        self.closed = False
+
+    def write(self, _data: bytes) -> int:
+        """Report a zero-progress synchronous HANDLE write."""
+        return 0
+
+    def close(self) -> None:
+        """Record closure of the protocol handle."""
+        self.closed = True
+
+
+class FakeWindowsThreadHandle:
+    """Provide the cancellable thread-handle surface for one test."""
+
+    def __init__(self) -> None:
+        self.closed = False
+
+    def cancel(self) -> None:
+        """Match cancellation of an already completed fake write."""
+
+    def close(self) -> None:
+        """Record closure of the fake thread handle."""
+        self.closed = True
 
 
 def _transport_pair() -> tuple[MemoryTransport, MemoryTransport]:
@@ -2283,6 +2316,147 @@ async def test_response_write_failure_converges_outbound_to_unknown() -> None:
     )
     assert "failed-publication" not in controller._outbound_targets
     await asyncio.gather(core.aclose(), runner.aclose())
+
+
+@pytest.mark.asyncio
+async def test_windows_handle_failure_rolls_back_outbound_publication(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A rejected Windows HANDLE frame cannot publish an outbound ACK."""
+    handle = RejectingPipeHandle()
+    thread_handle = FakeWindowsThreadHandle()
+    monkeypatch.setattr(
+        runner_bootstrap,
+        "_open_windows_thread_handle",
+        lambda: thread_handle,
+    )
+    writer = runner_bootstrap._ThreadPipeWriter(handle)
+    transport = FramedTransport(asyncio.StreamReader(), writer)
+    runner = RpcPeer(transport)
+    controller = _controller(Clock())
+    controller.register_rpc_methods(runner)
+    await _activate_outbound_controller(controller, ["media"])
+    payload = {
+        **_identity(),
+        "delivery_id": "windows-rejected-publication",
+        "to_handle": "chat-1",
+        "content_parts": [{"type": "text", "text": "hello"}],
+    }
+
+    await runner._dispatch_raw(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": "windows-response",
+                "method": "channel.send",
+                "params": payload,
+            },
+            separators=(",", ":"),
+        ),
+    )
+    while not transport.is_closed:
+        await asyncio.sleep(0)
+    while "windows-rejected-publication" in controller._outbound_attempts:
+        await asyncio.sleep(0)
+
+    assert (
+        controller._outbound_delivery_states[
+            "windows-rejected-publication"
+        ].value
+        == "unknown"
+    )
+    assert "windows-rejected-publication" not in (controller._outbound_targets)
+    assert "windows-rejected-publication" not in (
+        controller._outbound_attempts
+    )
+    await runner.aclose()
+    assert handle.closed
+    assert thread_handle.closed
+
+
+@pytest.mark.asyncio
+async def test_transport_close_while_publication_prepares_clears_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Closing while prepare waits for state cannot leave a busy stream."""
+    (
+        controller,
+        core,
+        runner,
+        _,
+        right_writer,
+    ) = await _active_framed_outbound_rpc_pair(["streaming"])
+    await core.call(
+        "channel.send",
+        {
+            **_identity(),
+            "delivery_id": "close-prepare-stream",
+            "to_handle": "chat-1",
+            "operation": "stream.start",
+            "stream_type": "message",
+            "sequence": 0,
+            "accumulated_text": "",
+        },
+    )
+    right_writer.block_next_write()
+    blocker = asyncio.create_task(runner.notify("test.blocker"))
+    await asyncio.wait_for(right_writer.frame_visible.wait(), timeout=1.0)
+    prepare_started = asyncio.Event()
+    original_prepare = controller._prepare_outbound_publication
+
+    async def observed_prepare(attempt: Any) -> dict[str, Any]:
+        """Expose when response preparation starts waiting for the lock."""
+        prepare_started.set()
+        return await original_prepare(attempt)
+
+    monkeypatch.setattr(
+        controller,
+        "_prepare_outbound_publication",
+        observed_prepare,
+    )
+    delta = asyncio.create_task(
+        core.call(
+            "channel.send",
+            {
+                **_identity(),
+                "delivery_id": "close-during-prepare",
+                "to_handle": "chat-1",
+                "operation": "stream.delta",
+                "target_delivery_id": "close-prepare-stream",
+                "stream_type": "message",
+                "sequence": 1,
+                "accumulated_text": "hello",
+            },
+        ),
+    )
+    while (
+        "close-during-prepare" not in controller._outbound_attempts
+        or not controller._outbound_attempts[
+            "close-during-prepare"
+        ].provisional
+    ):
+        await asyncio.sleep(0)
+    await controller._lock.acquire()
+    try:
+        right_writer.drain_release.set()
+        await blocker
+        await asyncio.wait_for(prepare_started.wait(), timeout=1.0)
+        await asyncio.wait_for(runner.aclose(), timeout=1.0)
+    finally:
+        controller._lock.release()
+
+    with pytest.raises(RpcClosedError):
+        await delta
+    while "close-during-prepare" in controller._outbound_attempts:
+        await asyncio.sleep(0)
+    target = controller._outbound_targets["close-prepare-stream"]
+    assert (
+        controller._outbound_delivery_states["close-during-prepare"].value
+        == "unknown"
+    )
+    assert target["pending_delivery_id"] is None
+    assert target["sequence"] == 0
+    await core.aclose()
 
 
 @pytest.mark.asyncio

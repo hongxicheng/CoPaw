@@ -88,7 +88,6 @@ class RpcResponsePublication:
     on_write_failed: PublicationWriteFailedCallback
     on_aborted: PublicationAbortCallback
     published: bool = False
-    write_failed: bool = False
 
 
 @dataclass(frozen=True)
@@ -318,14 +317,13 @@ class RpcPeer:
             )
 
         def write_succeeded() -> None:
-            """Record that writer.write accepted the final response frame."""
+            """Record that the output accepted the complete response frame."""
             publication.published = True
             publication.on_published()
 
         def write_failed() -> None:
             """Rollback state when the frame was never accepted."""
             publication.on_write_failed()
-            publication.write_failed = True
 
         await self._transport.send(
             encoded,
@@ -541,10 +539,11 @@ class RpcPeer:
         """Abort provisional state unless its response was already sent."""
         if response_sent or publication is not None and publication.published:
             return True
-        if publication is not None and not publication.write_failed:
+        if publication is not None:
             await self._run_publication_callback(
                 lambda: publication.on_aborted(reason_code),
             )
+            return publication.published
         return False
 
     async def _run_publication_callback(

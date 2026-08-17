@@ -344,18 +344,21 @@ JSON-RPC frame、返回值或 Runner 保存的 host context。
 `test_ch_0_004_lifecycle.py`。当前聚焦测试命令
 `conda run -n qwenpaw pytest -q tests/unit/channel_isolation/test_ch_0_004_models.py
 tests/unit/channel_isolation/test_ch_0_004_lifecycle.py
-tests/unit/channel_isolation/test_ch_0_004_rpc.py` 为 `70 passed`，framing 回归测试
+tests/unit/channel_isolation/test_ch_0_004_rpc.py` 为 `72 passed`，framing 回归测试
 `tests/unit/channel_isolation/test_ch_0_003_transport.py` 为 `15 passed`，相邻可靠性测试
 `tests/unit/channel_isolation/test_ch_0_005_reliability.py` 为 `13 passed`，
-`conda run -n qwenpaw pytest -q tests/unit/channel_isolation` 为 `266 passed`；目标文件
+`tests/unit/channel_isolation/test_ch_0_006_bootstrap.py` 为 `19 passed`，
+`conda run -n qwenpaw pytest -q tests/unit/channel_isolation` 为 `268 passed`；目标文件
 pre-commit 全部通过（包括 mypy、black、flake8 和 pylint），`git diff --check` 通过。
 原独立 Review 已通过（用户确认）；原实现
 与修复提交为 `95836112`、`26958f06`、`339766f7`、`4cd74739`、`220aef20`、
-`85ed4907`、`deddbb65`、`f26d76a1`、`b4ab6c86`。对 `b4ab6c86` 的复审发现真实
-`FramedTransport` 中 frame 可在 `writer.write()` 后、`drain()` 返回前被 Core 观察；本轮
-已将最终 result 选择和 ordering 状态提交移到单 writer 持锁、`writer.write()` 前的原子
-边界，覆盖 frame 已可见时的 stop/cancel、写前 lease expiry、绝对 drain deadline、
-`writer.write()` 失败回滚和 `drain()` 失败不回滚。
+`85ed4907`、`deddbb65`、`f26d76a1`、`b4ab6c86`、`2ee4eecd`。对 `2ee4eecd`
+的复审发现 Windows 线程 writer 在真实 HANDLE 写入前过早发布 ACK，以及 transport 在
+response prepare 等待生命周期锁期间关闭会遗留 `sending` attempt；本轮已将 Windows
+publication 边界延后到后台线程完成完整 HANDLE 写入，并让所有尚未 published 的关闭和
+写入失败路径幂等收敛为 `unknown`。回归测试覆盖 Windows 零进展写入不建立 ACK/target，
+以及 prepare 等锁期间关闭 transport 后移除 attempt、清除 stream busy 标记且不推进
+sequence。
 本记录继续保持 `[-]`，等待新的独立 Review 和最终验证，通过前不得恢复为 `[x]`。
 
 ### CH-0-005：可靠事件、ACK 和幂等原型

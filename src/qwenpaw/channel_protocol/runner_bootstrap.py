@@ -220,8 +220,6 @@ class _ThreadPipeWriter:
                     error = exc
                 with self._condition:
                     self._active = False
-                    if self._closed and error is None:
-                        error = BrokenPipeError("protocol pipe is closed")
                 try:
                     loop.call_soon_threadsafe(self._complete, future, error)
                 except RuntimeError:
@@ -252,16 +250,51 @@ class _ThreadPipeWriter:
             self._request = (loop, future, bytes(data))
             self._condition.notify()
 
-    async def drain(self) -> None:
-        """Wait until the dedicated thread completes the pending write."""
+    async def wait_write_accepted(self) -> None:
+        """Wait until the HANDLE accepts the complete pending frame."""
         future = self._pending_future
         if future is None:
             return
+        cancelled = False
         try:
-            await asyncio.shield(future)
+            while not future.done():
+                try:
+                    await asyncio.shield(future)
+                except asyncio.CancelledError:
+                    cancelled = True
+                    self.close()
+                if cancelled and not future.done():
+                    await self._retry_cancelled_write(future)
+            if cancelled:
+                try:
+                    future.result()
+                except Exception:
+                    raise asyncio.CancelledError from None
+                return
+            future.result()
         finally:
             if future.done() and self._pending_future is future:
                 self._pending_future = None
+
+    async def _retry_cancelled_write(
+        self,
+        future: asyncio.Future[None],
+    ) -> None:
+        """Retry synchronous I/O cancellation until it reaches a result."""
+        while not future.done():
+            with self._condition:
+                thread_handle = self._thread_handle
+                active = self._active
+            if active and thread_handle is not None:
+                thread_handle.cancel()
+            try:
+                await asyncio.sleep(0.01)
+            except asyncio.CancelledError:
+                continue
+
+    async def drain(self) -> None:
+        """Wait until the dedicated thread completes the pending write."""
+        await self.wait_write_accepted()
 
     def close(self) -> None:
         """Close the pipe and wake the dedicated writer thread."""
