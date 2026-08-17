@@ -853,6 +853,8 @@ async def _activate_outbound_controller(
 async def _active_outbound_rpc_pair(
     right_transport: MemoryTransport,
     capabilities: list[str],
+    *,
+    clock: Clock | None = None,
 ) -> tuple[LifecycleController, RpcPeer, RpcPeer]:
     """Create one active RPC pair for outbound publication tests."""
     left_transport = MemoryTransport()
@@ -867,7 +869,7 @@ async def _active_outbound_rpc_pair(
         environment_spec_id="ches1_" + "1" * 64,
         environment_id="ches1_" + "1" * 64 + ".install1_" + "2" * 32,
         capabilities=tuple(capabilities),
-        clock_ms=Clock(),
+        clock_ms=clock or Clock(),
     )
     controller.register_rpc_methods(runner)
     CoreLifecycleAdapter(controller).register_rpc_methods(core)
@@ -1652,6 +1654,178 @@ async def test_cancel_during_response_publication_rolls_back_ack() -> None:
         await core.call("channel.send", payload)
     assert duplicate.value.data["reason_code"] == ("OUTBOUND_ORDER_VIOLATION")
     right_transport.release_response.set()
+    await asyncio.gather(core.aclose(), runner.aclose())
+
+
+@pytest.mark.asyncio
+async def test_sent_ack_linearizes_before_stop_fencing() -> None:
+    """A sent ACK remains authoritative while its callback waits."""
+    right_transport = BlockingSendResponseTransport("rpc-4")
+    controller, core, runner = await _active_outbound_rpc_pair(
+        right_transport,
+        ["media"],
+    )
+    payload = {
+        **_identity(),
+        "delivery_id": "published-before-stop",
+        "to_handle": "chat-1",
+        "content_parts": [{"type": "text", "text": "hello"}],
+    }
+    request = asyncio.create_task(core.call("channel.send", payload))
+    await right_transport.response_started.wait()
+    await controller._lock.acquire()
+    try:
+        stopping = asyncio.create_task(
+            controller.stop(IdentityParams.from_mapping(_identity())),
+        )
+        await asyncio.sleep(0)
+        right_transport.release_response.set()
+        result = await request
+        assert result["state"] == "acknowledged"
+        assert (
+            controller._outbound_delivery_states["published-before-stop"].value
+            == "acknowledged"
+        )
+        assert "published-before-stop" in controller._outbound_targets
+        assert "published-before-stop" not in controller._outbound_attempts
+    finally:
+        controller._lock.release()
+    stopped = await stopping
+    assert stopped["state"] == "stopped"
+    assert (
+        controller._outbound_delivery_states["published-before-stop"].value
+        == "acknowledged"
+    )
+    assert "published-before-stop" in controller._outbound_targets
+    await asyncio.gather(core.aclose(), runner.aclose())
+
+
+@pytest.mark.asyncio
+async def test_sent_ack_linearizes_before_lease_expiry() -> None:
+    """Lease fencing cannot retract an already sent ACK."""
+    clock = Clock()
+    right_transport = BlockingSendResponseTransport("rpc-4")
+    controller, core, runner = await _active_outbound_rpc_pair(
+        right_transport,
+        ["media"],
+        clock=clock,
+    )
+    payload = {
+        **_identity(),
+        "delivery_id": "published-before-expiry",
+        "to_handle": "chat-1",
+        "content_parts": [{"type": "text", "text": "hello"}],
+    }
+    request = asyncio.create_task(core.call("channel.send", payload))
+    await right_transport.response_started.wait()
+    await controller._lock.acquire()
+    try:
+        health = asyncio.create_task(
+            controller.health(IdentityParams.from_mapping(_identity())),
+        )
+        await asyncio.sleep(0)
+        right_transport.release_response.set()
+        result = await request
+        assert result["state"] == "acknowledged"
+        assert (
+            controller._outbound_delivery_states[
+                "published-before-expiry"
+            ].value
+            == "acknowledged"
+        )
+        assert "published-before-expiry" in controller._outbound_targets
+        assert "published-before-expiry" not in (controller._outbound_attempts)
+        clock.now = 1100
+    finally:
+        controller._lock.release()
+    status = await health
+    assert status["state"] == "failed"
+    assert (
+        controller._outbound_delivery_states["published-before-expiry"].value
+        == "acknowledged"
+    )
+    assert "published-before-expiry" in controller._outbound_targets
+    await asyncio.gather(core.aclose(), runner.aclose())
+
+
+@pytest.mark.asyncio
+async def test_sent_ack_linearizes_before_zero_drain_deadline() -> None:
+    """A sent ACK wins before a queued zero-deadline quiesce."""
+    right_transport = BlockingSendResponseTransport("rpc-4")
+    controller, core, runner = await _active_outbound_rpc_pair(
+        right_transport,
+        ["media"],
+    )
+    payload = {
+        **_identity(),
+        "delivery_id": "published-before-drain",
+        "to_handle": "chat-1",
+        "content_parts": [{"type": "text", "text": "hello"}],
+    }
+    request = asyncio.create_task(core.call("channel.send", payload))
+    await right_transport.response_started.wait()
+    await controller._lock.acquire()
+    try:
+        quiescing = asyncio.create_task(
+            controller.quiesce(
+                QuiesceParams.from_mapping(
+                    {**_identity(), "drain_timeout_ms": 0},
+                ),
+            ),
+        )
+        await asyncio.sleep(0)
+        right_transport.release_response.set()
+        result = await request
+        assert result["state"] == "acknowledged"
+        assert (
+            controller._outbound_delivery_states[
+                "published-before-drain"
+            ].value
+            == "acknowledged"
+        )
+        assert "published-before-drain" in controller._outbound_targets
+        assert "published-before-drain" not in controller._outbound_attempts
+    finally:
+        controller._lock.release()
+    status = await quiescing
+    assert status["state"] == "quiescing"
+    assert (
+        controller._outbound_delivery_states["published-before-drain"].value
+        == "acknowledged"
+    )
+    assert "published-before-drain" in controller._outbound_targets
+    await asyncio.gather(core.aclose(), runner.aclose())
+
+
+@pytest.mark.asyncio
+async def test_zero_drain_deadline_prevents_unsent_ack_publication() -> None:
+    """A zero drain deadline wins while the ACK write is blocked."""
+    right_transport = BlockingSendResponseTransport("rpc-4")
+    controller, core, runner = await _active_outbound_rpc_pair(
+        right_transport,
+        ["media"],
+    )
+    payload = {
+        **_identity(),
+        "delivery_id": "drain-before-publication",
+        "to_handle": "chat-1",
+        "content_parts": [{"type": "text", "text": "hello"}],
+    }
+    request = asyncio.create_task(core.call("channel.send", payload))
+    await right_transport.response_started.wait()
+    status = await core.call(
+        "channel.quiesce",
+        {**_identity(), "drain_timeout_ms": 0},
+    )
+    assert status["state"] == "quiescing"
+    with pytest.raises(RpcError) as cancelled:
+        await request
+    assert cancelled.value.data["reason_code"] == "REQUEST_CANCELLED"
+    assert (
+        controller._outbound_delivery_states["drain-before-publication"].value
+        == "unknown"
+    )
+    assert "drain-before-publication" not in controller._outbound_targets
     await asyncio.gather(core.aclose(), runner.aclose())
 
 

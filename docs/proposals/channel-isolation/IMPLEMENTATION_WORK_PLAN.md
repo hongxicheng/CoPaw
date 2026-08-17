@@ -344,15 +344,16 @@ JSON-RPC frame、返回值或 Runner 保存的 host context。
 `test_ch_0_004_lifecycle.py`。当前聚焦测试命令
 `conda run -n qwenpaw pytest -q tests/unit/channel_isolation/test_ch_0_004_models.py
 tests/unit/channel_isolation/test_ch_0_004_lifecycle.py
-tests/unit/channel_isolation/test_ch_0_004_rpc.py` 为 `63 passed`，相邻可靠性测试
+tests/unit/channel_isolation/test_ch_0_004_rpc.py` 为 `67 passed`，相邻可靠性测试
 `tests/unit/channel_isolation/test_ch_0_005_reliability.py` 为 `13 passed`，
-`conda run -n qwenpaw pytest -q tests/unit/channel_isolation` 为 `256 passed`；目标文件
+`conda run -n qwenpaw pytest -q tests/unit/channel_isolation` 为 `260 passed`；目标文件
 pre-commit 全部通过（包括共同检查 `models.py` 与 `rpc.py` 的 mypy），`git diff --check`
 通过。原独立 Review 已通过（用户确认）；原实现
 与修复提交为 `95836112`、`26958f06`、`339766f7`、`4cd74739`、`220aef20`、
-`85ed4907`、`deddbb65`。对 `deddbb65` 的复审发现 endpoint unregister hook 可阻塞
-quiesce/stop、response publication 取消后保留 ACK/target、drain deadline 后仍可提交 ACK，
-以及 parse-error null ID 与 response Schema 类型不一致；当前工作树已按 Design 修复并验证。
+`85ed4907`、`deddbb65`、`f26d76a1`。对 `f26d76a1` 的复审发现 ACK 写出与生命周期
+状态提交之间仍存在异步锁窗口；本轮已将 transport send 成功及其后的无 `await` 同步状态
+提交冻结为唯一 publication 线性化点，并覆盖其与 stop、lease expiry、零 drain deadline
+的确定性竞争。
 本记录继续保持 `[-]`，等待新的独立 Review 和最终验证，通过前不得恢复为 `[x]`。
 
 ### CH-0-005：可靠事件、ACK 和幂等原型

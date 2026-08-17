@@ -1069,7 +1069,7 @@ class LifecycleController:
                 attempt.send_params = send_params
                 attempt.provisional = True
                 return result
-            self._commit_outbound_result_locked(
+            self._commit_outbound_result(
                 attempt,
                 result,
                 send_params,
@@ -1091,23 +1091,23 @@ class LifecycleController:
             ),
         )
 
-    async def _publish_outbound_attempt(
+    def _publish_outbound_attempt(
         self,
         attempt: _OutboundAttempt,
     ) -> None:
-        """Finalize one provisional attempt after response publication."""
-        async with self._lock:
-            if self._outbound_attempts.get(attempt.delivery_id) is attempt:
-                result = attempt.terminal_result
-                if result is None:
-                    return
-                self._commit_outbound_result_locked(
-                    attempt,
-                    result,
-                    attempt.send_params,
-                )
+        """Atomically publish delivery and ordering state after the frame."""
+        if self._outbound_attempts.get(attempt.delivery_id) is not attempt:
+            return
+        result = attempt.terminal_result
+        if result is None:
+            return
+        self._commit_outbound_result(
+            attempt,
+            result,
+            attempt.send_params,
+        )
 
-    def _commit_outbound_result_locked(
+    def _commit_outbound_result(
         self,
         attempt: _OutboundAttempt,
         result: OutboundResult,

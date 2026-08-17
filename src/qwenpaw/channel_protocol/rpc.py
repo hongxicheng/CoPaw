@@ -433,9 +433,7 @@ class RpcPeer:
             await self._send(RpcResponse(request.id, result=result))
             response_sent = True
             if publication is not None:
-                await self._run_publication_callback(
-                    publication.on_published,
-                )
+                publication.on_published()
         except ProtocolValidationError as exc:
             if await self._abort_response_publication(
                 publication,
