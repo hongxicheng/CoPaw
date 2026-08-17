@@ -18,6 +18,9 @@
 - [x] Core 保留 `ChannelManager`、`BaseChannel`、ACL、队列、AgentRequest/Event、平台
   无关渲染语义和 approval；Runner 负责平台原生 payload 编码。
 - [x] `core` Channel 和现有 legacy Plugin Channel 保持外部行为兼容。
+- [x] 所有 Channel 迁移任务均适用 Design §2.1 的迁移兼容原则；除任务验收明确要求外，
+  legacy Channel 消费新的 Runner 组件不属于验收条件，不得以兼容 legacy 内部结构为由
+  增加目标生产路径的复杂度。
 - [x] isolated Channel 使用每个默认 instance 一个 Runner 进程。
 - [x] Core↔Runner 使用 stdio，不使用 loopback TCP 或本地端口。
 - [x] stdio 使用 LSP `Content-Length` framing。
@@ -425,9 +428,14 @@ Linux、真实 Windows 和真实 frozen desktop 发布制品验收，这些限�
 
 ### CH-0-007：飞书主动连接原型
 
-- [ ] 将飞书平台连接逻辑拆为 `ChannelDriver`。
+- [ ] 以最终 `FeishuDriver` → Runner-safe 飞书平台实现 → `lark-oapi` 生产路径为设计
+  中心，从现有飞书实现迁移适合 Runner 边界的平台逻辑，不重新实现第二套平台连接。
+- [ ] 现有 `FeishuChannel` 仅作为迁移前行为来源和回归基线；不要求其消费新的平台
+  组件，不得为兼容其内部结构增加新生产路径的复杂度。
 - [ ] 使用 mock Host 和预构建 fixture environment，不实现正式 Env/Process Manager。
 - [ ] 验证主动长连接、鉴权、私聊/群聊/mention、文本/媒体/卡片和 streaming。
+- [ ] 在新生产 adapter 边界直接验证鉴权、SDK 回调、消息解析、媒体、卡片和
+  streaming，不以 legacy Channel 复用新组件作为验收证据。
 - [ ] 验证两个 Agent 的默认 instance 共用 environment，但 Runner、secret、checkpoint
   和状态独立。
 - [ ] 验证 Runner 崩溃、重连和 Core 回复。
