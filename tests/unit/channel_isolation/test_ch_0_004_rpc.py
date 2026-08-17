@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import math
+from collections.abc import Awaitable, Callable
 
 import pytest
 
@@ -28,11 +30,25 @@ class MemoryTransport:
         self.peer: MemoryTransport | None = None
         self.closed = False
 
-    async def send(self, message: str) -> None:
+    async def send(
+        self,
+        message: str,
+        *,
+        prepare_write: Callable[[], str | Awaitable[str]] | None = None,
+        on_write_succeeded: Callable[[], None] | None = None,
+        on_write_failed: Callable[[], None] | None = None,
+    ) -> None:
         """Deliver one complete framed message to the peer."""
+        _ = on_write_failed
         if self.closed or self.peer is None or self.peer.closed:
             raise ConnectionError("transport closed")
-        await self.peer.inbox.put(message)
+        if prepare_write is not None:
+            message = prepare_write()
+            if inspect.isawaitable(message):
+                message = await message
+        self.peer.inbox.put_nowait(message)
+        if on_write_succeeded is not None:
+            on_write_succeeded()
 
     async def receive(self) -> str:
         """Receive one complete framed message."""

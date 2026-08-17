@@ -73,16 +73,22 @@ def _recover_request_id(
 RequestHandler = Callable[[Any, RpcRequest], Any]
 NotificationHandler = Callable[[Any, RpcNotification], Any]
 PublicationCallback = Callable[[], Any]
+PublicationPrepareCallback = Callable[[], Any]
+PublicationWriteFailedCallback = Callable[[], Any]
 PublicationAbortCallback = Callable[[str], Any]
 
 
-@dataclass(frozen=True)
+@dataclass
 class RpcResponsePublication:
     """Bind an internal result to response publication callbacks."""
 
     result: object
+    on_prepare: PublicationPrepareCallback
     on_published: PublicationCallback
+    on_write_failed: PublicationWriteFailedCallback
     on_aborted: PublicationAbortCallback
+    published: bool = False
+    write_failed: bool = False
 
 
 @dataclass(frozen=True)
@@ -282,7 +288,12 @@ class RpcPeer:
             await self.start()
         await self._send(RpcNotification(method, params))
 
-    async def _send(self, message: RpcMessage) -> None:
+    async def _send(
+        self,
+        message: RpcMessage,
+        *,
+        publication: RpcResponsePublication | None = None,
+    ) -> None:
         """Serialize and send one validated envelope."""
         try:
             encoded = _strict_json_dumps(message.to_mapping())
@@ -291,7 +302,37 @@ class RpcPeer:
                 "RPC message contains non-JSON data",
                 reason_code="SCHEMA_MISMATCH",
             ) from exc
-        await self._transport.send(encoded)
+        if publication is None:
+            await self._transport.send(encoded)
+            return
+        if not isinstance(message, RpcResponse) or message.error is not None:
+            raise RuntimeError("publication requires a success response")
+
+        async def prepare_write() -> str:
+            """Build the final response at the writer visibility boundary."""
+            result = publication.on_prepare()
+            if inspect.isawaitable(result):
+                result = await result
+            return _strict_json_dumps(
+                RpcResponse(message.id, result=result).to_mapping(),
+            )
+
+        def write_succeeded() -> None:
+            """Record that writer.write accepted the final response frame."""
+            publication.published = True
+            publication.on_published()
+
+        def write_failed() -> None:
+            """Rollback state when the frame was never accepted."""
+            publication.on_write_failed()
+            publication.write_failed = True
+
+        await self._transport.send(
+            encoded,
+            prepare_write=prepare_write,
+            on_write_succeeded=write_succeeded,
+            on_write_failed=write_failed,
+        )
 
     async def _reader_loop(self) -> None:
         """Read frames and dispatch without waiting for handlers."""
@@ -430,10 +471,11 @@ class RpcPeer:
                 result = publication.result
             if cancellation.requested:
                 raise asyncio.CancelledError
-            await self._send(RpcResponse(request.id, result=result))
+            await self._send(
+                RpcResponse(request.id, result=result),
+                publication=publication,
+            )
             response_sent = True
-            if publication is not None:
-                publication.on_published()
         except ProtocolValidationError as exc:
             if await self._abort_response_publication(
                 publication,
@@ -497,9 +539,9 @@ class RpcPeer:
         reason_code: str,
     ) -> bool:
         """Abort provisional state unless its response was already sent."""
-        if response_sent:
+        if response_sent or publication is not None and publication.published:
             return True
-        if publication is not None:
+        if publication is not None and not publication.write_failed:
             await self._run_publication_callback(
                 lambda: publication.on_aborted(reason_code),
             )

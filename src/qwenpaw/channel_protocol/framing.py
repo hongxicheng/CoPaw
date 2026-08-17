@@ -5,9 +5,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import math
+from collections.abc import Awaitable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 from .errors import (
     FrameClosedError,
@@ -192,6 +194,9 @@ class _WriteItem:
 
     data: bytes
     future: asyncio.Future[None]
+    prepare_write: Callable[[], str | Awaitable[str]] | None = None
+    on_write_succeeded: Callable[[], None] | None = None
+    on_write_failed: Callable[[], None] | None = None
 
 
 class FramedTransport:
@@ -222,38 +227,101 @@ class FramedTransport:
         """Return whether the complete transport has been closed."""
         return self._closed
 
+    async def _prepare_write_item(self, item: _WriteItem) -> bytes:
+        """Build an optional final frame before writer visibility."""
+        if item.prepare_write is None:
+            return item.data
+        message = item.prepare_write()
+        if inspect.isawaitable(message):
+            message = await message
+        if not isinstance(message, str):
+            raise FrameProtocolError("prepared frame must be text")
+        return encode_frame(message, limits=self._limits)
+
+    @staticmethod
+    def _rollback_write_item(item: _WriteItem) -> None:
+        """Rollback one prepared item before transport cleanup."""
+        if item.on_write_failed is None:
+            return
+        with contextlib.suppress(Exception):
+            item.on_write_failed()
+
+    async def _write_item(self, item: _WriteItem) -> None:
+        """Process one queued item under the single writer lock."""
+        prepared = False
+        visible = False
+        try:
+            async with self._write_lock:
+                if item.future.done():
+                    return
+                prepared = item.prepare_write is not None
+                data = await self._prepare_write_item(item)
+                if item.future.done():
+                    return
+                self._writer.write(data)
+                visible = True
+                if item.on_write_succeeded is not None:
+                    item.on_write_succeeded()
+                await asyncio.wait_for(
+                    self._writer.drain(),
+                    timeout=self._limits.write_timeout,
+                )
+        finally:
+            if prepared and not visible:
+                self._rollback_write_item(item)
+
+    async def _fail_write_item(
+        self,
+        item: _WriteItem,
+        error: FrameError,
+    ) -> None:
+        """Fail one caller and close the complete transport."""
+        if not item.future.done():
+            item.future.set_exception(error)
+        await self._close(error)
+
+    async def _handle_write_error(
+        self,
+        item: _WriteItem,
+        error: BaseException,
+    ) -> None:
+        """Translate one writer exception into the framing error model."""
+        if isinstance(error, asyncio.CancelledError):
+            if not item.future.done():
+                item.future.set_exception(
+                    FrameClosedError("stdio writer stopped"),
+                )
+            raise error
+        if isinstance(error, asyncio.TimeoutError):
+            await self._fail_write_item(
+                item,
+                FrameTimeoutError("frame write timed out"),
+            )
+            return
+        if isinstance(error, FrameError):
+            await self._fail_write_item(item, error)
+            return
+        if isinstance(error, (BrokenPipeError, ConnectionError, OSError)):
+            await self._fail_write_item(
+                item,
+                FrameWriteError("stdio write failed"),
+            )
+            return
+        await self._fail_write_item(
+            item,
+            FrameWriteError("stdio write preparation failed"),
+        )
+
     async def _write_loop(self) -> None:
         """Serialize writes and resolve each caller's completion future."""
         try:
             while True:
                 item = await self._queue.get()
                 try:
-                    async with self._write_lock:
-                        self._writer.write(item.data)
-                        await asyncio.wait_for(
-                            self._writer.drain(),
-                            timeout=self._limits.write_timeout,
-                        )
-                except asyncio.TimeoutError:
-                    error: FrameError = FrameTimeoutError(
-                        "frame write timed out",
-                    )
-                    if not item.future.done():
-                        item.future.set_exception(error)
-                    await self._close(error)
+                    await self._write_item(item)
+                except BaseException as error:
+                    await self._handle_write_error(item, error)
                     return
-                except (BrokenPipeError, ConnectionError, OSError):
-                    error = FrameWriteError("stdio write failed")
-                    if not item.future.done():
-                        item.future.set_exception(error)
-                    await self._close(error)
-                    return
-                except asyncio.CancelledError:
-                    if not item.future.done():
-                        item.future.set_exception(
-                            FrameClosedError("stdio writer stopped"),
-                        )
-                    raise
                 else:
                     if not item.future.done():
                         item.future.set_result(None)
@@ -262,7 +330,14 @@ class FramedTransport:
         except asyncio.CancelledError:
             return
 
-    async def send(self, message: str) -> None:
+    async def send(
+        self,
+        message: str,
+        *,
+        prepare_write: Callable[[], str | Awaitable[str]] | None = None,
+        on_write_succeeded: Callable[[], None] | None = None,
+        on_write_failed: Callable[[], None] | None = None,
+    ) -> None:
         """Enqueue one frame and wait until the OS stream accepts it."""
         if self._closed:
             raise FrameClosedError("stdio transport is closed")
@@ -270,7 +345,13 @@ class FramedTransport:
         future: asyncio.Future[
             None
         ] = asyncio.get_running_loop().create_future()
-        item = _WriteItem(data, future)
+        item = _WriteItem(
+            data,
+            future,
+            prepare_write,
+            on_write_succeeded,
+            on_write_failed,
+        )
         self._pending_writes.add(future)
         put_task = asyncio.create_task(self._queue.put(item))
         close_task = asyncio.create_task(self._closed_event.wait())

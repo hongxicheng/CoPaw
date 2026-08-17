@@ -515,10 +515,15 @@ stop 或 generation 撤销关闭新准入并推进 epoch；不属于 quiesce dra
 对于 `channel.send` 和 `channel.reaction`，handler 结果在 JSON-RPC response 成功写入前只
 是 provisional：此时不得最终建立 target 或推进 stream sequence。response publication
 期间收到 cancel，或 response 写入失败时，attempt 必须收敛为 `unknown`；只有 response
-成功写入后才能提交 ACK 及 ordering 状态。transport send 成功返回及其后无 `await` 的
-同步状态提交共同构成唯一 publication 线性化点。已越过该点的 attempt 不得再被并发 stop、
-lease fencing 或 drain deadline 回滚为 `unknown`，尚未越过该点的 attempt 则继续受绝对
-drain deadline 和生命周期 fencing 约束。
+成功写入后才能提交 ACK 及 ordering 状态。唯一 publication 线性化点位于单一 writer 持有
+write lock 时、`writer.write()` 暴露 response frame 前：在该边界内先取得生命周期锁，重新
+检查 lease、generation、lifecycle 和绝对 drain deadline，选择最终 result 并提交完全一致的
+delivery/target/order 状态，随后无 `await` 地编码并调用 `writer.write()`。若
+`writer.write()` 未接受 frame，则在任何 transport cleanup await 前将已准备状态回滚为
+`unknown`；一旦 `writer.write()` 接受 frame，后续 `drain()`、finally、cancel 或 transport
+关闭不得回滚该 result，也不得发送第二个 response。已越过该点的 attempt 不得再被并发
+stop、lease fencing 或 drain deadline 回滚为 `unknown`，尚未越过该点的 attempt 则继续受
+绝对 drain deadline 和生命周期 fencing 约束。
 
 `channel.reaction` 使用独立的 closed `ReactionParams`，包含 identity、唯一
 `delivery_id`、`to_handle`、`target_delivery_id` 和 `reaction`。v1 只允许

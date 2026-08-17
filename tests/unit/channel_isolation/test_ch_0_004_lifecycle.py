@@ -6,8 +6,10 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import math
 import traceback
+from collections.abc import Awaitable, Callable
 
 import pytest
 
@@ -22,6 +24,7 @@ from qwenpaw.channel_protocol import (
     CoreLifecycleAdapter,
     HostStateStore,
     FixtureSecretHandleConsumer,
+    FramedTransport,
     PrepareParams,
     QuiesceParams,
     RpcError,
@@ -43,12 +46,26 @@ class MemoryTransport:
         self.closed = False
         self.sent_messages: list[str] = []
 
-    async def send(self, message: str) -> None:
+    async def send(
+        self,
+        message: str,
+        *,
+        prepare_write: Callable[[], str | Awaitable[str]] | None = None,
+        on_write_succeeded: Callable[[], None] | None = None,
+        on_write_failed: Callable[[], None] | None = None,
+    ) -> None:
         """Deliver one message to the peer."""
+        _ = on_write_failed
         if self.closed or self.peer is None or self.peer.closed:
             raise ConnectionError("transport closed")
+        if prepare_write is not None:
+            message = prepare_write()
+            if inspect.isawaitable(message):
+                message = await message
         self.sent_messages.append(message)
-        await self.peer.inbox.put(message)
+        self.peer.inbox.put_nowait(message)
+        if on_write_succeeded is not None:
+            on_write_succeeded()
 
     async def receive(self) -> str:
         """Receive one message from the peer."""
@@ -75,7 +92,14 @@ class BlockingSendResponseTransport(MemoryTransport):
         self.response_started = asyncio.Event()
         self.release_response = asyncio.Event()
 
-    async def send(self, message: str) -> None:
+    async def send(
+        self,
+        message: str,
+        *,
+        prepare_write: Callable[[], str | Awaitable[str]] | None = None,
+        on_write_succeeded: Callable[[], None] | None = None,
+        on_write_failed: Callable[[], None] | None = None,
+    ) -> None:
         """Pause only the selected successful response publication."""
         if (
             f'"id":"{self.request_id}"' in message
@@ -83,7 +107,45 @@ class BlockingSendResponseTransport(MemoryTransport):
         ):
             self.response_started.set()
             await self.release_response.wait()
-        await super().send(message)
+        await super().send(
+            message,
+            prepare_write=prepare_write,
+            on_write_succeeded=on_write_succeeded,
+            on_write_failed=on_write_failed,
+        )
+
+
+class VisibleBlockingSendResponseTransport(MemoryTransport):
+    """Block after the selected response is visible to the peer."""
+
+    def __init__(self, request_id: str) -> None:
+        super().__init__()
+        self.request_id = request_id
+        self.response_started = asyncio.Event()
+        self.release_response = asyncio.Event()
+
+    async def send(
+        self,
+        message: str,
+        *,
+        prepare_write: Callable[[], str | Awaitable[str]] | None = None,
+        on_write_succeeded: Callable[[], None] | None = None,
+        on_write_failed: Callable[[], None] | None = None,
+    ) -> None:
+        """Deliver the selected response before blocking send completion."""
+        selected = (
+            f'"id":"{self.request_id}"' in message
+            and '"state":"acknowledged"' in message
+        )
+        await super().send(
+            message,
+            prepare_write=prepare_write,
+            on_write_succeeded=on_write_succeeded,
+            on_write_failed=on_write_failed,
+        )
+        if selected:
+            self.response_started.set()
+            await self.release_response.wait()
 
 
 class FailingSendResponseTransport(MemoryTransport):
@@ -94,15 +156,94 @@ class FailingSendResponseTransport(MemoryTransport):
         self.request_id = request_id
         self.response_failed = asyncio.Event()
 
-    async def send(self, message: str) -> None:
+    async def send(
+        self,
+        message: str,
+        *,
+        prepare_write: Callable[[], str | Awaitable[str]] | None = None,
+        on_write_succeeded: Callable[[], None] | None = None,
+        on_write_failed: Callable[[], None] | None = None,
+    ) -> None:
         """Raise once the selected successful response is published."""
         if (
             f'"id":"{self.request_id}"' in message
             and '"state":"acknowledged"' in message
         ):
             self.response_failed.set()
+            if prepare_write is not None:
+                prepared = prepare_write()
+                if inspect.isawaitable(prepared):
+                    await prepared
+            if on_write_failed is not None:
+                on_write_failed()
             raise ConnectionError("response write failed")
-        await super().send(message)
+        await super().send(
+            message,
+            prepare_write=prepare_write,
+            on_write_succeeded=on_write_succeeded,
+            on_write_failed=on_write_failed,
+        )
+
+
+class LinkedFrameWriter:
+    """Expose frames to a peer reader before controllable drain returns."""
+
+    def __init__(self, peer_reader: asyncio.StreamReader) -> None:
+        self.peer_reader = peer_reader
+        self.closed = False
+        self.block_next = False
+        self.block_request_id: str | None = None
+        self.frame_visible = asyncio.Event()
+        self.drain_release = asyncio.Event()
+        self.drain_release.set()
+        self._current_write_blocked = False
+
+    def block_next_write(self) -> None:
+        """Block drain for the next accepted frame."""
+        self.block_next = True
+        self.block_request_id = None
+        self.frame_visible = asyncio.Event()
+        self.drain_release = asyncio.Event()
+
+    def block_response(self, request_id: str) -> None:
+        """Block drain after one selected response becomes visible."""
+        self.block_next = False
+        self.block_request_id = request_id
+        self.frame_visible = asyncio.Event()
+        self.drain_release = asyncio.Event()
+
+    def write(self, data: bytes) -> None:
+        """Make one frame visible before the matching drain call."""
+        if self.closed:
+            raise BrokenPipeError("writer closed")
+        marker = (
+            self.block_request_id is not None
+            and f'"id":"{self.block_request_id}"'.encode() in data
+        )
+        self._current_write_blocked = self.block_next or marker
+        self.block_next = False
+        if marker:
+            self.block_request_id = None
+        self.peer_reader.feed_data(data)
+        if self._current_write_blocked:
+            self.frame_visible.set()
+
+    async def drain(self) -> None:
+        """Hold the selected write after its bytes are peer-visible."""
+        if self._current_write_blocked:
+            await self.drain_release.wait()
+            self._current_write_blocked = False
+
+    def close(self) -> None:
+        """Close the linked reader and release any blocked drain."""
+        if self.closed:
+            return
+        self.closed = True
+        self.drain_release.set()
+        self.peer_reader.feed_eof()
+
+    async def wait_closed(self) -> None:
+        """Match the asyncio writer shutdown API."""
 
 
 def _transport_pair() -> tuple[MemoryTransport, MemoryTransport]:
@@ -112,6 +253,27 @@ def _transport_pair() -> tuple[MemoryTransport, MemoryTransport]:
     left.peer = right
     right.peer = left
     return left, right
+
+
+def _framed_transport_pair() -> (
+    tuple[
+        FramedTransport,
+        FramedTransport,
+        LinkedFrameWriter,
+        LinkedFrameWriter,
+    ]
+):
+    """Create linked framed transports with observable writer boundaries."""
+    left_reader = asyncio.StreamReader()
+    right_reader = asyncio.StreamReader()
+    left_writer = LinkedFrameWriter(right_reader)
+    right_writer = LinkedFrameWriter(left_reader)
+    return (
+        FramedTransport(left_reader, left_writer),
+        FramedTransport(right_reader, right_writer),
+        left_writer,
+        right_writer,
+    )
 
 
 class Clock:
@@ -891,6 +1053,55 @@ async def _active_outbound_rpc_pair(
     return controller, core, runner
 
 
+async def _active_framed_outbound_rpc_pair(
+    capabilities: list[str],
+    *,
+    clock: Clock | None = None,
+) -> tuple[
+    LifecycleController,
+    RpcPeer,
+    RpcPeer,
+    LinkedFrameWriter,
+    LinkedFrameWriter,
+]:
+    """Create an active RPC pair over real framed transports."""
+    (
+        left_transport,
+        right_transport,
+        left_writer,
+        right_writer,
+    ) = _framed_transport_pair()
+    core = RpcPeer(left_transport)
+    runner = RpcPeer(right_transport)
+    controller = LifecycleController(
+        channel_key="voice",
+        instance_id="instance-1",
+        generation=7,
+        environment_spec_id="ches1_" + "1" * 64,
+        environment_id="ches1_" + "1" * 64 + ".install1_" + "2" * 32,
+        capabilities=tuple(capabilities),
+        clock_ms=clock or Clock(),
+    )
+    controller.register_rpc_methods(runner)
+    CoreLifecycleAdapter(controller).register_rpc_methods(core)
+    await asyncio.gather(core.start(), runner.start())
+    await runner.call("runner.hello", _hello().to_mapping())
+    await core.call(
+        "channel.prepare",
+        {
+            **_identity(),
+            "host_context": {},
+            "capabilities": capabilities,
+        },
+    )
+    lease = LeaseParams.from_mapping(
+        {**_identity(), "lease_token": "publication", "lease_ttl_ms": 100},
+    )
+    await core.call("channel.activate", lease.to_mapping())
+    await core.call("channel.commit", lease.to_mapping())
+    return controller, core, runner, left_writer, right_writer
+
+
 @pytest.mark.asyncio
 async def test_outbound_operations_enforce_capabilities_and_order() -> None:
     """Outbound targets, sequences, capabilities, and reactions are stable."""
@@ -1660,7 +1871,7 @@ async def test_cancel_during_response_publication_rolls_back_ack() -> None:
 @pytest.mark.asyncio
 async def test_sent_ack_linearizes_before_stop_fencing() -> None:
     """A sent ACK remains authoritative while its callback waits."""
-    right_transport = BlockingSendResponseTransport("rpc-4")
+    right_transport = VisibleBlockingSendResponseTransport("rpc-4")
     controller, core, runner = await _active_outbound_rpc_pair(
         right_transport,
         ["media"],
@@ -1701,10 +1912,51 @@ async def test_sent_ack_linearizes_before_stop_fencing() -> None:
 
 
 @pytest.mark.asyncio
+async def test_visible_framed_ack_survives_stop_during_drain() -> None:
+    """A peer-visible framed ACK cannot be retracted during drain."""
+    (
+        controller,
+        core,
+        runner,
+        _,
+        right_writer,
+    ) = await _active_framed_outbound_rpc_pair(["media"])
+    right_writer.block_response("rpc-4")
+    payload = {
+        **_identity(),
+        "delivery_id": "visible-before-stop",
+        "to_handle": "chat-1",
+        "content_parts": [{"type": "text", "text": "hello"}],
+    }
+    request = asyncio.create_task(core.call("channel.send", payload))
+
+    await asyncio.wait_for(right_writer.frame_visible.wait(), timeout=1.0)
+    result = await asyncio.wait_for(request, timeout=1.0)
+    await core.notify(
+        "request.cancel",
+        {"request_id": "rpc-4", "reason": "late_cancel"},
+    )
+    await asyncio.sleep(0)
+    stopped = await controller.stop(
+        IdentityParams.from_mapping(_identity()),
+    )
+
+    assert result["state"] == "acknowledged"
+    assert stopped["state"] == "stopped"
+    assert (
+        controller._outbound_delivery_states["visible-before-stop"].value
+        == "acknowledged"
+    )
+    assert "visible-before-stop" in controller._outbound_targets
+    right_writer.drain_release.set()
+    await asyncio.gather(core.aclose(), runner.aclose())
+
+
+@pytest.mark.asyncio
 async def test_sent_ack_linearizes_before_lease_expiry() -> None:
     """Lease fencing cannot retract an already sent ACK."""
     clock = Clock()
-    right_transport = BlockingSendResponseTransport("rpc-4")
+    right_transport = VisibleBlockingSendResponseTransport("rpc-4")
     controller, core, runner = await _active_outbound_rpc_pair(
         right_transport,
         ["media"],
@@ -1749,9 +2001,54 @@ async def test_sent_ack_linearizes_before_lease_expiry() -> None:
 
 
 @pytest.mark.asyncio
+async def test_framed_writer_rechecks_lease_before_visible_result() -> None:
+    """Writer publication emits unknown after a queued lease expires."""
+    clock = Clock()
+    (
+        controller,
+        core,
+        runner,
+        _,
+        right_writer,
+    ) = await _active_framed_outbound_rpc_pair(["media"], clock=clock)
+    right_writer.block_next_write()
+    blocker = asyncio.create_task(runner.notify("test.blocker"))
+    await asyncio.wait_for(right_writer.frame_visible.wait(), timeout=1.0)
+    payload = {
+        **_identity(),
+        "delivery_id": "expired-before-write",
+        "to_handle": "chat-1",
+        "content_parts": [{"type": "text", "text": "hello"}],
+    }
+    request = asyncio.create_task(core.call("channel.send", payload))
+
+    while (
+        "expired-before-write" not in controller._outbound_attempts
+        or not controller._outbound_attempts[
+            "expired-before-write"
+        ].provisional
+    ):
+        await asyncio.sleep(0)
+    clock.now = 1100
+    right_writer.drain_release.set()
+    await blocker
+    result = await asyncio.wait_for(request, timeout=1.0)
+
+    assert result["state"] == "unknown"
+    assert result["reason_code"] == "LEASE_EXPIRED"
+    assert controller.state is RunnerState.FAILED
+    assert (
+        controller._outbound_delivery_states["expired-before-write"].value
+        == "unknown"
+    )
+    assert "expired-before-write" not in controller._outbound_targets
+    await asyncio.gather(core.aclose(), runner.aclose())
+
+
+@pytest.mark.asyncio
 async def test_sent_ack_linearizes_before_zero_drain_deadline() -> None:
     """A sent ACK wins before a queued zero-deadline quiesce."""
-    right_transport = BlockingSendResponseTransport("rpc-4")
+    right_transport = VisibleBlockingSendResponseTransport("rpc-4")
     controller, core, runner = await _active_outbound_rpc_pair(
         right_transport,
         ["media"],
@@ -1826,6 +2123,50 @@ async def test_zero_drain_deadline_prevents_unsent_ack_publication() -> None:
         == "unknown"
     )
     assert "drain-before-publication" not in controller._outbound_targets
+    await asyncio.gather(core.aclose(), runner.aclose())
+
+
+@pytest.mark.asyncio
+async def test_framed_writer_rechecks_absolute_drain_deadline() -> None:
+    """A past absolute deadline changes the written result to unknown."""
+    (
+        controller,
+        core,
+        runner,
+        _,
+        right_writer,
+    ) = await _active_framed_outbound_rpc_pair(["media"])
+    right_writer.block_next_write()
+    blocker = asyncio.create_task(runner.notify("test.blocker"))
+    await asyncio.wait_for(right_writer.frame_visible.wait(), timeout=1.0)
+    payload = {
+        **_identity(),
+        "delivery_id": "deadline-before-write",
+        "to_handle": "chat-1",
+        "content_parts": [{"type": "text", "text": "hello"}],
+    }
+    request = asyncio.create_task(core.call("channel.send", payload))
+
+    while (
+        "deadline-before-write" not in controller._outbound_attempts
+        or not controller._outbound_attempts[
+            "deadline-before-write"
+        ].provisional
+    ):
+        await asyncio.sleep(0)
+    attempt = controller._outbound_attempts["deadline-before-write"]
+    attempt.drain_deadline = asyncio.get_running_loop().time()
+    right_writer.drain_release.set()
+    await blocker
+    result = await asyncio.wait_for(request, timeout=1.0)
+
+    assert result["state"] == "unknown"
+    assert result["reason_code"] == "DRAIN_TIMEOUT"
+    assert (
+        controller._outbound_delivery_states["deadline-before-write"].value
+        == "unknown"
+    )
+    assert "deadline-before-write" not in controller._outbound_targets
     await asyncio.gather(core.aclose(), runner.aclose())
 
 

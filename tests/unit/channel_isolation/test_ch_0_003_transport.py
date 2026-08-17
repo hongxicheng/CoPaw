@@ -38,6 +38,7 @@ class FakeWriter:
         self.drain_started = asyncio.Event()
         self.drain_release = asyncio.Event()
         self.drain_release.set()
+        self.write_error: BaseException | None = None
         self.drain_error: BaseException | None = None
         self.active_drains = 0
         self.max_active_drains = 0
@@ -46,6 +47,8 @@ class FakeWriter:
         """Record an atomic transport write."""
         if self.closed:
             raise BrokenPipeError("writer closed")
+        if self.write_error is not None:
+            raise self.write_error
         self.frames.append(data)
 
     async def drain(self) -> None:
@@ -83,6 +86,12 @@ def _body(frame: bytes) -> str:
     return body.decode("utf-8")
 
 
+def _record_prepared_frame(events: list[str]) -> str:
+    """Record preparation and return a replacement test frame."""
+    events.append("prepared")
+    return '{"state":"acknowledged"}'
+
+
 @pytest.mark.asyncio
 async def test_concurrent_sends_use_one_non_interleaving_writer() -> None:
     """Concurrent callers produce complete frames in queue order."""
@@ -94,6 +103,72 @@ async def test_concurrent_sends_use_one_non_interleaving_writer() -> None:
 
     assert [_body(frame) for frame in writer.frames] == messages
     assert writer.max_active_drains == 1
+    await transport.aclose()
+
+
+@pytest.mark.asyncio
+async def test_write_boundary_prepares_before_frame_visibility() -> None:
+    """Preparation and publication run before drain can yield control."""
+    writer = FakeWriter()
+    writer.drain_release.clear()
+    transport = FramedTransport(_idle_reader(), writer)
+    events: list[str] = []
+
+    pending = asyncio.create_task(
+        transport.send(
+            '{"state":"provisional"}',
+            prepare_write=lambda: _record_prepared_frame(events),
+            on_write_succeeded=lambda: events.append("published"),
+            on_write_failed=lambda: events.append("failed"),
+        ),
+    )
+    await writer.drain_started.wait()
+
+    assert _body(writer.frames[0]) == '{"state":"acknowledged"}'
+    assert events == ["prepared", "published"]
+    writer.drain_release.set()
+    await pending
+    await transport.aclose()
+
+
+@pytest.mark.asyncio
+async def test_write_failure_rolls_back_before_close_wait() -> None:
+    """A rejected writer frame rolls back before asynchronous cleanup."""
+    writer = FakeWriter()
+    writer.write_error = BrokenPipeError("peer exited")
+    transport = FramedTransport(_idle_reader(), writer)
+    events: list[str] = []
+
+    with pytest.raises(FrameWriteError):
+        await transport.send(
+            '{"state":"provisional"}',
+            prepare_write=lambda: _record_prepared_frame(events),
+            on_write_succeeded=lambda: events.append("published"),
+            on_write_failed=lambda: events.append("failed"),
+        )
+
+    assert events == ["prepared", "failed"]
+    await transport.aclose()
+
+
+@pytest.mark.asyncio
+async def test_drain_failure_does_not_rollback_visible_frame() -> None:
+    """Drain failure cannot retract a frame accepted by writer.write."""
+    writer = FakeWriter()
+    writer.drain_error = BrokenPipeError("peer exited")
+    transport = FramedTransport(_idle_reader(), writer)
+    events: list[str] = []
+
+    with pytest.raises(FrameWriteError):
+        await transport.send(
+            '{"state":"provisional"}',
+            prepare_write=lambda: _record_prepared_frame(events),
+            on_write_succeeded=lambda: events.append("published"),
+            on_write_failed=lambda: events.append("failed"),
+        )
+
+    assert _body(writer.frames[0]) == '{"state":"acknowledged"}'
+    assert events == ["prepared", "published"]
     await transport.aclose()
 
 

@@ -344,16 +344,18 @@ JSON-RPC frame、返回值或 Runner 保存的 host context。
 `test_ch_0_004_lifecycle.py`。当前聚焦测试命令
 `conda run -n qwenpaw pytest -q tests/unit/channel_isolation/test_ch_0_004_models.py
 tests/unit/channel_isolation/test_ch_0_004_lifecycle.py
-tests/unit/channel_isolation/test_ch_0_004_rpc.py` 为 `67 passed`，相邻可靠性测试
+tests/unit/channel_isolation/test_ch_0_004_rpc.py` 为 `70 passed`，framing 回归测试
+`tests/unit/channel_isolation/test_ch_0_003_transport.py` 为 `15 passed`，相邻可靠性测试
 `tests/unit/channel_isolation/test_ch_0_005_reliability.py` 为 `13 passed`，
-`conda run -n qwenpaw pytest -q tests/unit/channel_isolation` 为 `260 passed`；目标文件
-pre-commit 全部通过（包括共同检查 `models.py` 与 `rpc.py` 的 mypy），`git diff --check`
-通过。原独立 Review 已通过（用户确认）；原实现
+`conda run -n qwenpaw pytest -q tests/unit/channel_isolation` 为 `266 passed`；目标文件
+pre-commit 全部通过（包括 mypy、black、flake8 和 pylint），`git diff --check` 通过。
+原独立 Review 已通过（用户确认）；原实现
 与修复提交为 `95836112`、`26958f06`、`339766f7`、`4cd74739`、`220aef20`、
-`85ed4907`、`deddbb65`、`f26d76a1`。对 `f26d76a1` 的复审发现 ACK 写出与生命周期
-状态提交之间仍存在异步锁窗口；本轮已将 transport send 成功及其后的无 `await` 同步状态
-提交冻结为唯一 publication 线性化点，并覆盖其与 stop、lease expiry、零 drain deadline
-的确定性竞争。
+`85ed4907`、`deddbb65`、`f26d76a1`、`b4ab6c86`。对 `b4ab6c86` 的复审发现真实
+`FramedTransport` 中 frame 可在 `writer.write()` 后、`drain()` 返回前被 Core 观察；本轮
+已将最终 result 选择和 ordering 状态提交移到单 writer 持锁、`writer.write()` 前的原子
+边界，覆盖 frame 已可见时的 stop/cancel、写前 lease expiry、绝对 drain deadline、
+`writer.write()` 失败回滚和 `drain()` 失败不回滚。
 本记录继续保持 `[-]`，等待新的独立 Review 和最终验证，通过前不得恢复为 `[x]`。
 
 ### CH-0-005：可靠事件、ACK 和幂等原型

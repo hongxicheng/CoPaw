@@ -414,6 +414,10 @@ class _OutboundAttempt:
     terminal_result: OutboundResult | None = None
     send_params: SendParams | None = None
     provisional: bool = False
+    publication_result: OutboundResult | None = None
+    publication_created_target: bool = False
+    publication_target_snapshot: dict[str, Any] | None = None
+    publication_lock_held: bool = False
     drain_timer: asyncio.TimerHandle | None = None
     done: asyncio.Event = field(default_factory=asyncio.Event)
 
@@ -1084,46 +1088,124 @@ class LifecycleController:
         """Keep an outbound result retractable until its response is sent."""
         return RpcResponsePublication(
             result=result,
-            on_published=lambda: self._publish_outbound_attempt(attempt),
+            on_prepare=lambda: self._prepare_outbound_publication(attempt),
+            on_published=lambda: self._publish_outbound_publication(attempt),
+            on_write_failed=lambda: self._rollback_outbound_publication(
+                attempt,
+            ),
             on_aborted=lambda reason_code: self._finish_outbound_unknown(
                 attempt,
                 reason_code,
             ),
         )
 
-    def _publish_outbound_attempt(
+    async def _prepare_outbound_publication(
+        self,
+        attempt: _OutboundAttempt,
+    ) -> dict[str, Any]:
+        """Choose and commit the final result before writer visibility."""
+        await self._lock.acquire()
+        attempt.publication_lock_held = True
+        try:
+            self._expire_lease_and_revoke()
+            if self._outbound_attempts.get(attempt.delivery_id) is not attempt:
+                return self._unknown_outbound_result(
+                    attempt.delivery_id,
+                    attempt.forced_reason or "LIFECYCLE_FENCED",
+                ).to_mapping()
+            result = attempt.terminal_result
+            if result is None:
+                result = self._unknown_outbound_result(
+                    attempt.delivery_id,
+                    attempt.forced_reason or "PLATFORM_RESULT_UNKNOWN",
+                )
+            result = self._fence_outbound_result_locked(attempt, result)
+            self._commit_outbound_result(
+                attempt,
+                result,
+                attempt.send_params,
+                reversible=True,
+            )
+            return result.to_mapping()
+        except BaseException:
+            self._release_outbound_publication_lock(attempt)
+            raise
+
+    def _publish_outbound_publication(
         self,
         attempt: _OutboundAttempt,
     ) -> None:
-        """Atomically publish delivery and ordering state after the frame."""
-        if self._outbound_attempts.get(attempt.delivery_id) is not attempt:
-            return
-        result = attempt.terminal_result
-        if result is None:
-            return
-        self._commit_outbound_result(
-            attempt,
-            result,
-            attempt.send_params,
-        )
+        """Finalize one result after writer.write accepted its frame."""
+        attempt.publication_result = None
+        attempt.publication_created_target = False
+        attempt.publication_target_snapshot = None
+        self._release_outbound_publication_lock(attempt)
 
     def _commit_outbound_result(
         self,
         attempt: _OutboundAttempt,
         result: OutboundResult,
         send_params: SendParams | None,
+        *,
+        reversible: bool = False,
     ) -> None:
         """Make one terminal result and its ordering effects visible."""
+        if reversible:
+            attempt.publication_result = result
         self._outbound_delivery_states[attempt.delivery_id] = result.state
         if (
             send_params is not None
             and result.state is DeliveryState.ACKNOWLEDGED
         ):
+            if send_params.operation in {
+                OutboundOperation.MESSAGE_CREATE,
+                OutboundOperation.STREAM_START,
+            }:
+                attempt.publication_created_target = reversible
+            elif reversible and attempt.target is not None:
+                snapshot = dict(attempt.target)
+                snapshot["pending_delivery_id"] = None
+                attempt.publication_target_snapshot = snapshot
             self._record_outbound_send(send_params, attempt.target)
         attempt.provisional = False
         attempt.terminal_result = None
         attempt.send_params = None
         self._complete_outbound_attempt_locked(attempt)
+
+    def _rollback_outbound_publication(
+        self,
+        attempt: _OutboundAttempt,
+    ) -> None:
+        """Retract a prepared result when writer.write rejected its frame."""
+        try:
+            if attempt.publication_result is None:
+                return
+            self._outbound_delivery_states[
+                attempt.delivery_id
+            ] = DeliveryState.UNKNOWN
+            if attempt.publication_created_target:
+                self._outbound_targets.pop(attempt.delivery_id, None)
+            elif (
+                attempt.publication_target_snapshot is not None
+                and attempt.target is not None
+            ):
+                attempt.target.clear()
+                attempt.target.update(attempt.publication_target_snapshot)
+            attempt.publication_result = None
+            attempt.publication_created_target = False
+            attempt.publication_target_snapshot = None
+        finally:
+            self._release_outbound_publication_lock(attempt)
+
+    def _release_outbound_publication_lock(
+        self,
+        attempt: _OutboundAttempt,
+    ) -> None:
+        """Release the lifecycle lock retained across writer.write."""
+        if not attempt.publication_lock_held:
+            return
+        attempt.publication_lock_held = False
+        self._lock.release()
 
     def _fence_outbound_result_locked(
         self,
@@ -1507,6 +1589,10 @@ class LifecycleController:
 
     async def _expire_lease_if_needed_async(self) -> None:
         """Fence an expired lease and revoke its endpoint registration."""
+        self._expire_lease_and_revoke()
+
+    def _expire_lease_and_revoke(self) -> None:
+        """Synchronously fence expiry at lifecycle or writer boundaries."""
         had_endpoint = self.endpoint is not None
         was_failed = self.state is RunnerState.FAILED
         self._expire_lease_if_needed()
