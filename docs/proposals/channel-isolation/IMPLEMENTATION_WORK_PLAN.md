@@ -303,7 +303,7 @@ descriptor validator 和聚焦单测机械验证；ADR-035/036 已确认。独�
 
 ### CH-0-004：JSON-RPC 2.0、Schema 和生命周期
 
-- 状态：[-] 协议缺口已重新实施并验证，等待独立 Review。
+- 状态：[x] 独立 Review 和最终验证通过
 
 - [x] 实现 JSON-RPC 2.0 request、response、notification、error 和 cancel。
 - [x] 实现 pending request 上限、request timeout、未知方法和重复 response 处理。
@@ -350,9 +350,9 @@ tests/unit/channel_isolation/test_ch_0_004_rpc.py` 为 `74 passed`，framing 回
 `tests/unit/channel_isolation/test_ch_0_006_bootstrap.py` 为 `20 passed`，
 `conda run -n qwenpaw pytest -q tests/unit/channel_isolation` 为 `271 passed`；目标文件
 pre-commit 全部通过（包括 mypy、black、flake8 和 pylint），`git diff --check` 通过。
-原独立 Review 已通过（用户确认）；原实现
-与修复提交为 `95836112`、`26958f06`、`339766f7`、`4cd74739`、`220aef20`、
-`85ed4907`、`deddbb65`、`f26d76a1`、`b4ab6c86`、`2ee4eecd`、`9fcc9058`。
+实现与历次修复提交为 `95836112`、`26958f06`、`339766f7`、`4cd74739`、
+`220aef20`、`85ed4907`、`deddbb65`、`f26d76a1`、`b4ab6c86`、`2ee4eecd`、
+`9fcc9058`、`5c53ff7b` 和 `59becc9a`。
 对 `5c53ff7b` 的复审发现 Windows response acceptance deferred settlement 期间会把
 prepared `stream.start` target 提前写入正式 ordering 表，使并发 `stream.delta` 可在原
 frame 最终失败前执行平台副作用；本轮已将 prepared delivery/target/order 保存在 attempt
@@ -372,7 +372,8 @@ publication 边界延后到后台线程完成完整 HANDLE 写入，并让所有
 写入失败路径幂等收敛为 `unknown`。回归测试覆盖 Windows 零进展写入不建立 ACK/target，
 以及 prepare 等锁期间关闭 transport 后移除 attempt、清除 stream busy 标记且不推进
 sequence。
-本记录继续保持 `[-]`，等待新的独立 Review 和最终验证，通过前不得恢复为 `[x]`。
+最新修复提交 `59becc9a` 的独立 Review 已通过（用户确认）；上述聚焦、相邻、全组测试和
+目标文件 pre-commit 作为最终验证证据均通过，本任务状态更新为 `[x]`。
 
 ### CH-0-005：可靠事件、ACK 和幂等原型
 
