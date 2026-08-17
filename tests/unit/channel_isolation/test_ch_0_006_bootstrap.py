@@ -20,6 +20,7 @@ import packaging
 import pytest
 
 from qwenpaw.channel_protocol import (
+    FrameClosedError,
     FrameLimitError,
     FrameTimeoutError,
     FrameWriteError,
@@ -243,6 +244,27 @@ class _BlockedWriteHandle:
 
     def close(self) -> None:
         """Mark the fake protocol handle closed."""
+        self.closed = True
+
+
+class _LateSuccessfulWriteHandle:
+    """Complete one blocked write even after cancellation was requested."""
+
+    def __init__(self) -> None:
+        self.data = bytearray()
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.closed = False
+
+    def write(self, data: bytes) -> int:
+        """Wait past the deadline, then accept the complete frame."""
+        self.started.set()
+        self.release.wait(timeout=1)
+        self.data.extend(data)
+        return len(data)
+
+    def close(self) -> None:
+        """Record closure without changing the in-flight write result."""
         self.closed = True
 
 
@@ -762,6 +784,42 @@ async def test_windows_timeout_cancels_frame_and_closes_writer(
     await asyncio.sleep(0.01)
 
     assert blocked_handle.data == b""
+
+
+@pytest.mark.asyncio
+async def test_windows_late_success_preserves_timeout_and_closes_transport(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A late accepted HANDLE frame cannot turn a timeout into success."""
+    handle = _LateSuccessfulWriteHandle()
+    thread_handle = _FakeWindowsThreadHandle()
+    monkeypatch.setattr(os, "name", "nt")
+    monkeypatch.setattr(
+        runner_bootstrap,
+        "_open_windows_thread_handle",
+        lambda: thread_handle,
+    )
+    transport = await _open_protocol_transport(
+        FramedTransport,
+        handle,
+        limits=FramingLimits(write_timeout=0.02),
+    )
+    sending = asyncio.create_task(transport.send("{}"))
+    assert await asyncio.to_thread(handle.started.wait, 1)
+
+    with pytest.raises(FrameTimeoutError):
+        await asyncio.wait_for(sending, timeout=0.2)
+    assert transport.is_closed
+
+    handle.release.set()
+    while not handle.closed:
+        await asyncio.sleep(0)
+
+    assert bytes(handle.data) == encode_frame("{}")
+    with pytest.raises(FrameClosedError):
+        await transport.send("{}")
+    await transport.aclose()
+    assert thread_handle.closed
 
 
 @pytest.mark.asyncio

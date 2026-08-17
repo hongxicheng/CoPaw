@@ -528,6 +528,14 @@ result，也不得发送第二个 response。已越过该点的 attempt 不得�
 fencing 或 drain deadline 回滚为 `unknown`，尚未越过该点的 attempt 则继续受绝对 drain
 deadline 和生命周期 fencing 约束。
 
+底层 frame acceptance 与外层 write deadline/cancel 是两个独立事实。若 deadline 或 cancel
+先发生，transport 必须立即关闭新写入并向原调用传播 `FrameTimeoutError` 或取消，不能因
+HANDLE 随后成功而把原调用改为正常成功；底层 acceptance settlement 则继续独立收敛。若
+完整 frame 迟到成功，仍执行唯一 `on_write_succeeded`、保留已可见 ACK/target/order 并释放
+publication 生命周期锁；若 frame 未被接受，则执行唯一 rollback 并收敛为 `unknown`。
+settlement 不得阻塞原调用传播 deadline/cancel，也不得令已关闭 writer 对外表现为可继续
+使用的 transport。
+
 `channel.reaction` 使用独立的 closed `ReactionParams`，包含 identity、唯一
 `delivery_id`、`to_handle`、`target_delivery_id` 和 `reaction`。v1 只允许
 `reaction=completed`，目标必须是先前成功接收的 `message.create` 或 `stream.start`；

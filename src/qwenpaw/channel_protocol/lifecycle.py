@@ -1093,6 +1093,9 @@ class LifecycleController:
             on_write_failed=lambda: self._rollback_outbound_publication(
                 attempt,
             ),
+            on_write_deferred=lambda: self._defer_outbound_publication(
+                attempt,
+            ),
             on_aborted=lambda reason_code: self._finish_outbound_unknown(
                 attempt,
                 reason_code,
@@ -1134,11 +1137,33 @@ class LifecycleController:
     def _publish_outbound_publication(
         self,
         attempt: _OutboundAttempt,
-    ) -> None:
+    ) -> Any:
         """Finalize one result after output accepted its complete frame."""
+        if not attempt.publication_lock_held:
+            if attempt.publication_result is None:
+                return None
+            return self._publish_deferred_outbound_publication(attempt)
         attempt.publication_result = None
         attempt.publication_created_target = False
         attempt.publication_target_snapshot = None
+        self._release_outbound_publication_lock(attempt)
+        return None
+
+    async def _publish_deferred_outbound_publication(
+        self,
+        attempt: _OutboundAttempt,
+    ) -> None:
+        """Finalize a late accepted frame without blocking lifecycle work."""
+        async with self._lock:
+            attempt.publication_result = None
+            attempt.publication_created_target = False
+            attempt.publication_target_snapshot = None
+
+    def _defer_outbound_publication(
+        self,
+        attempt: _OutboundAttempt,
+    ) -> None:
+        """Release lifecycle work while HANDLE acceptance remains pending."""
         self._release_outbound_publication_lock(attempt)
 
     def _commit_outbound_result(
@@ -1175,8 +1200,28 @@ class LifecycleController:
     def _rollback_outbound_publication(
         self,
         attempt: _OutboundAttempt,
-    ) -> None:
+    ) -> Any:
         """Retract a result when output rejected its complete frame."""
+        if not attempt.publication_lock_held:
+            if attempt.publication_result is None:
+                return None
+            return self._rollback_deferred_outbound_publication(attempt)
+        self._rollback_outbound_publication_locked(attempt)
+        return None
+
+    async def _rollback_deferred_outbound_publication(
+        self,
+        attempt: _OutboundAttempt,
+    ) -> None:
+        """Rollback a late rejected frame without blocking lifecycle work."""
+        async with self._lock:
+            self._rollback_outbound_publication_locked(attempt)
+
+    def _rollback_outbound_publication_locked(
+        self,
+        attempt: _OutboundAttempt,
+    ) -> None:
+        """Rollback one prepared publication while holding the state lock."""
         try:
             if attempt.publication_result is None:
                 return

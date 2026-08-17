@@ -9,6 +9,7 @@ import asyncio
 import inspect
 import json
 import math
+import threading
 import traceback
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -27,6 +28,7 @@ from qwenpaw.channel_protocol import (
     HostStateStore,
     FixtureSecretHandleConsumer,
     FramedTransport,
+    FramingLimits,
     PrepareParams,
     QuiesceParams,
     RpcError,
@@ -57,9 +59,10 @@ class MemoryTransport:
         prepare_write: Callable[[], str | Awaitable[str]] | None = None,
         on_write_succeeded: Callable[[], None] | None = None,
         on_write_failed: Callable[[], None] | None = None,
+        on_write_deferred: Callable[[], None] | None = None,
     ) -> None:
         """Deliver one message to the peer."""
-        _ = on_write_failed
+        _ = on_write_failed, on_write_deferred
         if self.closed or self.peer is None or self.peer.closed:
             raise ConnectionError("transport closed")
         if prepare_write is not None:
@@ -103,6 +106,7 @@ class BlockingSendResponseTransport(MemoryTransport):
         prepare_write: Callable[[], str | Awaitable[str]] | None = None,
         on_write_succeeded: Callable[[], None] | None = None,
         on_write_failed: Callable[[], None] | None = None,
+        on_write_deferred: Callable[[], None] | None = None,
     ) -> None:
         """Pause only the selected successful response publication."""
         if (
@@ -116,6 +120,7 @@ class BlockingSendResponseTransport(MemoryTransport):
             prepare_write=prepare_write,
             on_write_succeeded=on_write_succeeded,
             on_write_failed=on_write_failed,
+            on_write_deferred=on_write_deferred,
         )
 
 
@@ -135,6 +140,7 @@ class VisibleBlockingSendResponseTransport(MemoryTransport):
         prepare_write: Callable[[], str | Awaitable[str]] | None = None,
         on_write_succeeded: Callable[[], None] | None = None,
         on_write_failed: Callable[[], None] | None = None,
+        on_write_deferred: Callable[[], None] | None = None,
     ) -> None:
         """Deliver the selected response before blocking send completion."""
         selected = (
@@ -146,6 +152,7 @@ class VisibleBlockingSendResponseTransport(MemoryTransport):
             prepare_write=prepare_write,
             on_write_succeeded=on_write_succeeded,
             on_write_failed=on_write_failed,
+            on_write_deferred=on_write_deferred,
         )
         if selected:
             self.response_started.set()
@@ -167,6 +174,7 @@ class FailingSendResponseTransport(MemoryTransport):
         prepare_write: Callable[[], str | Awaitable[str]] | None = None,
         on_write_succeeded: Callable[[], None] | None = None,
         on_write_failed: Callable[[], None] | None = None,
+        on_write_deferred: Callable[[], None] | None = None,
     ) -> None:
         """Raise once the selected successful response is published."""
         if (
@@ -186,6 +194,7 @@ class FailingSendResponseTransport(MemoryTransport):
             prepare_write=prepare_write,
             on_write_succeeded=on_write_succeeded,
             on_write_failed=on_write_failed,
+            on_write_deferred=on_write_deferred,
         )
 
 
@@ -262,6 +271,27 @@ class RejectingPipeHandle:
 
     def close(self) -> None:
         """Record closure of the protocol handle."""
+        self.closed = True
+
+
+class LateSuccessfulPipeHandle:
+    """Accept one Windows frame only after the write deadline expires."""
+
+    def __init__(self) -> None:
+        self.data = bytearray()
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.closed = False
+
+    def write(self, data: bytes) -> int:
+        """Block in the writer thread, then accept the complete frame."""
+        self.started.set()
+        self.release.wait(timeout=1)
+        self.data.extend(data)
+        return len(data)
+
+    def close(self) -> None:
+        """Record closure without changing the pending write result."""
         self.closed = True
 
 
@@ -2369,6 +2399,71 @@ async def test_windows_handle_failure_rolls_back_outbound_publication(
     assert "windows-rejected-publication" not in (
         controller._outbound_attempts
     )
+    await runner.aclose()
+    assert handle.closed
+    assert thread_handle.closed
+
+
+@pytest.mark.asyncio
+async def test_windows_late_ack_keeps_publication_and_releases_lifecycle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A late Windows ACK survives timeout without blocking lifecycle work."""
+    handle = LateSuccessfulPipeHandle()
+    thread_handle = FakeWindowsThreadHandle()
+    monkeypatch.setattr(
+        runner_bootstrap,
+        "_open_windows_thread_handle",
+        lambda: thread_handle,
+    )
+    writer = runner_bootstrap._ThreadPipeWriter(handle)
+    transport = FramedTransport(
+        asyncio.StreamReader(),
+        writer,
+        limits=FramingLimits(write_timeout=0.02),
+    )
+    runner = RpcPeer(transport)
+    controller = _controller(Clock())
+    controller.register_rpc_methods(runner)
+    await _activate_outbound_controller(controller, ["media"])
+    payload = {
+        **_identity(),
+        "delivery_id": "windows-late-publication",
+        "to_handle": "chat-1",
+        "content_parts": [{"type": "text", "text": "hello"}],
+    }
+
+    await runner._dispatch_raw(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": "windows-late-response",
+                "method": "channel.send",
+                "params": payload,
+            },
+            separators=(",", ":"),
+        ),
+    )
+    assert await asyncio.to_thread(handle.started.wait, 1)
+    while not transport.is_closed:
+        await asyncio.sleep(0)
+
+    stopping = asyncio.create_task(
+        controller.stop(IdentityParams.from_mapping(_identity())),
+    )
+    stopped = await asyncio.wait_for(stopping, timeout=0.1)
+    assert stopped["state"] == "stopped"
+
+    handle.release.set()
+    while (
+        controller._outbound_delivery_states["windows-late-publication"].value
+        != "acknowledged"
+    ):
+        await asyncio.sleep(0)
+
+    assert "windows-late-publication" in controller._outbound_targets
+    assert "windows-late-publication" not in controller._outbound_attempts
+    assert not controller._lock.locked()
     await runner.aclose()
     assert handle.closed
     assert thread_handle.closed

@@ -86,8 +86,10 @@ class RpcResponsePublication:
     on_prepare: PublicationPrepareCallback
     on_published: PublicationCallback
     on_write_failed: PublicationWriteFailedCallback
+    on_write_deferred: PublicationCallback
     on_aborted: PublicationAbortCallback
     published: bool = False
+    deferred: bool = False
 
 
 @dataclass(frozen=True)
@@ -316,20 +318,35 @@ class RpcPeer:
                 RpcResponse(message.id, result=result).to_mapping(),
             )
 
-        def write_succeeded() -> None:
+        def write_succeeded() -> Any:
             """Record that the output accepted the complete response frame."""
-            publication.published = True
-            publication.on_published()
+            result = publication.on_published()
+            if not inspect.isawaitable(result):
+                publication.published = True
+                return None
 
-        def write_failed() -> None:
+            async def complete() -> None:
+                """Publish one deferred acceptance under its state lock."""
+                await result
+                publication.published = True
+
+            return complete()
+
+        def write_failed() -> Any:
             """Rollback state when the frame was never accepted."""
-            publication.on_write_failed()
+            return publication.on_write_failed()
+
+        def write_deferred() -> None:
+            """Release publication fencing after timeout or cancellation."""
+            publication.deferred = True
+            publication.on_write_deferred()
 
         await self._transport.send(
             encoded,
             prepare_write=prepare_write,
             on_write_succeeded=write_succeeded,
             on_write_failed=write_failed,
+            on_write_deferred=write_deferred,
         )
 
     async def _reader_loop(self) -> None:
@@ -537,7 +554,11 @@ class RpcPeer:
         reason_code: str,
     ) -> bool:
         """Abort provisional state unless its response was already sent."""
-        if response_sent or publication is not None and publication.published:
+        if (
+            response_sent
+            or publication is not None
+            and (publication.published or publication.deferred)
+        ):
             return True
         if publication is not None:
             await self._run_publication_callback(

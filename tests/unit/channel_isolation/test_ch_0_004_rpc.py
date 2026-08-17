@@ -37,9 +37,10 @@ class MemoryTransport:
         prepare_write: Callable[[], str | Awaitable[str]] | None = None,
         on_write_succeeded: Callable[[], None] | None = None,
         on_write_failed: Callable[[], None] | None = None,
+        on_write_deferred: Callable[[], None] | None = None,
     ) -> None:
         """Deliver one complete framed message to the peer."""
-        _ = on_write_failed
+        _ = on_write_failed, on_write_deferred
         if self.closed or self.peer is None or self.peer.closed:
             raise ConnectionError("transport closed")
         if prepare_write is not None:

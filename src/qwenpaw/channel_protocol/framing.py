@@ -195,8 +195,9 @@ class _WriteItem:
     data: bytes
     future: asyncio.Future[None]
     prepare_write: Callable[[], str | Awaitable[str]] | None = None
-    on_write_succeeded: Callable[[], None] | None = None
-    on_write_failed: Callable[[], None] | None = None
+    on_write_succeeded: Callable[[], Any] | None = None
+    on_write_failed: Callable[[], Any] | None = None
+    on_write_deferred: Callable[[], None] | None = None
 
 
 class FramedTransport:
@@ -220,6 +221,7 @@ class FramedTransport:
         self._closed_event = asyncio.Event()
         self._close_lock = asyncio.Lock()
         self._write_lock = asyncio.Lock()
+        self._deferred_acceptances: set[asyncio.Task[None]] = set()
         self._writer_task = asyncio.create_task(self._write_loop())
 
     @property
@@ -238,14 +240,55 @@ class FramedTransport:
             raise FrameProtocolError("prepared frame must be text")
         return encode_frame(message, limits=self._limits)
 
-    async def _wait_write_accepted(self) -> None:
-        """Wait when an adapter defers actual frame acceptance."""
+    def _write_acceptance(self) -> Awaitable[None] | None:
+        """Return an adapter's deferred frame acceptance, if any."""
         callback = getattr(self._writer, "wait_write_accepted", None)
+        if callback is None:
+            return None
+        result = callback()
+        if inspect.isawaitable(result):
+            return result
+        return None
+
+    async def _settle_deferred_acceptance(
+        self,
+        item: _WriteItem,
+        acceptance: asyncio.Task[None],
+    ) -> None:
+        """Publish or rollback a frame after its caller already stopped."""
+        callback = item.on_write_succeeded
+        try:
+            await asyncio.shield(acceptance)
+        except BaseException:
+            callback = item.on_write_failed
         if callback is None:
             return
         result = callback()
         if inspect.isawaitable(result):
             await result
+
+    def _consume_deferred_acceptance(
+        self,
+        task: asyncio.Task[None],
+    ) -> None:
+        """Release one completed deferred acceptance task."""
+        self._deferred_acceptances.discard(task)
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            task.result()
+
+    def _defer_write_acceptance(
+        self,
+        item: _WriteItem,
+        acceptance: asyncio.Task[None],
+    ) -> None:
+        """Settle an adapter result without hiding timeout or cancellation."""
+        if item.on_write_deferred is not None:
+            item.on_write_deferred()
+        settlement = asyncio.create_task(
+            self._settle_deferred_acceptance(item, acceptance),
+        )
+        self._deferred_acceptances.add(settlement)
+        settlement.add_done_callback(self._consume_deferred_acceptance)
 
     @staticmethod
     def _rollback_write_item(item: _WriteItem) -> None:
@@ -259,6 +302,7 @@ class FramedTransport:
         """Process one queued item under the single writer lock."""
         prepared = False
         visible = False
+        deferred = False
         try:
             async with self._write_lock:
                 if item.future.done():
@@ -268,19 +312,46 @@ class FramedTransport:
                 if item.future.done():
                     return
                 self._writer.write(data)
-                await asyncio.wait_for(
-                    self._wait_write_accepted(),
-                    timeout=self._limits.write_timeout,
-                )
+                acceptance = self._write_acceptance()
+                if acceptance is not None:
+                    acceptance_task = asyncio.ensure_future(acceptance)
+                    try:
+                        done, _ = await asyncio.wait(
+                            {acceptance_task},
+                            timeout=self._limits.write_timeout,
+                        )
+                    except asyncio.CancelledError:
+                        with contextlib.suppress(Exception):
+                            self._writer.close()
+                        self._defer_write_acceptance(
+                            item,
+                            acceptance_task,
+                        )
+                        deferred = True
+                        raise
+                    if acceptance_task not in done:
+                        with contextlib.suppress(Exception):
+                            self._writer.close()
+                        self._defer_write_acceptance(
+                            item,
+                            acceptance_task,
+                        )
+                        deferred = True
+                        raise asyncio.TimeoutError
+                    acceptance_task.result()
                 visible = True
                 if item.on_write_succeeded is not None:
-                    item.on_write_succeeded()
+                    callback_result = item.on_write_succeeded()
+                    if inspect.isawaitable(callback_result):
+                        raise RuntimeError(
+                            "immediate write publication must be synchronous",
+                        )
                 await asyncio.wait_for(
                     self._writer.drain(),
                     timeout=self._limits.write_timeout,
                 )
         finally:
-            if prepared and not visible:
+            if prepared and not visible and not deferred:
                 self._rollback_write_item(item)
 
     async def _fail_write_item(
@@ -350,6 +421,7 @@ class FramedTransport:
         prepare_write: Callable[[], str | Awaitable[str]] | None = None,
         on_write_succeeded: Callable[[], None] | None = None,
         on_write_failed: Callable[[], None] | None = None,
+        on_write_deferred: Callable[[], None] | None = None,
     ) -> None:
         """Enqueue one frame and wait until the OS stream accepts it."""
         if self._closed:
@@ -364,6 +436,7 @@ class FramedTransport:
             prepare_write,
             on_write_succeeded,
             on_write_failed,
+            on_write_deferred,
         )
         self._pending_writes.add(future)
         put_task = asyncio.create_task(self._queue.put(item))
@@ -392,6 +465,7 @@ class FramedTransport:
         except asyncio.CancelledError:
             if not future.done():
                 future.cancel()
+            await self._close()
             raise
         finally:
             put_task.cancel()
