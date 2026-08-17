@@ -519,22 +519,26 @@ stop 或 generation 撤销关闭新准入并推进 epoch；不属于 quiesce dra
 write lock 时、transport adapter 确认底层输出已接受完整 response frame 的边界：普通
 asyncio stream 可由同步 `writer.write()` 确认，Windows 线程托管 pipe 必须等待后台线程
 完成全部 HANDLE 写入，不能以进入线程队列作为确认。在该边界内先取得生命周期锁，重新
-检查 lease、generation、lifecycle 和绝对 drain deadline，选择最终 result 并提交完全一致的
-可回滚的 delivery/target/order prepared 状态，再向底层输出提交同一 frame；adapter 确认
-完整 frame 已被接受后，必须在不释放生命周期锁且无新 `await` 的回调中将 prepared 状态
-最终发布。若完整 frame 未被接受，则在任何 transport cleanup await 前将已准备状态回滚为
-`unknown`；一旦完整 frame 被接受，后续 finally、cancel 或 transport 关闭不得回滚该
-result，也不得发送第二个 response。已越过该点的 attempt 不得再被并发 stop、lease
+检查 lease、generation、lifecycle 和绝对 drain deadline，选择最终 result，并将完全一致的
+delivery/target/order 变更保存在 attempt 私有的 prepared 状态，再向底层输出提交同一
+frame。prepared 状态不得写入正式 delivery ledger 或 target/order 表，也不得被并发的
+`stream.delta`、`message.update` 或 reaction 用作已确认 target；对既有 target 的 prepared
+更新在 settlement 前仍保持 busy。adapter 确认完整 frame 已被接受后，必须在不释放生命
+周期锁且无新 `await` 的回调中将 prepared 状态原子发布到正式 ledger。若完整 frame 未被
+接受，则在任何 transport cleanup await 前将 delivery 收敛为 `unknown`，且不得产生正式
+target/order 变化；一旦完整 frame 被接受，后续 finally、cancel 或 transport 关闭不得回滚
+该 result，也不得发送第二个 response。已越过该点的 attempt 不得再被并发 stop、lease
 fencing 或 drain deadline 回滚为 `unknown`，尚未越过该点的 attempt 则继续受绝对 drain
 deadline 和生命周期 fencing 约束。
 
 底层 frame acceptance 与外层 write deadline/cancel 是两个独立事实。若 deadline 或 cancel
 先发生，transport 必须立即关闭新写入并向原调用传播 `FrameTimeoutError` 或取消，不能因
 HANDLE 随后成功而把原调用改为正常成功；底层 acceptance settlement 则继续独立收敛。若
-完整 frame 迟到成功，仍执行唯一 `on_write_succeeded`、保留已可见 ACK/target/order 并释放
-publication 生命周期锁；若 frame 未被接受，则执行唯一 rollback 并收敛为 `unknown`。
-settlement 不得阻塞原调用传播 deadline/cancel，也不得令已关闭 writer 对外表现为可继续
-使用的 transport。
+完整 frame 迟到成功，仍执行唯一 `on_write_succeeded`，重新取得生命周期锁后才把私有
+prepared ACK/target/order 发布为正式状态；在 settlement 完成前，这些状态对其他 request
+不可见。若 frame 未被接受，则执行唯一 rollback 并收敛为 `unknown`。deferred settlement
+不得阻塞 stop 或原调用传播 deadline/cancel，也不得令已关闭 writer 对外表现为可继续使用
+的 transport。
 
 `channel.reaction` 使用独立的 closed `ReactionParams`，包含 identity、唯一
 `delivery_id`、`to_handle`、`target_delivery_id` 和 `reaction`。v1 只允许

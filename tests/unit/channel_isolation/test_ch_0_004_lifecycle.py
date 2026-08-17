@@ -295,6 +295,40 @@ class LateSuccessfulPipeHandle:
         self.closed = True
 
 
+class LateRejectingLinkedPipeHandle:
+    """Reject one delayed frame while forwarding all earlier frames."""
+
+    def __init__(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        peer_reader: asyncio.StreamReader,
+        marker: bytes,
+    ) -> None:
+        self._loop = loop
+        self._peer_reader = peer_reader
+        self._marker = marker
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.closed = False
+
+    def write(self, data: bytes) -> int:
+        """Delay and reject the selected frame without exposing its bytes."""
+        frame = bytes(data)
+        if self._marker in frame:
+            self.started.set()
+            self.release.wait(timeout=1)
+            return 0
+        self._loop.call_soon_threadsafe(self._peer_reader.feed_data, frame)
+        return len(data)
+
+    def close(self) -> None:
+        """Close the linked reader after the writer thread exits."""
+        if self.closed:
+            return
+        self.closed = True
+        self._loop.call_soon_threadsafe(self._peer_reader.feed_eof)
+
+
 class FakeWindowsThreadHandle:
     """Provide the cancellable thread-handle surface for one test."""
 
@@ -2465,6 +2499,118 @@ async def test_windows_late_ack_keeps_publication_and_releases_lifecycle(
     assert "windows-late-publication" not in controller._outbound_attempts
     assert not controller._lock.locked()
     await runner.aclose()
+    assert handle.closed
+    assert thread_handle.closed
+
+
+@pytest.mark.asyncio
+async def test_deferred_start_target_is_hidden_until_handle_settlement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A deferred stream target cannot admit dependent platform work."""
+    loop = asyncio.get_running_loop()
+    core_reader = asyncio.StreamReader()
+    runner_reader = asyncio.StreamReader()
+    core_writer = LinkedFrameWriter(runner_reader)
+    handle = LateRejectingLinkedPipeHandle(
+        loop,
+        core_reader,
+        b'"id":"rpc-1"',
+    )
+    thread_handle = FakeWindowsThreadHandle()
+    monkeypatch.setattr(
+        runner_bootstrap,
+        "_open_windows_thread_handle",
+        lambda: thread_handle,
+    )
+    runner_writer = runner_bootstrap._ThreadPipeWriter(handle)
+    core = RpcPeer(FramedTransport(core_reader, core_writer))
+    runner_transport = FramedTransport(
+        runner_reader,
+        runner_writer,
+        limits=FramingLimits(write_timeout=0.02),
+    )
+    runner = RpcPeer(runner_transport)
+    side_effects: list[tuple[str, str]] = []
+
+    async def record_send(params: SendParams) -> dict[str, str]:
+        """Record platform work before returning an acknowledged result."""
+        side_effects.append((params.delivery_id, params.operation.value))
+        return {
+            "delivery_id": params.delivery_id,
+            "state": "acknowledged",
+        }
+
+    controller = LifecycleController(
+        channel_key="voice",
+        instance_id="instance-1",
+        generation=7,
+        environment_spec_id="ches1_" + "1" * 64,
+        environment_id="ches1_" + "1" * 64 + ".install1_" + "2" * 32,
+        capabilities=("streaming",),
+        send_handler=record_send,
+        clock_ms=Clock(),
+    )
+    controller.register_rpc_methods(runner)
+    await _activate_outbound_controller(controller, ["streaming"])
+    await asyncio.gather(core.start(), runner.start())
+
+    start = asyncio.create_task(
+        core.call(
+            "channel.send",
+            {
+                **_identity(),
+                "delivery_id": "deferred-start",
+                "to_handle": "chat-1",
+                "operation": "stream.start",
+                "stream_type": "message",
+                "sequence": 0,
+                "accumulated_text": "",
+            },
+        ),
+    )
+    assert await asyncio.to_thread(handle.started.wait, 1)
+    delta = asyncio.create_task(
+        core.call(
+            "channel.send",
+            {
+                **_identity(),
+                "delivery_id": "waiting-delta",
+                "to_handle": "chat-1",
+                "operation": "stream.delta",
+                "target_delivery_id": "deferred-start",
+                "stream_type": "message",
+                "sequence": 1,
+                "accumulated_text": "hello",
+            },
+        ),
+    )
+    while "rpc-2" not in runner._incoming:
+        await asyncio.sleep(0)
+    while not runner_transport.is_closed:
+        await asyncio.sleep(0)
+
+    assert "deferred-start" not in controller._outbound_targets
+    assert side_effects == [("deferred-start", "stream.start")]
+    stopped = await asyncio.wait_for(
+        controller.stop(IdentityParams.from_mapping(_identity())),
+        timeout=0.1,
+    )
+    assert stopped["state"] == "stopped"
+
+    handle.release.set()
+    results = await asyncio.gather(start, delta, return_exceptions=True)
+    while "deferred-start" in controller._outbound_attempts:
+        await asyncio.sleep(0)
+
+    assert all(isinstance(result, Exception) for result in results)
+    assert (
+        controller._outbound_delivery_states["deferred-start"].value
+        == "unknown"
+    )
+    assert "deferred-start" not in controller._outbound_targets
+    assert side_effects == [("deferred-start", "stream.start")]
+    await asyncio.gather(core.aclose(), runner.aclose())
     assert handle.closed
     assert thread_handle.closed
 

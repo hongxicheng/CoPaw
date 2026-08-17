@@ -344,15 +344,21 @@ JSON-RPC frame、返回值或 Runner 保存的 host context。
 `test_ch_0_004_lifecycle.py`。当前聚焦测试命令
 `conda run -n qwenpaw pytest -q tests/unit/channel_isolation/test_ch_0_004_models.py
 tests/unit/channel_isolation/test_ch_0_004_lifecycle.py
-tests/unit/channel_isolation/test_ch_0_004_rpc.py` 为 `73 passed`，framing 回归测试
+tests/unit/channel_isolation/test_ch_0_004_rpc.py` 为 `74 passed`，framing 回归测试
 `tests/unit/channel_isolation/test_ch_0_003_transport.py` 为 `15 passed`，相邻可靠性测试
 `tests/unit/channel_isolation/test_ch_0_005_reliability.py` 为 `13 passed`，
 `tests/unit/channel_isolation/test_ch_0_006_bootstrap.py` 为 `20 passed`，
-`conda run -n qwenpaw pytest -q tests/unit/channel_isolation` 为 `270 passed`；目标文件
+`conda run -n qwenpaw pytest -q tests/unit/channel_isolation` 为 `271 passed`；目标文件
 pre-commit 全部通过（包括 mypy、black、flake8 和 pylint），`git diff --check` 通过。
 原独立 Review 已通过（用户确认）；原实现
 与修复提交为 `95836112`、`26958f06`、`339766f7`、`4cd74739`、`220aef20`、
 `85ed4907`、`deddbb65`、`f26d76a1`、`b4ab6c86`、`2ee4eecd`、`9fcc9058`。
+对 `5c53ff7b` 的复审发现 Windows response acceptance deferred settlement 期间会把
+prepared `stream.start` target 提前写入正式 ordering 表，使并发 `stream.delta` 可在原
+frame 最终失败前执行平台副作用；本轮已将 prepared delivery/target/order 保存在 attempt
+私有状态，只有 HANDLE 接受完整 frame 后才原子发布，迟到失败则直接收敛为 `unknown`。
+真实双端 `RpcPeer`、`FramedTransport` 和 Windows 线程 writer 回归覆盖 settlement 前 target
+不可见、依赖 delta 不执行、stop 不等待 settlement，以及迟到失败不留下 target/sequence。
 对 `9fcc9058`
 的复审发现 Windows HANDLE 在 write deadline 后迟到成功时会吞掉超时并长时间持有
 publication 生命周期锁；本轮已分离 frame acceptance 与 deadline/cancel 两个事实。原调用

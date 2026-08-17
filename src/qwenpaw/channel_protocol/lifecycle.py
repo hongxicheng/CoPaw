@@ -415,8 +415,7 @@ class _OutboundAttempt:
     send_params: SendParams | None = None
     provisional: bool = False
     publication_result: OutboundResult | None = None
-    publication_created_target: bool = False
-    publication_target_snapshot: dict[str, Any] | None = None
+    publication_send_params: SendParams | None = None
     publication_lock_held: bool = False
     drain_timer: asyncio.TimerHandle | None = None
     done: asyncio.Event = field(default_factory=asyncio.Event)
@@ -1106,7 +1105,7 @@ class LifecycleController:
         self,
         attempt: _OutboundAttempt,
     ) -> dict[str, Any]:
-        """Choose and commit the final result before writer visibility."""
+        """Choose the private result before writer visibility."""
         await self._lock.acquire()
         attempt.publication_lock_held = True
         try:
@@ -1123,12 +1122,11 @@ class LifecycleController:
                     attempt.forced_reason or "PLATFORM_RESULT_UNKNOWN",
                 )
             result = self._fence_outbound_result_locked(attempt, result)
-            self._commit_outbound_result(
-                attempt,
-                result,
-                attempt.send_params,
-                reversible=True,
-            )
+            attempt.publication_result = result
+            attempt.publication_send_params = attempt.send_params
+            attempt.provisional = False
+            attempt.terminal_result = None
+            attempt.send_params = None
             return result.to_mapping()
         except BaseException:
             self._release_outbound_publication_lock(attempt)
@@ -1143,10 +1141,10 @@ class LifecycleController:
             if attempt.publication_result is None:
                 return None
             return self._publish_deferred_outbound_publication(attempt)
-        attempt.publication_result = None
-        attempt.publication_created_target = False
-        attempt.publication_target_snapshot = None
-        self._release_outbound_publication_lock(attempt)
+        try:
+            self._publish_outbound_publication_locked(attempt)
+        finally:
+            self._release_outbound_publication_lock(attempt)
         return None
 
     async def _publish_deferred_outbound_publication(
@@ -1155,42 +1153,57 @@ class LifecycleController:
     ) -> None:
         """Finalize a late accepted frame without blocking lifecycle work."""
         async with self._lock:
-            attempt.publication_result = None
-            attempt.publication_created_target = False
-            attempt.publication_target_snapshot = None
+            self._publish_outbound_publication_locked(attempt)
+
+    def _publish_outbound_publication_locked(
+        self,
+        attempt: _OutboundAttempt,
+    ) -> None:
+        """Expose one accepted result and its ordering effects atomically."""
+        result = attempt.publication_result
+        if result is None:
+            return
+        send_params = attempt.publication_send_params
+        self._outbound_delivery_states[attempt.delivery_id] = result.state
+        if (
+            send_params is not None
+            and result.state is DeliveryState.ACKNOWLEDGED
+        ):
+            self._record_outbound_send(send_params, attempt.target)
+        self._clear_outbound_publication(attempt)
+        self._complete_outbound_attempt_locked(attempt)
 
     def _defer_outbound_publication(
         self,
         attempt: _OutboundAttempt,
     ) -> None:
         """Release lifecycle work while HANDLE acceptance remains pending."""
+        self._detach_deferred_outbound_attempt_locked(attempt)
         self._release_outbound_publication_lock(attempt)
+
+    def _detach_deferred_outbound_attempt_locked(
+        self,
+        attempt: _OutboundAttempt,
+    ) -> None:
+        """Stop lifecycle waits while keeping prepared ordering private."""
+        self._outbound_attempts.pop(attempt.delivery_id, None)
+        if attempt.drain_timer is not None:
+            attempt.drain_timer.cancel()
+            attempt.drain_timer = None
+        attempt.done.set()
 
     def _commit_outbound_result(
         self,
         attempt: _OutboundAttempt,
         result: OutboundResult,
         send_params: SendParams | None,
-        *,
-        reversible: bool = False,
     ) -> None:
         """Make one terminal result and its ordering effects visible."""
-        if reversible:
-            attempt.publication_result = result
         self._outbound_delivery_states[attempt.delivery_id] = result.state
         if (
             send_params is not None
             and result.state is DeliveryState.ACKNOWLEDGED
         ):
-            if send_params.operation in {
-                OutboundOperation.MESSAGE_CREATE,
-                OutboundOperation.STREAM_START,
-            }:
-                attempt.publication_created_target = reversible
-            elif reversible and attempt.target is not None:
-                snapshot = dict(attempt.target)
-                snapshot["pending_delivery_id"] = None
-                attempt.publication_target_snapshot = snapshot
             self._record_outbound_send(send_params, attempt.target)
         attempt.provisional = False
         attempt.terminal_result = None
@@ -1228,19 +1241,16 @@ class LifecycleController:
             self._outbound_delivery_states[
                 attempt.delivery_id
             ] = DeliveryState.UNKNOWN
-            if attempt.publication_created_target:
-                self._outbound_targets.pop(attempt.delivery_id, None)
-            elif (
-                attempt.publication_target_snapshot is not None
-                and attempt.target is not None
-            ):
-                attempt.target.clear()
-                attempt.target.update(attempt.publication_target_snapshot)
-            attempt.publication_result = None
-            attempt.publication_created_target = False
-            attempt.publication_target_snapshot = None
+            self._clear_outbound_publication(attempt)
+            self._complete_outbound_attempt_locked(attempt)
         finally:
             self._release_outbound_publication_lock(attempt)
+
+    @staticmethod
+    def _clear_outbound_publication(attempt: _OutboundAttempt) -> None:
+        """Discard one attempt-private prepared publication."""
+        attempt.publication_result = None
+        attempt.publication_send_params = None
 
     def _release_outbound_publication_lock(
         self,
