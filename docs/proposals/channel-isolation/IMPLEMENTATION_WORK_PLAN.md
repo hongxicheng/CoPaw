@@ -456,14 +456,22 @@ Phase 3 的 durable pending、ACK 丢失重投和 Runner 重启恢复投递仍�
 `ReplyMessageRequest(reply_in_thread=true)`，thread streaming 收敛为最终非流式回复；恢复
 静默和半开 WebSocket 健康监控；为 SDK disconnect、线程清理和 Driver stop 设置内部有限
 边界；`channel.health` 在不扩展 CH-0-004 响应 Schema 的前提下执行有界本地平台探测。
+后续独立 Review 发现同群多个 topic 共用 session alias 时，后入站会覆盖先前在途请求的
+回复目标。修复后 mock Host 从已接收 `InboundEvent.event_id` 形成并保存不透明
+`feishu:reply:<event_id>` handle，Driver 以每个 event 独立的 Host State key 保存
+receive target；普通最终回复或 thread `stream.end` acknowledged 后清理，stream 进行中及
+failed/unknown 结果保留。该请求级路由不改变群聊 session 共享策略，也未扩展 CH-0-004
+closed Schema；主动发送和既有 `feishu:sw:*` session handle 继续兼容。
 
-实现侧验证：CH-0-007 隔离 suite `24 passed`，普通聚焦入口 `1 passed`；
+实现侧验证：CH-0-007 隔离 suite `30 passed`，普通聚焦入口 `1 passed`；
 `tests/unit/channel_isolation`、旧飞书 unit 和 contract 组合回归
 `456 passed, 1 skipped`；目标文件 pre-commit 全部通过（包含 mypy、black、flake8 和
 pylint），`git diff --check` 通过。测试覆盖两个 Agent 共用同一 `environment_id` 时的独立
 进程、配置、secret、checkpoint、路由和出站状态，Runner 崩溃后新 generation 从 Host
 State 恢复 Core reply，以及 thread reply/checkpoint 恢复、thread streaming fallback、
-半开连接恢复、disconnect/EOF 有界清理和断连期间 health 可观测性。当前未运行真实飞书
+同群 topic 顺序/反向完成、同一/不同发送者、多个在途请求 checkpoint 恢复、媒体目标、
+非 thread 群聊、私聊、显式主动发送及 session handle 兼容、半开连接恢复、disconnect/EOF
+有界清理和断连期间 health 可观测性。当前未运行真实飞书
 外部收发、Linux、真实 Windows、frozen desktop 和全仓库测试；这些限制等待独立 Review、
 G0 或发布验证处理，本任务不得据此标记为 `[x]`。
 

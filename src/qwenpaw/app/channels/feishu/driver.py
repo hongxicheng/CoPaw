@@ -8,6 +8,7 @@ import asyncio
 from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+import hashlib
 import json
 import logging
 from pathlib import Path
@@ -36,6 +37,9 @@ _RECEIVE_STATE_KEY = "feishu.receive_ids"
 _RECEIVE_STATE_VERSION = 2
 _RECEIVE_STATE_MAX_ENTRIES = 256
 _RECEIVE_STATE_MAX_BYTES = 60 * 1024
+_REPLY_HANDLE_PREFIX = "feishu:reply:"
+_REPLY_STATE_KEY_PREFIX = "feishu.reply."
+_REPLY_STATE_VERSION = 1
 _PLATFORM_STOP_TIMEOUT = 6.0
 _CONNECTION_TASK_STOP_TIMEOUT = 1.0
 _PLATFORM_HEALTH_TIMEOUT = 0.5
@@ -207,6 +211,7 @@ class FeishuDriver:
         self._secret: dict[str, str] | None = None
         self._config: dict[str, Any] = {}
         self._receive_ids: OrderedDict[str, _ReceiveTarget] = OrderedDict()
+        self._reply_targets: dict[str, _ReceiveTarget] = {}
         self._delivery_targets: dict[str, dict[str, str]] = {}
         self._connection_task: asyncio.Task[None] | None = None
         self._connection_ready = asyncio.Event()
@@ -453,6 +458,8 @@ class FeishuDriver:
                 failure = await self._update_delivery_stream(platform, params)
                 if failure is not None:
                     return failure
+            if self._completes_reply_target(params):
+                await self._forget_reply_target(params.to_handle)
             return self._acknowledged_result(params.delivery_id)
         except FeishuDeliveryError as exc:
             logger.warning(
@@ -597,12 +604,25 @@ class FeishuDriver:
         if not self._can_consume():
             return
         event = self._normalize_message(value)
+        target = self._receive_target_from_event(event)
+        if target is not None:
+            self._reply_targets[event.event_id] = target
+            try:
+                await self._persist_reply_target(event.event_id)
+            except Exception:
+                logger.warning(
+                    "Feishu reply target checkpoint failed",
+                    exc_info=True,
+                )
         acknowledgement = await self._submit_event(event)
         delivered = (
             event.event_id in acknowledgement.accepted_event_ids
             or event.event_id in acknowledgement.duplicate_event_ids
         )
         if not delivered:
+            await self._forget_reply_target(
+                f"{_REPLY_HANDLE_PREFIX}{event.event_id}",
+            )
             rejected = next(
                 (
                     item
@@ -618,7 +638,8 @@ class FeishuDriver:
                     rejected.retryable,
                 )
             return
-        await self._remember_receive_target(event)
+        if target is not None:
+            self._remember_receive_aliases(event, target)
         message_id = str(event.metadata.get("feishu_message_id") or "")
         if message_id:
             try:
@@ -628,13 +649,7 @@ class FeishuDriver:
                 )
             except Exception:
                 logger.debug("Feishu typing reaction failed", exc_info=True)
-        try:
-            await self._persist_receive_ids()
-        except Exception:
-            logger.warning(
-                "Feishu receive target checkpoint failed",
-                exc_info=True,
-            )
+        await self._checkpoint_receive_aliases()
 
     async def _handle_card_action(self, value: object) -> None:
         if not self._can_consume():
@@ -761,23 +776,39 @@ class FeishuDriver:
             },
         )
 
-    async def _remember_receive_target(self, event: InboundEvent) -> None:
+    def _remember_receive_target(self, event: InboundEvent) -> None:
+        target = self._receive_target_from_event(event)
+        if target is None:
+            return
+        self._reply_targets[event.event_id] = target
+        self._remember_receive_aliases(event, target)
+
+    @staticmethod
+    def _receive_target_from_event(
+        event: InboundEvent,
+    ) -> _ReceiveTarget | None:
         receive_id = str(event.metadata.get("feishu_receive_id") or "")
         receive_type = str(
             event.metadata.get("feishu_receive_id_type") or "open_id",
         )
         if not receive_id:
-            return
+            return None
         thread_message_id = ""
         if event.metadata.get("feishu_thread_id"):
             thread_message_id = str(
                 event.metadata.get("feishu_message_id") or "",
             )
-        target = _ReceiveTarget(
+        return _ReceiveTarget(
             receive_type,
             receive_id,
             thread_message_id,
         )
+
+    def _remember_receive_aliases(
+        self,
+        event: InboundEvent,
+        target: _ReceiveTarget,
+    ) -> None:
         for key in (
             str(event.conversation["id"]),
             event.acl_sender_id,
@@ -786,6 +817,15 @@ class FeishuDriver:
             self._receive_ids.pop(key, None)
             self._receive_ids[key] = target
         self._trim_receive_ids()
+
+    async def _checkpoint_receive_aliases(self) -> None:
+        try:
+            await self._persist_receive_ids()
+        except Exception:
+            logger.warning(
+                "Feishu receive target checkpoint failed",
+                exc_info=True,
+            )
 
     def _session_key(self, event: InboundEvent) -> str:
         if event.conversation["type"] == "group":
@@ -853,6 +893,24 @@ class FeishuDriver:
             ).to_mapping(),
         )
 
+    async def _persist_reply_target(self, event_id: str) -> None:
+        if self._peer is None or self._identity is None:
+            return
+        target = self._reply_targets.get(event_id)
+        if target is None:
+            return
+        await self._peer.call(
+            "host.state.put",
+            HostStateParams(
+                channel_key=self._identity.channel_key,
+                instance_id=self._identity.instance_id,
+                generation=self._identity.generation,
+                key=self._reply_state_key(event_id),
+                schema_version=_REPLY_STATE_VERSION,
+                value=self._target_value(target),
+            ).to_mapping(),
+        )
+
     def _trim_receive_ids(self) -> None:
         while len(self._receive_ids) > _RECEIVE_STATE_MAX_ENTRIES:
             self._receive_ids.popitem(last=False)
@@ -869,17 +927,14 @@ class FeishuDriver:
     def _receive_state_value(self) -> dict[str, dict[str, str]]:
         value: dict[str, dict[str, str]] = {}
         for key, target in self._receive_ids.items():
-            item = {
-                "receive_id_type": target.receive_id_type,
-                "receive_id": target.receive_id,
-            }
-            if target.thread_message_id:
-                item["thread_message_id"] = target.thread_message_id
-            value[key] = item
+            value[key] = self._target_value(target)
         return value
 
     async def _resolve_receive_target(self, to_handle: str) -> _ReceiveTarget:
         value = to_handle.strip()
+        reply_event_id = self._reply_event_id(value)
+        if reply_event_id is not None:
+            return await self._resolve_reply_target(reply_event_id)
         prefixes = {
             "feishu:chat_id:": "chat_id",
             "feishu:open_id:": "open_id",
@@ -904,6 +959,101 @@ class FeishuDriver:
         if key in self._receive_ids:
             self._receive_ids.move_to_end(key)
         return target
+
+    async def _resolve_reply_target(self, event_id: str) -> _ReceiveTarget:
+        target = self._reply_targets.get(event_id)
+        if target is not None:
+            return target
+        if self._peer is None or self._identity is None:
+            raise KeyError("Feishu reply target is unavailable")
+        result = await self._peer.call(
+            "host.state.get",
+            HostStateParams(
+                channel_key=self._identity.channel_key,
+                instance_id=self._identity.instance_id,
+                generation=self._identity.generation,
+                key=self._reply_state_key(event_id),
+            ).to_mapping(),
+        )
+        if not isinstance(result, Mapping) or not result.get("found"):
+            raise KeyError("Feishu reply target is unavailable")
+        target = self._target_from_value(result.get("value"))
+        if target is None:
+            raise KeyError("Feishu reply target is unavailable")
+        self._reply_targets[event_id] = target
+        return target
+
+    async def _forget_reply_target(self, to_handle: str) -> None:
+        event_id = self._reply_event_id(to_handle.strip())
+        if event_id is None:
+            return
+        self._reply_targets.pop(event_id, None)
+        if self._peer is None or self._identity is None:
+            return
+        try:
+            await self._peer.call(
+                "host.state.delete",
+                HostStateParams(
+                    channel_key=self._identity.channel_key,
+                    instance_id=self._identity.instance_id,
+                    generation=self._identity.generation,
+                    key=self._reply_state_key(event_id),
+                ).to_mapping(),
+            )
+        except Exception:
+            logger.warning(
+                "Feishu reply target cleanup failed",
+                exc_info=True,
+            )
+
+    @staticmethod
+    def _completes_reply_target(params: SendParams) -> bool:
+        return params.operation in {
+            OutboundOperation.MESSAGE_CREATE,
+            OutboundOperation.STREAM_END,
+        }
+
+    @staticmethod
+    def _reply_event_id(to_handle: str) -> str | None:
+        if not to_handle.startswith(_REPLY_HANDLE_PREFIX):
+            return None
+        event_id = to_handle[len(_REPLY_HANDLE_PREFIX) :]
+        return event_id or None
+
+    @staticmethod
+    def _reply_state_key(event_id: str) -> str:
+        digest = hashlib.sha256(event_id.encode("utf-8")).hexdigest()
+        return f"{_REPLY_STATE_KEY_PREFIX}{digest}"
+
+    @staticmethod
+    def _target_value(target: _ReceiveTarget) -> dict[str, str]:
+        value = {
+            "receive_id_type": target.receive_id_type,
+            "receive_id": target.receive_id,
+        }
+        if target.thread_message_id:
+            value["thread_message_id"] = target.thread_message_id
+        return value
+
+    @staticmethod
+    def _target_from_value(value: object) -> _ReceiveTarget | None:
+        if not isinstance(value, Mapping):
+            return None
+        receive_id = value.get("receive_id")
+        receive_type = value.get("receive_id_type")
+        if not isinstance(receive_id, str) or not isinstance(
+            receive_type,
+            str,
+        ):
+            return None
+        thread_message_id = value.get("thread_message_id", "")
+        if not isinstance(thread_message_id, str):
+            thread_message_id = ""
+        return _ReceiveTarget(
+            receive_type,
+            receive_id,
+            thread_message_id,
+        )
 
     def _require_platform(self) -> FeishuPlatform:
         if self._platform is None:

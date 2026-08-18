@@ -334,6 +334,7 @@ class MockHost:
         self.peer = peer
         self.identity = identity
         self.events: list[Any] = []
+        self.reply_handles: dict[str, str] = {}
         self.state_store = state_store or HostStateStore()
         self.hello = asyncio.Event()
         self.reject_unmentioned_groups = False
@@ -375,6 +376,9 @@ class MockHost:
                 )
                 continue
             self.events.append(event)
+            self.reply_handles[
+                event.event_id
+            ] = f"feishu:reply:{event.event_id}"
             accepted.append(event.event_id)
         return {
             "batch_id": params.batch_id,
@@ -382,6 +386,10 @@ class MockHost:
             "duplicate_event_ids": [],
             "rejected_events": rejected,
         }
+
+    def reply_handle_for(self, event_id: str) -> str:
+        """Return the opaque reply handle saved with one Core request."""
+        return self.reply_handles[event_id]
 
     async def _state_get(self, params: Any, _: object) -> dict[str, Any]:
         value = await self.state_store.get(params.key)
@@ -535,6 +543,29 @@ async def _close_session(
     )
     await core.aclose()
     await asyncio.wait_for(session, timeout=1.0)
+
+
+async def _send_reply(
+    core: RpcPeer,
+    identity: FixtureIdentity,
+    *,
+    delivery_id: str,
+    to_handle: str,
+    content_parts: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Send one final reply through the protocol fixture."""
+    return await core.call(
+        "channel.send",
+        {
+            "channel_key": "feishu",
+            "instance_id": identity.instance_id,
+            "generation": identity.generation,
+            "delivery_id": delivery_id,
+            "to_handle": to_handle,
+            "operation": "message.create",
+            "content_parts": content_parts,
+        },
+    )
 
 
 def _message(
@@ -770,14 +801,290 @@ async def test_driver_outbound_card_stream_reaction_and_unknown_boundary(
 
 
 @pytest.mark.asyncio
-async def test_driver_thread_reply_and_stream_fallback_survive_checkpoint(
+@pytest.mark.parametrize(
+    ("sender_b", "reply_order"),
+    [
+        ("ou-user", ("topic-a", "topic-b")),
+        ("ou-user", ("topic-b", "topic-a")),
+        ("ou-other", ("topic-b", "topic-a")),
+    ],
+)
+async def test_driver_topic_replies_keep_request_scoped_targets(
+    tmp_path: Path,
+    sender_b: str,
+    reply_order: tuple[str, str],
+) -> None:
+    """Interleaved topics keep immutable per-request reply targets."""
+    identity = _identity(f"topics-{sender_b[-4:]}-{reply_order[0][-1]}")
+    platform = FakePlatform("topics")
+    core, host, driver, session = await _start_session(
+        identity,
+        platform,
+        tmp_path,
+    )
+    messages = {
+        "topic-a": _message(
+            "topic-a",
+            chat_id="oc-shared-topic",
+            chat_type="group",
+            sender="ou-user",
+            thread_id="omt-topic-a",
+        ),
+        "topic-b": _message(
+            "topic-b",
+            chat_id="oc-shared-topic",
+            chat_type="group",
+            sender=sender_b,
+            thread_id="omt-topic-b",
+        ),
+    }
+    await platform.emit_message(messages["topic-a"])
+    await platform.emit_message(messages["topic-b"])
+    handles = {
+        event_id: host.reply_handle_for(event_id) for event_id in messages
+    }
+    for event_id in reply_order:
+        content_parts = [{"type": "text", "text": f"answer-{event_id}"}]
+        if event_id == "topic-b":
+            content_parts.append(
+                {
+                    "type": "file",
+                    "file_url": "file:///tmp/topic-b.txt",
+                },
+            )
+        result = await _send_reply(
+            core,
+            identity,
+            delivery_id=f"reply-{event_id}",
+            to_handle=handles[event_id],
+            content_parts=content_parts,
+        )
+        assert result["state"] == "acknowledged"
+        assert (
+            await host.state_store.get(
+                driver._reply_state_key(event_id),
+            )
+            is None
+        )
+        pending = set(messages).difference(
+            reply_order[: reply_order.index(event_id) + 1],
+        )
+        for pending_event_id in pending:
+            assert (
+                await host.state_store.get(
+                    driver._reply_state_key(pending_event_id),
+                )
+                is not None
+            )
+    replies = [item for item in platform.sent if item["kind"] == "message"]
+    assert [item["reply_message_id"] for item in replies] == [
+        f"msg-{event_id}" for event_id in reply_order
+    ]
+    assert [item["receive_id"] for item in replies] == [
+        "oc-shared-topic",
+        "oc-shared-topic",
+    ]
+    await _close_session(core, session, identity)
+
+
+@pytest.mark.asyncio
+async def test_driver_topic_reply_targets_survive_checkpoint_restart(
+    tmp_path: Path,
+) -> None:
+    """Multiple in-flight topic targets restore independently."""
+    identity = _identity("topic-restart")
+    state_store = HostStateStore()
+    platform = FakePlatform("topic-restart")
+    core, host, driver, session = await _start_session(
+        identity,
+        platform,
+        tmp_path,
+        state_store=state_store,
+    )
+    for event_id, thread_id in (
+        ("restart-a", "omt-restart-a"),
+        ("restart-b", "omt-restart-b"),
+    ):
+        await platform.emit_message(
+            _message(
+                event_id,
+                chat_id="oc-restart-topic",
+                chat_type="group",
+                thread_id=thread_id,
+            ),
+        )
+    handles = {
+        event_id: host.reply_handle_for(event_id)
+        for event_id in ("restart-a", "restart-b")
+    }
+    for event_id in handles:
+        checkpoint = await state_store.get(
+            driver._reply_state_key(event_id),
+        )
+        assert checkpoint is not None
+        assert checkpoint[1]["thread_message_id"] == f"msg-{event_id}"
+    await _close_session(core, session, identity)
+
+    restarted_identity = _identity("topic-restart", generation=2)
+    restarted_platform = FakePlatform("topic-restarted")
+    restarted_core, _, _, restarted_session = await _start_session(
+        restarted_identity,
+        restarted_platform,
+        tmp_path,
+        state_store=state_store,
+    )
+    for event_id in ("restart-b", "restart-a"):
+        result = await _send_reply(
+            restarted_core,
+            restarted_identity,
+            delivery_id=f"restored-{event_id}",
+            to_handle=handles[event_id],
+            content_parts=[
+                {"type": "text", "text": f"answer-{event_id}"},
+            ],
+        )
+        assert result["state"] == "acknowledged"
+    replies = [
+        item for item in restarted_platform.sent if item["kind"] == "message"
+    ]
+    assert [item["reply_message_id"] for item in replies] == [
+        "msg-restart-b",
+        "msg-restart-a",
+    ]
+    await _close_session(
+        restarted_core,
+        restarted_session,
+        restarted_identity,
+    )
+
+
+@pytest.mark.asyncio
+async def test_driver_request_handles_preserve_non_thread_send_paths(
+    tmp_path: Path,
+) -> None:
+    """Request replies and explicit sends retain group and DM routing."""
+    identity = _identity("reply-compat")
+    platform = FakePlatform("reply-compat")
+    core, host, driver, session = await _start_session(
+        identity,
+        platform,
+        tmp_path,
+    )
+    await platform.emit_message(
+        _message(
+            "plain-group",
+            chat_id="oc-plain-group",
+            chat_type="group",
+        ),
+    )
+    await platform.emit_message(
+        _message(
+            "plain-dm",
+            chat_id="oc-plain-dm",
+            sender="ou-plain-dm",
+        ),
+    )
+    session_event = driver._normalize_message(
+        _message(
+            "session-alias",
+            chat_id="oc-session-alias",
+            chat_type="group",
+        ),
+    )
+    driver._remember_receive_target(session_event)
+    session_handle = f"feishu:sw:{driver._session_key(session_event)}"
+    sends = (
+        (host.reply_handle_for("plain-group"), "request-group"),
+        (host.reply_handle_for("plain-dm"), "request-dm"),
+        (session_handle, "session-group"),
+        ("feishu:chat_id:oc-explicit", "explicit-group"),
+        ("feishu:open_id:ou-explicit", "explicit-dm"),
+    )
+    for to_handle, delivery_id in sends:
+        result = await _send_reply(
+            core,
+            identity,
+            delivery_id=delivery_id,
+            to_handle=to_handle,
+            content_parts=[{"type": "text", "text": delivery_id}],
+        )
+        assert result["state"] == "acknowledged"
+    replies = [item for item in platform.sent if item["kind"] == "message"]
+    assert [
+        (
+            item["receive_id_type"],
+            item["receive_id"],
+            item["reply_message_id"],
+        )
+        for item in replies
+    ] == [
+        ("chat_id", "oc-plain-group", ""),
+        ("open_id", "ou-plain-dm", ""),
+        ("chat_id", "oc-session-alias", ""),
+        ("chat_id", "oc-explicit", ""),
+        ("open_id", "ou-explicit", ""),
+    ]
+    await _close_session(core, session, identity)
+
+
+@pytest.mark.asyncio
+async def test_driver_unknown_reply_keeps_request_target_for_retry(
+    tmp_path: Path,
+) -> None:
+    """An uncertain platform result keeps the request target recoverable."""
+    identity = _identity("reply-unknown")
+    platform = FakePlatform("reply-unknown")
+    core, host, driver, session = await _start_session(
+        identity,
+        platform,
+        tmp_path,
+    )
+    await platform.emit_message(
+        _message(
+            "unknown-topic",
+            chat_id="oc-unknown-topic",
+            chat_type="group",
+            thread_id="omt-unknown-topic",
+        ),
+    )
+    handle = host.reply_handle_for("unknown-topic")
+    state_key = driver._reply_state_key("unknown-topic")
+    platform.send_error = FeishuDeliveryError(
+        "PLATFORM_RESULT_UNKNOWN",
+        side_effect_possible=True,
+    )
+    unknown = await _send_reply(
+        core,
+        identity,
+        delivery_id="unknown-attempt",
+        to_handle=handle,
+        content_parts=[{"type": "text", "text": "first"}],
+    )
+    assert unknown["state"] == "unknown"
+    assert await host.state_store.get(state_key) is not None
+    platform.send_error = None
+    acknowledged = await _send_reply(
+        core,
+        identity,
+        delivery_id="known-attempt",
+        to_handle=handle,
+        content_parts=[{"type": "text", "text": "second"}],
+    )
+    assert acknowledged["state"] == "acknowledged"
+    assert platform.sent[-1]["reply_message_id"] == "msg-unknown-topic"
+    assert await host.state_store.get(state_key) is None
+    await _close_session(core, session, identity)
+
+
+@pytest.mark.asyncio
+async def test_driver_thread_reply_and_stream_fallback_use_request_handles(
     tmp_path: Path,
 ) -> None:
     """Thread routing replies to the source message without CardKit."""
     identity = _identity("thread")
     state_store = HostStateStore()
     platform = FakePlatform("thread")
-    core, _, driver, session = await _start_session(
+    core, host, driver, session = await _start_session(
         identity,
         platform,
         tmp_path,
@@ -785,34 +1092,31 @@ async def test_driver_thread_reply_and_stream_fallback_survive_checkpoint(
     )
     await platform.emit_message(
         _message(
-            "thread-event",
+            "thread-message",
             chat_id="oc-thread",
             chat_type="group",
             thread_id="omt-thread",
         ),
     )
-    session_key = driver._session_key(
-        driver._normalize_message(
-            _message(
-                "thread-key",
-                chat_id="oc-thread",
-                chat_type="group",
-                thread_id="omt-thread",
-            ),
+    await platform.emit_message(
+        _message(
+            "thread-stream",
+            chat_id="oc-thread",
+            chat_type="group",
+            thread_id="omt-thread",
         ),
     )
-    target = f"feishu:sw:{session_key}"
-    common = {
+    base = {
         "channel_key": "feishu",
         "instance_id": identity.instance_id,
         "generation": identity.generation,
-        "to_handle": target,
     }
     created = await core.call(
         "channel.send",
         {
-            **common,
+            **base,
             "delivery_id": "thread-message",
+            "to_handle": host.reply_handle_for("thread-message"),
             "operation": "message.create",
             "content_parts": [{"type": "text", "text": "reply"}],
         },
@@ -820,19 +1124,27 @@ async def test_driver_thread_reply_and_stream_fallback_survive_checkpoint(
     started = await core.call(
         "channel.send",
         {
-            **common,
+            **base,
             "delivery_id": "thread-stream",
+            "to_handle": host.reply_handle_for("thread-stream"),
             "operation": "stream.start",
             "stream_type": "message",
             "sequence": 0,
             "accumulated_text": "A",
         },
     )
+    assert (
+        await state_store.get(
+            driver._reply_state_key("thread-stream"),
+        )
+        is not None
+    )
     delta = await core.call(
         "channel.send",
         {
-            **common,
+            **base,
             "delivery_id": "thread-delta",
+            "to_handle": host.reply_handle_for("thread-stream"),
             "operation": "stream.delta",
             "target_delivery_id": "thread-stream",
             "stream_type": "message",
@@ -843,8 +1155,9 @@ async def test_driver_thread_reply_and_stream_fallback_survive_checkpoint(
     ended = await core.call(
         "channel.send",
         {
-            **common,
+            **base,
             "delivery_id": "thread-end",
+            "to_handle": host.reply_handle_for("thread-stream"),
             "operation": "stream.end",
             "target_delivery_id": "thread-stream",
             "stream_type": "message",
@@ -854,10 +1167,22 @@ async def test_driver_thread_reply_and_stream_fallback_survive_checkpoint(
     )
     for result in (created, started, delta, ended):
         assert result["state"] == "acknowledged"
+    assert (
+        await state_store.get(
+            driver._reply_state_key("thread-message"),
+        )
+        is None
+    )
+    assert (
+        await state_store.get(
+            driver._reply_state_key("thread-stream"),
+        )
+        is None
+    )
     messages = [item for item in platform.sent if item["kind"] == "message"]
     assert [item["reply_message_id"] for item in messages] == [
-        "msg-thread-event",
-        "msg-thread-event",
+        "msg-thread-message",
+        "msg-thread-stream",
     ]
     assert messages[-1]["content_parts"] == [
         {"type": "text", "text": "ABC"},
@@ -865,39 +1190,7 @@ async def test_driver_thread_reply_and_stream_fallback_survive_checkpoint(
     assert not any(
         item["kind"].startswith("stream.") for item in platform.sent
     )
-    checkpoint = driver._receive_state_value()
-    assert checkpoint[session_key]["thread_message_id"] == ("msg-thread-event")
     await _close_session(core, session, identity)
-
-    restarted_identity = _identity("thread", generation=2)
-    restarted_platform = FakePlatform("thread-restarted")
-    restarted_core, _, _, restarted_session = await _start_session(
-        restarted_identity,
-        restarted_platform,
-        tmp_path,
-        state_store=state_store,
-    )
-    restarted = await restarted_core.call(
-        "channel.send",
-        {
-            "channel_key": "feishu",
-            "instance_id": restarted_identity.instance_id,
-            "generation": restarted_identity.generation,
-            "delivery_id": "thread-restarted",
-            "to_handle": target,
-            "operation": "message.create",
-            "content_parts": [{"type": "text", "text": "again"}],
-        },
-    )
-    assert restarted["state"] == "acknowledged"
-    assert restarted_platform.sent[-1]["reply_message_id"] == (
-        "msg-thread-event"
-    )
-    await _close_session(
-        restarted_core,
-        restarted_session,
-        restarted_identity,
-    )
 
 
 @pytest.mark.asyncio
@@ -1108,7 +1401,7 @@ async def test_receive_checkpoint_is_bounded(tmp_path: Path) -> None:
                 sender=f"ou-{index:04d}-{'y' * 80}",
             ),
         )
-        await driver._remember_receive_target(event)
+        driver._remember_receive_target(event)
     await driver._persist_receive_ids()
     encoded = json.dumps(
         driver._receive_state_value(),
@@ -1971,15 +2264,12 @@ async def test_distinct_runner_processes_and_restart_restore_core_reply(
     process_a.kill()
     await asyncio.wait_for(process_a.wait(), timeout=2.0)
     await core_a.aclose()
+    reply_handle = host_a.reply_handle_for("process-a")
     restarted_identity = _identity("process-a", generation=2)
     restarted, restarted_core, _ = await start_process(
         restarted_identity,
         {},
         state_a,
-    )
-    session_key = (
-        f"{f'app-{restarted_identity.instance_id}'[-4:]}_"
-        f"{'oc-process-a'[-8:]}"
     )
     result = await restarted_core.call(
         "channel.send",
@@ -1988,7 +2278,7 @@ async def test_distinct_runner_processes_and_restart_restore_core_reply(
             "instance_id": restarted_identity.instance_id,
             "generation": 2,
             "delivery_id": "delivery-restart",
-            "to_handle": f"feishu:sw:{session_key}",
+            "to_handle": reply_handle,
             "operation": "message.create",
             "content_parts": [{"type": "text", "text": "reply"}],
         },
