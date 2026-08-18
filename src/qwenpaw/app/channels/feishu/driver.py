@@ -33,9 +33,12 @@ from .utils import sender_display_string, short_session_id_from_full_id
 logger = logging.getLogger(__name__)
 
 _RECEIVE_STATE_KEY = "feishu.receive_ids"
-_RECEIVE_STATE_VERSION = 1
+_RECEIVE_STATE_VERSION = 2
 _RECEIVE_STATE_MAX_ENTRIES = 256
 _RECEIVE_STATE_MAX_BYTES = 60 * 1024
+_PLATFORM_STOP_TIMEOUT = 6.0
+_CONNECTION_TASK_STOP_TIMEOUT = 1.0
+_PLATFORM_HEALTH_TIMEOUT = 0.5
 
 
 class FeishuPlatform(Protocol):
@@ -70,6 +73,8 @@ class FeishuPlatform(Protocol):
         receive_id_type: str,
         receive_id: str,
         content_parts: tuple[dict[str, Any], ...],
+        *,
+        reply_message_id: str = "",
     ) -> str:
         ...
 
@@ -107,6 +112,9 @@ class FeishuPlatform(Protocol):
     ) -> bool:
         ...
 
+    async def health_snapshot(self) -> Mapping[str, Any]:
+        ...
+
 
 @dataclass(frozen=True)
 class _ReceiveTarget:
@@ -114,6 +122,7 @@ class _ReceiveTarget:
 
     receive_id_type: str
     receive_id: str
+    thread_message_id: str = ""
 
 
 class _FeishuLifecycleController(LifecycleController):
@@ -164,6 +173,16 @@ class _FeishuLifecycleController(LifecycleController):
         result = await super().stop(params)
         await self._driver.stop()
         return result
+
+    async def health(self, params: Any) -> dict[str, Any]:
+        result = await super().health(params)
+        if result.get("consuming"):
+            snapshot = await self._driver.probe_health()
+            result["consuming"] = bool(snapshot.get("connected"))
+        return result
+
+    async def generation_status(self, params: Any) -> dict[str, Any]:
+        return await LifecycleController.health(self, params)
 
 
 class FeishuDriver:
@@ -317,7 +336,15 @@ class FeishuDriver:
         platform = self._platform
         self._platform = None
         if platform is not None:
-            await platform.close()
+            try:
+                await asyncio.wait_for(
+                    platform.close(),
+                    timeout=_PLATFORM_STOP_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("Feishu platform close timed out")
+            except Exception:
+                logger.debug("Feishu platform close failed", exc_info=True)
         self._prepared = False
 
     async def _stop_connection(self) -> None:
@@ -325,14 +352,24 @@ class FeishuDriver:
         platform = self._platform
         if platform is not None:
             try:
-                await platform.disconnect()
+                await asyncio.wait_for(
+                    platform.disconnect(),
+                    timeout=_PLATFORM_STOP_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("Feishu platform disconnect timed out")
             except Exception:
                 logger.debug("Feishu disconnect failed", exc_info=True)
         task = self._connection_task
         self._connection_task = None
         if task is not None and task is not asyncio.current_task():
             task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+            done, _ = await asyncio.wait(
+                {task},
+                timeout=_CONNECTION_TASK_STOP_TIMEOUT,
+            )
+            if not done:
+                logger.warning("Feishu connection task stop timed out")
         self._connected = False
 
     async def _connection_loop(self) -> None:
@@ -373,6 +410,33 @@ class FeishuDriver:
             "last_error": self._last_error,
         }
 
+    async def probe_health(self) -> dict[str, Any]:
+        """Combine Driver lifecycle and bounded local platform health."""
+        snapshot = self.health_snapshot()
+        if not snapshot["connected"]:
+            return snapshot
+        platform_connected = False
+        platform = self._platform
+        if platform is not None:
+            try:
+                platform_connected = bool(
+                    (
+                        await asyncio.wait_for(
+                            platform.health_snapshot(),
+                            timeout=_PLATFORM_HEALTH_TIMEOUT,
+                        )
+                    ).get("connected"),
+                )
+            except (asyncio.TimeoutError, Exception):
+                logger.debug(
+                    "Feishu platform health probe failed",
+                    exc_info=True,
+                )
+        snapshot["connected"] = bool(
+            snapshot["connected"] and platform_connected,
+        )
+        return snapshot
+
     async def send(  # pylint: disable=too-many-return-statements
         self,
         params: SendParams,
@@ -382,50 +446,13 @@ class FeishuDriver:
         try:
             target = await self._resolve_receive_target(params.to_handle)
             if params.operation is OutboundOperation.MESSAGE_CREATE:
-                if params.approval is not None:
-                    message_id = await platform.send_approval(
-                        target.receive_id_type,
-                        target.receive_id,
-                        params.approval.to_mapping(),
-                        self._fallback_text(params.content_parts),
-                    )
-                else:
-                    message_id = await platform.send_message(
-                        target.receive_id_type,
-                        target.receive_id,
-                        params.content_parts,
-                    )
-                self._delivery_targets[params.delivery_id] = {
-                    "message_id": message_id,
-                }
+                await self._create_delivery(platform, target, params)
             elif params.operation is OutboundOperation.STREAM_START:
-                stream_target = await platform.start_stream(
-                    target.receive_id_type,
-                    target.receive_id,
-                    self._stream_text(params),
-                )
-                self._delivery_targets[params.delivery_id] = stream_target
+                await self._start_delivery_stream(platform, target, params)
             else:
-                stream_target = self._delivery_targets.get(
-                    params.target_delivery_id or "",
-                )
-                if stream_target is None:
-                    return self._failed_result(
-                        params.delivery_id,
-                        "OUTBOUND_TARGET_UNKNOWN",
-                    )
-                final = params.operation is OutboundOperation.STREAM_END
-                updated = await platform.update_stream(
-                    stream_target,
-                    self._stream_text(params),
-                    params.sequence or 0,
-                    final=final,
-                )
-                if not updated:
-                    return self._failed_result(
-                        params.delivery_id,
-                        "PLATFORM_SEND_FAILED",
-                    )
+                failure = await self._update_delivery_stream(platform, params)
+                if failure is not None:
+                    return failure
             return self._acknowledged_result(params.delivery_id)
         except FeishuDeliveryError as exc:
             logger.warning(
@@ -453,6 +480,93 @@ class FeishuDriver:
                 params.delivery_id,
                 "PLATFORM_RESULT_UNKNOWN",
             )
+
+    async def _create_delivery(
+        self,
+        platform: FeishuPlatform,
+        target: _ReceiveTarget,
+        params: SendParams,
+    ) -> None:
+        if params.approval is not None:
+            message_id = await platform.send_approval(
+                target.receive_id_type,
+                target.receive_id,
+                params.approval.to_mapping(),
+                self._fallback_text(params.content_parts),
+            )
+        else:
+            message_id = await platform.send_message(
+                target.receive_id_type,
+                target.receive_id,
+                params.content_parts,
+                reply_message_id=target.thread_message_id,
+            )
+        self._delivery_targets[params.delivery_id] = {
+            "message_id": message_id,
+        }
+
+    async def _start_delivery_stream(
+        self,
+        platform: FeishuPlatform,
+        target: _ReceiveTarget,
+        params: SendParams,
+    ) -> None:
+        if target.thread_message_id:
+            stream_target = {
+                "receive_id_type": target.receive_id_type,
+                "receive_id": target.receive_id,
+                "thread_message_id": target.thread_message_id,
+            }
+        else:
+            stream_target = await platform.start_stream(
+                target.receive_id_type,
+                target.receive_id,
+                self._stream_text(params),
+            )
+        self._delivery_targets[params.delivery_id] = stream_target
+
+    async def _update_delivery_stream(
+        self,
+        platform: FeishuPlatform,
+        params: SendParams,
+    ) -> dict[str, Any] | None:
+        stream_target = self._delivery_targets.get(
+            params.target_delivery_id or "",
+        )
+        if stream_target is None:
+            return self._failed_result(
+                params.delivery_id,
+                "OUTBOUND_TARGET_UNKNOWN",
+            )
+        final = params.operation is OutboundOperation.STREAM_END
+        thread_message_id = stream_target.get("thread_message_id", "")
+        if thread_message_id:
+            if final:
+                message_id = await platform.send_message(
+                    stream_target["receive_id_type"],
+                    stream_target["receive_id"],
+                    (
+                        {
+                            "type": "text",
+                            "text": self._thread_stream_text(params),
+                        },
+                    ),
+                    reply_message_id=thread_message_id,
+                )
+                stream_target["message_id"] = message_id
+            return None
+        updated = await platform.update_stream(
+            stream_target,
+            self._stream_text(params),
+            params.sequence or 0,
+            final=final,
+        )
+        if updated:
+            return None
+        return self._failed_result(
+            params.delivery_id,
+            "PLATFORM_SEND_FAILED",
+        )
 
     async def reaction(self, params: ReactionParams) -> dict[str, Any]:
         """Add the legacy DONE reaction to a sent platform message."""
@@ -654,7 +768,16 @@ class FeishuDriver:
         )
         if not receive_id:
             return
-        target = _ReceiveTarget(receive_type, receive_id)
+        thread_message_id = ""
+        if event.metadata.get("feishu_thread_id"):
+            thread_message_id = str(
+                event.metadata.get("feishu_message_id") or "",
+            )
+        target = _ReceiveTarget(
+            receive_type,
+            receive_id,
+            thread_message_id,
+        )
         for key in (
             str(event.conversation["id"]),
             event.acl_sender_id,
@@ -703,7 +826,14 @@ class FeishuDriver:
             receive_id = item.get("receive_id")
             receive_type = item.get("receive_id_type")
             if isinstance(receive_id, str) and isinstance(receive_type, str):
-                restored[key] = _ReceiveTarget(receive_type, receive_id)
+                thread_message_id = item.get("thread_message_id", "")
+                if not isinstance(thread_message_id, str):
+                    thread_message_id = ""
+                restored[key] = _ReceiveTarget(
+                    receive_type,
+                    receive_id,
+                    thread_message_id,
+                )
         self._receive_ids = restored
         self._trim_receive_ids()
 
@@ -737,13 +867,16 @@ class FeishuDriver:
             self._receive_ids.popitem(last=False)
 
     def _receive_state_value(self) -> dict[str, dict[str, str]]:
-        return {
-            key: {
+        value: dict[str, dict[str, str]] = {}
+        for key, target in self._receive_ids.items():
+            item = {
                 "receive_id_type": target.receive_id_type,
                 "receive_id": target.receive_id,
             }
-            for key, target in self._receive_ids.items()
-        }
+            if target.thread_message_id:
+                item["thread_message_id"] = target.thread_message_id
+            value[key] = item
+        return value
 
     async def _resolve_receive_target(self, to_handle: str) -> _ReceiveTarget:
         value = to_handle.strip()
@@ -812,6 +945,16 @@ class FeishuDriver:
         ):
             return f"{prefix}  💭 {text}" if prefix else f"💭 {text}"
         return f"{prefix}  {text}" if prefix and text else text
+
+    @staticmethod
+    def _thread_stream_text(params: SendParams) -> str:
+        text = params.accumulated_text or ""
+        if (
+            params.stream_type is not None
+            and params.stream_type.value == "reasoning"
+        ):
+            return f"💭 {text}"
+        return text
 
     @staticmethod
     def _acknowledged_result(delivery_id: str) -> dict[str, Any]:

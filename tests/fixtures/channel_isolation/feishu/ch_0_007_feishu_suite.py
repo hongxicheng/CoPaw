@@ -14,6 +14,7 @@ import logging
 from pathlib import Path
 import subprocess
 import sys
+import threading
 import time
 from types import SimpleNamespace
 from typing import Any
@@ -21,6 +22,7 @@ from unittest.mock import patch
 
 import pytest
 
+from qwenpaw.app.channels.feishu import driver as driver_module
 from qwenpaw.app.channels.feishu.driver import FeishuDriver
 from qwenpaw.app.channels.feishu import platform as platform_module
 from qwenpaw.app.channels.feishu.platform import (
@@ -147,6 +149,10 @@ class FakePlatform:
         self.sent: list[dict[str, Any]] = []
         self.fail_prepare = False
         self.send_error: FeishuDeliveryError | None = None
+        self.connected = False
+        self.disconnect_blocker: asyncio.Event | None = None
+        self.health_error: Exception | None = None
+        self.health_delay = 0.0
         self._on_message: Callable[[object], Awaitable[None]] | None = None
         self._on_card: Callable[[object], Awaitable[None]] | None = None
         self._disconnected = asyncio.Event()
@@ -174,6 +180,7 @@ class FakePlatform:
     ) -> None:
         """Establish one deterministic active connection."""
         self.connect_count += 1
+        self.connected = True
         self._on_message = on_message
         self._on_card = on_card
         self._disconnected = asyncio.Event()
@@ -184,6 +191,9 @@ class FakePlatform:
 
     async def disconnect(self) -> None:
         """Release the fake active connection."""
+        if self.disconnect_blocker is not None:
+            await self.disconnect_blocker.wait()
+        self.connected = False
         self._disconnected.set()
 
     async def close(self) -> None:
@@ -202,13 +212,24 @@ class FakePlatform:
 
     def force_disconnect(self) -> None:
         """Simulate a platform connection loss."""
+        self.connected = False
         self._disconnected.set()
+
+    async def health_snapshot(self) -> dict[str, Any]:
+        """Return deterministic local connection health."""
+        if self.health_delay:
+            await asyncio.sleep(self.health_delay)
+        if self.health_error is not None:
+            raise self.health_error
+        return {"connected": self.connected}
 
     async def send_message(
         self,
         receive_id_type: str,
         receive_id: str,
         content_parts: tuple[dict[str, Any], ...],
+        *,
+        reply_message_id: str = "",
     ) -> str:
         """Record one Driver outbound call."""
         if self.send_error is not None:
@@ -218,6 +239,7 @@ class FakePlatform:
                 "kind": "message",
                 "receive_id_type": receive_id_type,
                 "receive_id": receive_id,
+                "reply_message_id": reply_message_id,
                 "content_parts": [dict(part) for part in content_parts],
             },
         )
@@ -434,6 +456,7 @@ async def _start_session(
     media_dir: Path,
     *,
     state_store: HostStateStore | None = None,
+    reconnect_initial_delay: float = 0.001,
 ) -> tuple[RpcPeer, MockHost, FeishuDriver, asyncio.Task[None]]:
     core_transport, runner_transport = _transport_pair()
     core = RpcPeer(core_transport)
@@ -441,7 +464,7 @@ async def _start_session(
     host.transports = (core_transport, runner_transport)
     driver = FeishuDriver(
         platform_factory=lambda: platform,
-        reconnect_initial_delay=0.001,
+        reconnect_initial_delay=reconnect_initial_delay,
         reconnect_max_delay=0.005,
         connect_timeout=1.0,
     )
@@ -521,6 +544,7 @@ def _message(
     chat_type: str = "p2p",
     sender: str = "ou-user",
     mentioned: bool = False,
+    thread_id: str = "",
 ) -> dict[str, Any]:
     return {
         "event_id": event_id,
@@ -531,6 +555,7 @@ def _message(
         "sender_name": "Alice",
         "content_parts": [{"type": "text", "text": "hello"}],
         "bot_mentioned": mentioned,
+        "thread_id": thread_id,
     }
 
 
@@ -742,6 +767,227 @@ async def test_driver_outbound_card_stream_reaction_and_unknown_boundary(
         "reaction",
     ]
     await _close_session(core, session, identity)
+
+
+@pytest.mark.asyncio
+async def test_driver_thread_reply_and_stream_fallback_survive_checkpoint(
+    tmp_path: Path,
+) -> None:
+    """Thread routing replies to the source message without CardKit."""
+    identity = _identity("thread")
+    state_store = HostStateStore()
+    platform = FakePlatform("thread")
+    core, _, driver, session = await _start_session(
+        identity,
+        platform,
+        tmp_path,
+        state_store=state_store,
+    )
+    await platform.emit_message(
+        _message(
+            "thread-event",
+            chat_id="oc-thread",
+            chat_type="group",
+            thread_id="omt-thread",
+        ),
+    )
+    session_key = driver._session_key(
+        driver._normalize_message(
+            _message(
+                "thread-key",
+                chat_id="oc-thread",
+                chat_type="group",
+                thread_id="omt-thread",
+            ),
+        ),
+    )
+    target = f"feishu:sw:{session_key}"
+    common = {
+        "channel_key": "feishu",
+        "instance_id": identity.instance_id,
+        "generation": identity.generation,
+        "to_handle": target,
+    }
+    created = await core.call(
+        "channel.send",
+        {
+            **common,
+            "delivery_id": "thread-message",
+            "operation": "message.create",
+            "content_parts": [{"type": "text", "text": "reply"}],
+        },
+    )
+    started = await core.call(
+        "channel.send",
+        {
+            **common,
+            "delivery_id": "thread-stream",
+            "operation": "stream.start",
+            "stream_type": "message",
+            "sequence": 0,
+            "accumulated_text": "A",
+        },
+    )
+    delta = await core.call(
+        "channel.send",
+        {
+            **common,
+            "delivery_id": "thread-delta",
+            "operation": "stream.delta",
+            "target_delivery_id": "thread-stream",
+            "stream_type": "message",
+            "sequence": 1,
+            "accumulated_text": "AB",
+        },
+    )
+    ended = await core.call(
+        "channel.send",
+        {
+            **common,
+            "delivery_id": "thread-end",
+            "operation": "stream.end",
+            "target_delivery_id": "thread-stream",
+            "stream_type": "message",
+            "sequence": 2,
+            "accumulated_text": "ABC",
+        },
+    )
+    for result in (created, started, delta, ended):
+        assert result["state"] == "acknowledged"
+    messages = [item for item in platform.sent if item["kind"] == "message"]
+    assert [item["reply_message_id"] for item in messages] == [
+        "msg-thread-event",
+        "msg-thread-event",
+    ]
+    assert messages[-1]["content_parts"] == [
+        {"type": "text", "text": "ABC"},
+    ]
+    assert not any(
+        item["kind"].startswith("stream.") for item in platform.sent
+    )
+    checkpoint = driver._receive_state_value()
+    assert checkpoint[session_key]["thread_message_id"] == ("msg-thread-event")
+    await _close_session(core, session, identity)
+
+    restarted_identity = _identity("thread", generation=2)
+    restarted_platform = FakePlatform("thread-restarted")
+    restarted_core, _, _, restarted_session = await _start_session(
+        restarted_identity,
+        restarted_platform,
+        tmp_path,
+        state_store=state_store,
+    )
+    restarted = await restarted_core.call(
+        "channel.send",
+        {
+            "channel_key": "feishu",
+            "instance_id": restarted_identity.instance_id,
+            "generation": restarted_identity.generation,
+            "delivery_id": "thread-restarted",
+            "to_handle": target,
+            "operation": "message.create",
+            "content_parts": [{"type": "text", "text": "again"}],
+        },
+    )
+    assert restarted["state"] == "acknowledged"
+    assert restarted_platform.sent[-1]["reply_message_id"] == (
+        "msg-thread-event"
+    )
+    await _close_session(
+        restarted_core,
+        restarted_session,
+        restarted_identity,
+    )
+
+
+@pytest.mark.asyncio
+async def test_channel_health_tracks_disconnect_and_reconnect(
+    tmp_path: Path,
+) -> None:
+    """Health keeps lifecycle active while exposing connection readiness."""
+    identity = _identity("health")
+    platform = FakePlatform("health")
+    core, _, _, session = await _start_session(
+        identity,
+        platform,
+        tmp_path,
+        reconnect_initial_delay=0.05,
+    )
+    params = {
+        "channel_key": "feishu",
+        "instance_id": identity.instance_id,
+        "generation": identity.generation,
+    }
+    healthy = await core.call("channel.health", params)
+    assert healthy["state"] == "active"
+    assert healthy["consuming"] is True
+    platform.force_disconnect()
+    disconnected = await core.call("channel.health", params)
+    assert disconnected["state"] == "active"
+    assert disconnected["consuming"] is False
+    for _ in range(100):
+        if platform.connect_count >= 2 and platform.connected:
+            break
+        await asyncio.sleep(0.001)
+    reconnected = await core.call("channel.health", params)
+    assert reconnected["state"] == "active"
+    assert reconnected["consuming"] is True
+    assert set(reconnected) == {
+        "state",
+        "generation",
+        "lease_expires_at_ms",
+        "consuming",
+    }
+    await _close_session(core, session, identity)
+
+
+@pytest.mark.asyncio
+async def test_channel_health_probe_timeout_is_bounded(
+    tmp_path: Path,
+) -> None:
+    """A failed platform probe degrades health without blocking control."""
+    identity = _identity("health-timeout")
+    platform = FakePlatform("health-timeout")
+    core, _, _, session = await _start_session(identity, platform, tmp_path)
+    platform.health_delay = 0.1
+    params = {
+        "channel_key": "feishu",
+        "instance_id": identity.instance_id,
+        "generation": identity.generation,
+    }
+    with patch.object(driver_module, "_PLATFORM_HEALTH_TIMEOUT", 0.01):
+        started = time.monotonic()
+        result = await core.call("channel.health", params)
+    assert time.monotonic() - started < 0.08
+    assert result["state"] == "active"
+    assert result["consuming"] is False
+    platform.health_delay = 0.0
+    platform.health_error = RuntimeError("fixture probe failure")
+    failed = await core.call("channel.health", params)
+    assert failed["state"] == "active"
+    assert failed["consuming"] is False
+    platform.health_error = None
+    await _close_session(core, session, identity)
+
+
+@pytest.mark.asyncio
+async def test_runner_eof_is_bounded_when_platform_disconnect_hangs(
+    tmp_path: Path,
+) -> None:
+    """Runner EOF cleanup completes when platform disconnect never returns."""
+    identity = _identity("stop-timeout")
+    platform = FakePlatform("stop-timeout")
+    core, _, _, session = await _start_session(identity, platform, tmp_path)
+    platform.disconnect_blocker = asyncio.Event()
+    with (
+        patch.object(driver_module, "_PLATFORM_STOP_TIMEOUT", 0.01),
+        patch.object(driver_module, "_CONNECTION_TASK_STOP_TIMEOUT", 0.01),
+    ):
+        started = time.monotonic()
+        await core.aclose()
+        await asyncio.wait_for(session, timeout=0.2)
+    assert time.monotonic() - started < 0.2
+    platform.disconnect_blocker.set()
 
 
 @pytest.mark.asyncio
@@ -1123,14 +1369,20 @@ async def test_production_sdk_partial_success_becomes_unknown(
         _receive_type: str,
         _receive_id: str,
         _body: str,
+        *,
+        reply_message_id: str = "",
     ) -> list[str]:
+        _ = reply_message_id
         return ["msg-text"]
 
     async def failed_file(
         _receive_type: str,
         _receive_id: str,
         _part: Mapping[str, Any],
+        *,
+        reply_message_id: str = "",
     ) -> str:
+        _ = reply_message_id
         raise FeishuDeliveryError(
             "LOCAL_FILE_UNAVAILABLE",
             side_effect_possible=False,
@@ -1167,6 +1419,19 @@ async def test_production_sdk_send_card_stream_and_reaction_boundaries(
             data=SimpleNamespace(message_id=f"message-{message_counter}"),
         )
 
+    async def reply_message(request: object) -> _SdkResponse:
+        nonlocal message_counter
+        message_counter += 1
+        calls.append("message.reply")
+        assert isinstance(request, Mapping)
+        assert request["message_id"] == "msg-thread-source"
+        body = request["request_body"]
+        assert isinstance(body, Mapping)
+        assert body["reply_in_thread"] is True
+        return _SdkResponse(
+            data=SimpleNamespace(message_id=f"reply-{message_counter}"),
+        )
+
     async def create_image(_request: object) -> _SdkResponse:
         calls.append("image.create")
         return _SdkResponse(data=SimpleNamespace(image_key="image-key"))
@@ -1196,7 +1461,10 @@ async def test_production_sdk_send_card_stream_and_reaction_boundaries(
     platform._client = SimpleNamespace(
         im=SimpleNamespace(
             v1=SimpleNamespace(
-                message=SimpleNamespace(acreate=create_message),
+                message=SimpleNamespace(
+                    acreate=create_message,
+                    areply=reply_message,
+                ),
                 image=SimpleNamespace(acreate=create_image),
                 file=SimpleNamespace(acreate=create_file),
                 message_reaction=SimpleNamespace(acreate=create_reaction),
@@ -1219,6 +1487,8 @@ async def test_production_sdk_send_card_stream_and_reaction_boundaries(
     builder_names = (
         "CreateMessageRequest",
         "CreateMessageRequestBody",
+        "ReplyMessageRequest",
+        "ReplyMessageRequestBody",
         "CreateImageRequest",
         "CreateImageRequestBody",
         "CreateFileRequest",
@@ -1276,11 +1546,26 @@ async def test_production_sdk_send_card_stream_and_reaction_boundaries(
             final=True,
         )
         assert await platform.add_reaction(message_id, "DONE")
+        thread_id = await platform.send_message(
+            "chat_id",
+            "oc-sdk",
+            (
+                {"type": "text", "text": "| A | B |"},
+                {"type": "image", "image_url": image_path.as_uri()},
+                {
+                    "type": "file",
+                    "file_url": file_path.as_uri(),
+                    "filename": "file.txt",
+                },
+            ),
+            reply_message_id="msg-thread-source",
+        )
     finally:
         for item in reversed(patches):
             item.stop()
     assert message_id == "message-3"
     assert approval_id == "message-4"
+    assert thread_id == "reply-8"
     assert calls == [
         "message.create",
         "image.create",
@@ -1294,7 +1579,119 @@ async def test_production_sdk_send_card_stream_and_reaction_boundaries(
         "card.update",
         "card.finalize",
         "reaction.create",
+        "message.reply",
+        "image.create",
+        "message.reply",
+        "file.create",
+        "message.reply",
     ]
+
+
+@pytest.mark.asyncio
+async def test_production_sdk_half_open_connection_wakes_disconnect() -> None:
+    """A silent SDK-shaped connection is closed by the health monitor."""
+
+    class HalfOpenConnection:
+        async def recv(self) -> bytes:
+            await asyncio.Event().wait()
+            return b""
+
+        async def close(self) -> None:
+            return None
+
+    class HalfOpenClient:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            self._conn: HalfOpenConnection | None = None
+
+        async def _connect(self) -> None:
+            self._conn = HalfOpenConnection()
+            asyncio.get_running_loop().create_task(
+                self._receive_message_loop(),
+            )
+
+        async def _disconnect(self) -> None:
+            connection = self._conn
+            self._conn = None
+            if connection is not None:
+                await connection.close()
+
+        async def _ping_loop(self) -> None:
+            while True:
+                await asyncio.sleep(3600)
+
+        async def _handle_message(self, _message: bytes) -> None:
+            return None
+
+    fake_sdk = SimpleNamespace(
+        LogLevel=SimpleNamespace(INFO="info"),
+        FEISHU_DOMAIN="https://open.feishu.cn",
+        LARK_DOMAIN="https://open.larksuite.com",
+        ws=SimpleNamespace(Client=HalfOpenClient),
+    )
+    platform = LarkOapiPlatform()
+    platform._config = {"app_id": "app-sdk", "domain": "feishu"}
+    platform._secret = {"app_secret": "secret"}
+    platform._runner_loop = asyncio.get_running_loop()
+    platform._closed = False
+    platform._disconnected = asyncio.Event()
+    platform._ws_started.clear()
+    with (
+        patch.object(platform_module, "lark", fake_sdk),
+        patch.object(platform_module, "_WS_HEALTH_CHECK_INTERVAL", 0.01),
+        patch.object(platform_module, "FEISHU_WS_RECV_TIMEOUT", 0.01),
+    ):
+        platform._ws_thread = threading.Thread(
+            target=platform._run_ws,
+            args=(SimpleNamespace(),),
+            daemon=True,
+        )
+        platform._ws_thread.start()
+        assert await asyncio.to_thread(platform._ws_started.wait, 1.0)
+        await asyncio.wait_for(platform.wait_disconnected(), timeout=0.3)
+        thread = platform._ws_thread
+        if thread is not None:
+            await asyncio.to_thread(thread.join, 0.3)
+            assert not thread.is_alive()
+    await platform.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_production_sdk_disconnect_timeout_stops_loop() -> None:
+    """A blocked SDK disconnect cannot hold platform shutdown forever."""
+    platform = LarkOapiPlatform()
+    loop = asyncio.new_event_loop()
+    started = threading.Event()
+
+    def run_loop() -> None:
+        asyncio.set_event_loop(loop)
+        started.set()
+        loop.run_forever()
+        loop.close()
+
+    thread = threading.Thread(target=run_loop, daemon=True)
+    thread.start()
+    assert started.wait(1.0)
+
+    class BlockingClient:
+        _conn = object()
+
+        async def _disconnect(self) -> None:
+            await asyncio.Event().wait()
+
+    platform._closed = False
+    platform._ws_loop = loop
+    platform._ws_client = BlockingClient()
+    platform._ws_thread = thread
+    with (
+        patch.object(platform_module, "_WS_DISCONNECT_TIMEOUT", 0.01),
+        patch.object(platform_module, "_WS_THREAD_JOIN_TIMEOUT", 0.1),
+    ):
+        started_at = time.monotonic()
+        await platform.disconnect()
+    assert time.monotonic() - started_at < 0.2
+    await asyncio.to_thread(thread.join, 0.2)
+    assert not thread.is_alive()
+    assert platform._disconnected.is_set()
 
 
 @pytest.mark.asyncio

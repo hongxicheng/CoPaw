@@ -38,6 +38,7 @@ from .constants import (
     FEISHU_PROCESSED_IDS_MAX,
     FEISHU_STALE_MSG_THRESHOLD_MS,
     FEISHU_STREAM_ELEMENT_ID,
+    FEISHU_WS_RECV_TIMEOUT,
 )
 from .utils import (
     build_interactive_content_chunks,
@@ -52,6 +53,11 @@ from .utils import (
 
 
 logger = logging.getLogger(__name__)
+
+_WS_HEALTH_CHECK_INTERVAL = 30.0
+_WS_DISCONNECT_TIMEOUT = 5.0
+_WS_THREAD_JOIN_TIMEOUT = 5.0
+_WS_PENDING_CANCEL_TIMEOUT = 0.5
 
 
 def _declare_namespace_shim(_name: str) -> None:
@@ -100,6 +106,8 @@ try:
         Emoji,
         GetMessageRequest,
         GetMessageResourceRequest,
+        ReplyMessageRequest,
+        ReplyMessageRequestBody,
     )
     from lark_oapi.api.cardkit.v1 import (
         ContentCardElementRequest,
@@ -162,6 +170,7 @@ class LarkOapiPlatform:
         self._ws_started = threading.Event()
         self._ws_error: BaseException | None = None
         self._disconnected = asyncio.Event()
+        self._last_ws_receive_at = 0.0
         self._closed = False
         self._clock_offset = 0
         self._bot_open_id = ""
@@ -278,27 +287,85 @@ class LarkOapiPlatform:
         """Wait until the SDK connection terminates."""
         await self._disconnected.wait()
 
+    async def health_snapshot(self) -> dict[str, Any]:
+        """Return a local, non-blocking connection health snapshot."""
+        thread = self._ws_thread
+        loop = self._ws_loop
+        client = self._ws_client
+        connection = getattr(client, "_conn", None)
+        silent = (
+            self._last_ws_receive_at > 0
+            and time.monotonic() - self._last_ws_receive_at
+            > FEISHU_WS_RECV_TIMEOUT
+        )
+        connected = bool(
+            not self._closed
+            and thread is not None
+            and thread.is_alive()
+            and loop is not None
+            and not loop.is_closed()
+            and client is not None
+            and connection is not None
+            and not self._disconnected.is_set()
+            and not silent,
+        )
+        return {"connected": connected}
+
     async def disconnect(self) -> None:
         """Stop the current SDK connection without discarding config."""
         self._closed = True
         loop = self._ws_loop
         client = self._ws_client
-        if loop is not None and not loop.is_closed():
+        if (
+            loop is not None
+            and not loop.is_closed()
+            and loop.is_running()
+            and self._ws_error is None
+        ):
             if client is not None and hasattr(client, "_disconnect"):
-                with suppress(asyncio.CancelledError, Exception):
-                    future = asyncio.run_coroutine_threadsafe(
-                        client._disconnect(),
-                        loop,
+                future = asyncio.run_coroutine_threadsafe(
+                    self._disconnect_ws_client(),
+                    loop,
+                )
+                try:
+                    await asyncio.wait_for(
+                        asyncio.wrap_future(future),
+                        timeout=_WS_DISCONNECT_TIMEOUT * 1.2,
                     )
-                    await asyncio.wrap_future(future)
+                except asyncio.CancelledError:
+                    task = asyncio.current_task()
+                    if task is not None and task.cancelling():
+                        raise
+                except asyncio.TimeoutError:
+                    future.cancel()
+                    logger.warning("Feishu SDK disconnect timed out")
+                except Exception:
+                    future.cancel()
+                    logger.warning(
+                        "Feishu SDK disconnect failed",
+                        exc_info=True,
+                    )
             with suppress(RuntimeError):
                 loop.call_soon_threadsafe(loop.stop)
         thread = self._ws_thread
         if thread is not None and thread is not threading.current_thread():
-            await asyncio.to_thread(thread.join, 5.0)
-        self._ws_thread = None
-        self._ws_client = None
+            await asyncio.to_thread(thread.join, _WS_THREAD_JOIN_TIMEOUT)
+            if thread.is_alive():
+                logger.warning("Feishu WebSocket thread did not stop")
+        if thread is None or not thread.is_alive():
+            self._ws_thread = None
+            self._ws_client = None
         self._disconnected.set()
+
+    async def _disconnect_ws_client(self) -> None:
+        """Run the private SDK disconnect with a strict deadline."""
+        client = self._ws_client
+        if client is None or not hasattr(client, "_disconnect"):
+            return
+        await asyncio.wait_for(
+            client._disconnect(),
+            timeout=_WS_DISCONNECT_TIMEOUT,
+        )
 
     async def close(self) -> None:
         """Release all platform resources."""
@@ -407,42 +474,23 @@ class LarkOapiPlatform:
                 domain=self._sdk_domain(),
                 auto_reconnect=False,
             )
-
-            async def receive_message_loop() -> None:
-                try:
-                    while True:
-                        connection = self._ws_client._conn
-                        if connection is None:
-                            return
-                        message = await connection.recv()
-                        loop.create_task(
-                            self._ws_client._handle_message(message),
-                        )
-                except Exception:
-                    logger.debug(
-                        "Feishu WebSocket receive loop ended",
-                        exc_info=True,
-                    )
-                finally:
-                    with suppress(Exception):
-                        await self._ws_client._disconnect()
-                    runner_loop.call_soon_threadsafe(
-                        self._disconnected.set,
-                    )
-                    loop.call_soon(loop.stop)
-
-            self._ws_client._receive_message_loop = receive_message_loop
+            self._ws_client._receive_message_loop = (
+                lambda: self._receive_ws_messages(loop, runner_loop)
+            )
             loop.run_until_complete(self._ws_client._connect())
+            self._last_ws_receive_at = time.monotonic()
             loop.create_task(self._ws_client._ping_loop())
+            loop.create_task(
+                self._monitor_ws_connection(loop, runner_loop),
+            )
             self._ws_started.set()
             loop.run_forever()
         except BaseException as exc:
             self._ws_error = exc
             self._ws_started.set()
         finally:
-            if self._ws_client is not None:
-                with suppress(Exception):
-                    loop.run_until_complete(self._ws_client._disconnect())
+            with suppress(asyncio.TimeoutError, Exception):
+                loop.run_until_complete(self._disconnect_ws_client())
             pending = [
                 task for task in asyncio.all_tasks(loop) if not task.done()
             ]
@@ -451,11 +499,70 @@ class LarkOapiPlatform:
             if pending:
                 with suppress(Exception):
                     loop.run_until_complete(
-                        asyncio.gather(*pending, return_exceptions=True),
+                        asyncio.wait(
+                            pending,
+                            timeout=_WS_PENDING_CANCEL_TIMEOUT,
+                        ),
                     )
             loop.close()
             self._ws_loop = None
             runner_loop.call_soon_threadsafe(self._disconnected.set)
+
+    async def _receive_ws_messages(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        runner_loop: asyncio.AbstractEventLoop,
+    ) -> None:
+        """Receive SDK frames and terminate the connection on exit."""
+        try:
+            while True:
+                connection = getattr(self._ws_client, "_conn", None)
+                if connection is None:
+                    return
+                message = await connection.recv()
+                self._last_ws_receive_at = time.monotonic()
+                loop.create_task(self._ws_client._handle_message(message))
+        except Exception:
+            logger.debug(
+                "Feishu WebSocket receive loop ended",
+                exc_info=True,
+            )
+        finally:
+            await self._stop_ws_loop(loop, runner_loop)
+
+    async def _monitor_ws_connection(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        runner_loop: asyncio.AbstractEventLoop,
+    ) -> None:
+        """Close a missing or silent SDK connection."""
+        while not self._closed:
+            await asyncio.sleep(_WS_HEALTH_CHECK_INTERVAL)
+            connection = getattr(self._ws_client, "_conn", None)
+            silent = (
+                self._last_ws_receive_at > 0
+                and time.monotonic() - self._last_ws_receive_at
+                > FEISHU_WS_RECV_TIMEOUT
+            )
+            if connection is not None and not silent:
+                continue
+            if silent:
+                logger.warning("Feishu WebSocket was silent for too long")
+            else:
+                logger.warning("Feishu WebSocket connection was lost")
+            await self._stop_ws_loop(loop, runner_loop)
+            return
+
+    async def _stop_ws_loop(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        runner_loop: asyncio.AbstractEventLoop,
+    ) -> None:
+        """Best-effort disconnect and wake the Runner connection loop."""
+        with suppress(asyncio.TimeoutError, Exception):
+            await self._disconnect_ws_client()
+        runner_loop.call_soon_threadsafe(self._disconnected.set)
+        loop.call_soon(loop.stop)
 
     async def _dispatch_native_message(
         self,
@@ -777,6 +884,8 @@ class LarkOapiPlatform:
         receive_id_type: str,
         receive_id: str,
         content_parts: tuple[dict[str, Any], ...],
+        *,
+        reply_message_id: str = "",
     ) -> str:
         """Send text and media with legacy Feishu ordering and rendering."""
         text_parts: list[str] = []
@@ -798,6 +907,7 @@ class LarkOapiPlatform:
                     receive_id_type,
                     receive_id,
                     body,
+                    reply_message_id=reply_message_id,
                 )
                 if message_ids:
                     last_message_id = message_ids[-1]
@@ -808,12 +918,14 @@ class LarkOapiPlatform:
                         receive_id_type,
                         receive_id,
                         part,
+                        reply_message_id=reply_message_id,
                     )
                 else:
                     message_id = await self._send_file_part(
                         receive_id_type,
                         receive_id,
                         part,
+                        reply_message_id=reply_message_id,
                     )
                 last_message_id = message_id
                 side_effect_possible = True
@@ -868,8 +980,14 @@ class LarkOapiPlatform:
         receive_id_type: str,
         receive_id: str,
         body: str,
+        *,
+        reply_message_id: str = "",
     ) -> list[str]:
-        if re.search(r"^\s*\|", body, re.MULTILINE):
+        if not reply_message_id and re.search(
+            r"^\s*\|",
+            body,
+            re.MULTILINE,
+        ):
             message_ids = []
             try:
                 for chunk in build_interactive_content_chunks(body):
@@ -903,6 +1021,7 @@ class LarkOapiPlatform:
                 receive_id,
                 "post",
                 json.dumps(post, ensure_ascii=False),
+                reply_message_id=reply_message_id,
             ),
         ]
 
@@ -911,6 +1030,8 @@ class LarkOapiPlatform:
         receive_id_type: str,
         receive_id: str,
         part: Mapping[str, Any],
+        *,
+        reply_message_id: str = "",
     ) -> str:
         if self._client is None:
             raise FeishuDeliveryError(
@@ -951,6 +1072,7 @@ class LarkOapiPlatform:
                 receive_id,
                 "image",
                 json.dumps({"image_key": image_key}, ensure_ascii=False),
+                reply_message_id=reply_message_id,
             )
         except FeishuDeliveryError as exc:
             raise FeishuDeliveryError(
@@ -964,6 +1086,8 @@ class LarkOapiPlatform:
         receive_id_type: str,
         receive_id: str,
         part: Mapping[str, Any],
+        *,
+        reply_message_id: str = "",
     ) -> str:
         locator = str(
             part.get("file_url")
@@ -1031,6 +1155,7 @@ class LarkOapiPlatform:
                 receive_id,
                 "audio" if file_type == "opus" else "file",
                 json.dumps({"file_key": file_key}, ensure_ascii=False),
+                reply_message_id=reply_message_id,
             )
         except FeishuDeliveryError as exc:
             raise FeishuDeliveryError(
@@ -1081,21 +1206,40 @@ class LarkOapiPlatform:
         receive_id: str,
         message_type: str,
         content: str,
+        *,
+        reply_message_id: str = "",
     ) -> str:
-        request = (
-            CreateMessageRequest.builder()
-            .receive_id_type(receive_id_type)
-            .request_body(
-                CreateMessageRequestBody.builder()
-                .receive_id(receive_id)
-                .msg_type(message_type)
-                .content(content)
-                .build(),
+        if reply_message_id:
+            request = (
+                ReplyMessageRequest.builder()
+                .message_id(reply_message_id)
+                .request_body(
+                    ReplyMessageRequestBody.builder()
+                    .msg_type(message_type)
+                    .content(content)
+                    .reply_in_thread(True)
+                    .build(),
+                )
+                .build()
             )
-            .build()
-        )
+        else:
+            request = (
+                CreateMessageRequest.builder()
+                .receive_id_type(receive_id_type)
+                .request_body(
+                    CreateMessageRequestBody.builder()
+                    .receive_id(receive_id)
+                    .msg_type(message_type)
+                    .content(content)
+                    .build(),
+                )
+                .build()
+            )
         try:
-            response = await self._client.im.v1.message.acreate(request)
+            if reply_message_id:
+                response = await self._client.im.v1.message.areply(request)
+            else:
+                response = await self._client.im.v1.message.acreate(request)
         except Exception as exc:
             raise FeishuDeliveryError(
                 "MESSAGE_RESULT_UNKNOWN",

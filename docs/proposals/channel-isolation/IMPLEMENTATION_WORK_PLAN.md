@@ -428,7 +428,7 @@ Linux、真实 Windows 和真实 frozen desktop 发布制品验收，这些限�
 
 ### CH-0-007：飞书主动连接原型
 
-- 状态：[-] 初始实现和实施侧验证完成，等待独立 Review 和最终验证
+- 状态：[-] 初始实现和已确认审查问题修复完成，等待独立 Review 和最终验证
 
 - [x] 以最终 `FeishuDriver` → Runner-safe 飞书平台实现 → `lark-oapi` 生产路径为设计
   中心，从现有飞书实现迁移适合 Runner 边界的平台逻辑，不重新实现第二套平台连接。
@@ -452,13 +452,20 @@ Phase 3 的 durable pending、ACK 丢失重投和 Runner 重启恢复投递仍�
 生产 adapter 以单一原子导入边界加载真实 `lark-oapi`；任务局部测试通过隔离 pytest
 进程避开 legacy 全局 SDK 替身，不修改共享测试基础设施或扭曲生产导入结构。
 
-实现侧验证：CH-0-007 聚焦测试 `18 passed`；`tests/unit/channel_isolation`、旧飞书 unit 和
-contract 组合回归 `456 passed, 1 skipped`；目标文件 pre-commit 全部通过（包含 mypy、
-black、flake8 和 pylint），`git diff --check` 通过。测试覆盖两个 Agent 共用同一
-`environment_id` 时的独立进程、配置、secret、checkpoint、路由和出站状态，以及 Runner
-崩溃后新 generation 从 Host State 恢复 Core reply。当前未运行真实飞书外部收发、Linux、
-真实 Windows、frozen desktop 和全仓库测试；这些限制等待独立 Review、G0 或发布验证处理，
-本任务不得据此标记为 `[x]`。
+已确认审查问题修复保留 topic/thread 原消息路由，文本和媒体使用
+`ReplyMessageRequest(reply_in_thread=true)`，thread streaming 收敛为最终非流式回复；恢复
+静默和半开 WebSocket 健康监控；为 SDK disconnect、线程清理和 Driver stop 设置内部有限
+边界；`channel.health` 在不扩展 CH-0-004 响应 Schema 的前提下执行有界本地平台探测。
+
+实现侧验证：CH-0-007 隔离 suite `24 passed`，普通聚焦入口 `1 passed`；
+`tests/unit/channel_isolation`、旧飞书 unit 和 contract 组合回归
+`456 passed, 1 skipped`；目标文件 pre-commit 全部通过（包含 mypy、black、flake8 和
+pylint），`git diff --check` 通过。测试覆盖两个 Agent 共用同一 `environment_id` 时的独立
+进程、配置、secret、checkpoint、路由和出站状态，Runner 崩溃后新 generation 从 Host
+State 恢复 Core reply，以及 thread reply/checkpoint 恢复、thread streaming fallback、
+半开连接恢复、disconnect/EOF 有界清理和断连期间 health 可观测性。当前未运行真实飞书
+外部收发、Linux、真实 Windows、frozen desktop 和全仓库测试；这些限制等待独立 Review、
+G0 或发布验证处理，本任务不得据此标记为 `[x]`。
 
 验收：两个 Agent 使用不同飞书配置并行收发，无配置、session 或状态串用。
 

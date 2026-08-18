@@ -85,6 +85,7 @@ class FixturePlatform:
         self._on_message: Callable[[object], Awaitable[None]] | None = None
         self._disconnected = asyncio.Event()
         self._emit_task: asyncio.Task[None] | None = None
+        self._connected = False
 
     async def prepare(
         self,
@@ -107,6 +108,7 @@ class FixturePlatform:
         """Start one active fixture connection."""
         _ = on_card
         self._on_message = on_message
+        self._connected = True
         self._disconnected = asyncio.Event()
         event = self._config.get("fixture_event")
         if isinstance(event, Mapping) and event:
@@ -123,6 +125,7 @@ class FixturePlatform:
 
     async def disconnect(self) -> None:
         """Stop the active fixture connection."""
+        self._connected = False
         self._disconnected.set()
         if self._emit_task is not None:
             await asyncio.gather(self._emit_task, return_exceptions=True)
@@ -136,12 +139,19 @@ class FixturePlatform:
         receive_id_type: str,
         receive_id: str,
         content_parts: tuple[dict[str, Any], ...],
+        *,
+        reply_message_id: str = "",
     ) -> str:
         """Return a deterministic message identifier."""
         assert receive_id_type in {"chat_id", "open_id"}
         assert receive_id
         assert content_parts
+        _ = reply_message_id
         return f"fixture-message-{receive_id}"
+
+    async def health_snapshot(self) -> dict[str, Any]:
+        """Return deterministic local connection health."""
+        return {"connected": self._connected}
 
     async def send_approval(
         self,
