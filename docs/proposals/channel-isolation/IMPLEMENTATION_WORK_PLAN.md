@@ -428,17 +428,37 @@ Linux、真实 Windows 和真实 frozen desktop 发布制品验收，这些限�
 
 ### CH-0-007：飞书主动连接原型
 
-- [ ] 以最终 `FeishuDriver` → Runner-safe 飞书平台实现 → `lark-oapi` 生产路径为设计
+- 状态：[-] 初始实现和实施侧验证完成，等待独立 Review 和最终验证
+
+- [x] 以最终 `FeishuDriver` → Runner-safe 飞书平台实现 → `lark-oapi` 生产路径为设计
   中心，从现有飞书实现迁移适合 Runner 边界的平台逻辑，不重新实现第二套平台连接。
-- [ ] 现有 `FeishuChannel` 仅作为迁移前行为来源和回归基线；不要求其消费新的平台
+- [x] 现有 `FeishuChannel` 仅作为迁移前行为来源和回归基线；不要求其消费新的平台
   组件，不得为兼容其内部结构增加新生产路径的复杂度。
-- [ ] 使用 mock Host 和预构建 fixture environment，不实现正式 Env/Process Manager。
-- [ ] 验证主动长连接、鉴权、私聊/群聊/mention、文本/媒体/卡片和 streaming。
-- [ ] 在新生产 adapter 边界直接验证鉴权、SDK 回调、消息解析、媒体、卡片和
+- [x] 使用 mock Host 和预构建 fixture environment，不实现正式 Env/Process Manager。
+- [x] 验证主动长连接、鉴权、私聊/群聊/mention、文本/媒体/卡片和 streaming。
+- [x] 在新生产 adapter 边界直接验证鉴权、SDK 回调、消息解析、媒体、卡片和
   streaming，不以 legacy Channel 复用新组件作为验收证据。
-- [ ] 验证两个 Agent 的默认 instance 共用 environment，但 Runner、secret、checkpoint
+- [x] 验证两个 Agent 的默认 instance 共用 environment，但 Runner、secret、checkpoint
   和状态独立。
-- [ ] 验证 Runner 崩溃、重连和 Core 回复。
+- [x] 验证 Runner 崩溃、重连和 Core 回复。
+
+实现位于 `src/qwenpaw/app/channels/feishu/driver.py` 和 `platform.py`；旧
+`FeishuChannel` 未改为消费新组件，`feishu/__init__.py` 仅以懒加载隔离 Runner 导入路径。
+任务局部 Runner 位于 `tests/fixtures/channel_isolation/feishu/runner.py`，没有修改正式
+bootstrap、Env/Process Manager、Registry、Catalog 或 Proxy。生产 adapter 直接覆盖
+`lark-oapi` Client、WebSocket 同步回调、tenant-token 鉴权探测、消息/引用解析、媒体下载与
+上传、approval card、CardKit streaming 和 reaction；同步回调保持迁移前快速返回语义，
+Phase 3 的 durable pending、ACK 丢失重投和 Runner 重启恢复投递仍归 `CH-3-001`。
+生产 adapter 以单一原子导入边界加载真实 `lark-oapi`；任务局部测试通过隔离 pytest
+进程避开 legacy 全局 SDK 替身，不修改共享测试基础设施或扭曲生产导入结构。
+
+实现侧验证：CH-0-007 聚焦测试 `18 passed`；`tests/unit/channel_isolation`、旧飞书 unit 和
+contract 组合回归 `456 passed, 1 skipped`；目标文件 pre-commit 全部通过（包含 mypy、
+black、flake8 和 pylint），`git diff --check` 通过。测试覆盖两个 Agent 共用同一
+`environment_id` 时的独立进程、配置、secret、checkpoint、路由和出站状态，以及 Runner
+崩溃后新 generation 从 Host State 恢复 Core reply。当前未运行真实飞书外部收发、Linux、
+真实 Windows、frozen desktop 和全仓库测试；这些限制等待独立 Review、G0 或发布验证处理，
+本任务不得据此标记为 `[x]`。
 
 验收：两个 Agent 使用不同飞书配置并行收发，无配置、session 或状态串用。
 
