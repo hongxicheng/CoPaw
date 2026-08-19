@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import asyncio
-from typing import cast
+from typing import Awaitable, Callable, cast
 
 import pytest
 
@@ -86,6 +86,63 @@ async def _authorize_registry(
     return lease
 
 
+def _runner_result(method: str, generation: int) -> dict[str, object]:
+    """Return one valid Runner lifecycle response."""
+    if method == "channel.commit":
+        return {
+            "state": "active",
+            "generation": generation,
+            "consuming": True,
+        }
+    if method in {"channel.prepare", "channel.activate"}:
+        return {"state": "standby", "generation": generation}
+    if method == "channel.lease_renew":
+        return {"state": "active", "generation": generation}
+    raise AssertionError(f"unexpected lifecycle method: {method}")
+
+
+class _ScriptedPeer:
+    """Provide default lifecycle results with focused method overrides."""
+
+    def __init__(
+        self,
+        generation: int,
+        handlers: dict[str, Callable[[], Awaitable[object]]] | None = None,
+    ) -> None:
+        self.generation = generation
+        self.handlers = handlers or {}
+        self.calls: list[str] = []
+
+    async def call(
+        self,
+        method: str,
+        _: object,
+        *,
+        timeout: float | None = None,
+    ) -> object:
+        """Run an override or return the default generation result."""
+        _ = timeout
+        self.calls.append(method)
+        handler = self.handlers.get(method)
+        if handler is not None:
+            return await handler()
+        return _runner_result(method, self.generation)
+
+
+async def _activate_client(
+    lifecycle: CoreLifecycleClient,
+    *,
+    generation: int = 7,
+    token: str = "route-lease",
+) -> LeaseParams:
+    """Prepare, activate, and commit one peer-bound client."""
+    lease = _lease_params(generation=generation, token=token)
+    await lifecycle.prepare(_prepare_params(generation))
+    await lifecycle.activate(lease)
+    await lifecycle.commit(lease)
+    return lease
+
+
 def test_endpoint_registry_must_match_authority_identity() -> None:
     """Endpoint storage cannot diverge from its lifecycle authority."""
     authority = CoreGenerationAuthority(
@@ -109,29 +166,20 @@ async def test_control_timeout_keeps_generation_revoked() -> None:
         instance_id="instance-1",
         clock_ms=clock,
     )
-    lease = await _authorize_registry(registry)
-    registry.register(_endpoint())
 
-    class TimeoutPeer:
+    async def timeout_stop() -> object:
         """Fail after observing the pre-call Core fencing boundary."""
+        assert registry.resolve(7) is None
+        raise RpcTimeoutError("stop timed out")
 
-        async def call(
-            self,
-            method: str,
-            _: object,
-            *,
-            timeout: float | None = None,
-        ) -> object:
-            _ = timeout
-            assert method == "channel.stop"
-            assert registry.resolve(7) is None
-            raise RpcTimeoutError("stop timed out")
-
+    peer = _ScriptedPeer(7, {"channel.stop": timeout_stop})
     lifecycle = CoreLifecycleClient(
-        cast(RpcPeer, TimeoutPeer()),
+        cast(RpcPeer, peer),
         registry.authority,
         registry.prune,
     )
+    lease = await _activate_client(lifecycle)
+    registry.register(_endpoint())
     with pytest.raises(RpcTimeoutError):
         await lifecycle.stop(IdentityParams.from_mapping(_identity()))
     assert registry.resolve(7) is None
@@ -147,43 +195,245 @@ async def test_stop_can_retry_after_timeout_without_restoring_route() -> None:
         channel_key="voice",
         instance_id="instance-1",
     )
-    await _authorize_registry(registry)
-    registry.register(_endpoint())
 
-    class RetryPeer:
+    stop_calls = 0
+
+    async def retry_stop() -> object:
         """Fail the first stop call and accept its explicit retry."""
+        nonlocal stop_calls
+        assert registry.resolve(7) is None
+        stop_calls += 1
+        if stop_calls == 1:
+            raise RpcTimeoutError("stop timed out")
+        return {"state": "stopped", "generation": 7}
 
-        def __init__(self) -> None:
-            self.calls = 0
-
-        async def call(
-            self,
-            method: str,
-            _: object,
-            *,
-            timeout: float | None = None,
-        ) -> object:
-            _ = timeout
-            assert method == "channel.stop"
-            assert registry.resolve(7) is None
-            self.calls += 1
-            if self.calls == 1:
-                raise RpcTimeoutError("stop timed out")
-            return {"state": "stopped", "generation": 7}
-
-    peer = RetryPeer()
+    peer = _ScriptedPeer(7, {"channel.stop": retry_stop})
     lifecycle = CoreLifecycleClient(
         cast(RpcPeer, peer),
         registry.authority,
         registry.prune,
     )
+    await _activate_client(lifecycle)
+    registry.register(_endpoint())
     params = IdentityParams.from_mapping(_identity())
     with pytest.raises(RpcTimeoutError):
         await lifecycle.stop(params)
     assert registry.resolve(7) is None
     assert (await lifecycle.stop(params))["state"] == "stopped"
-    assert peer.calls == 2
+    assert stop_calls == 2
     assert registry.resolve(7) is None
+
+
+@pytest.mark.asyncio
+async def test_old_stop_retry_survives_candidate_prepare_abort() -> None:
+    """A failed candidate cannot erase an old peer's stop capability."""
+    registry = CoreEndpointRegistry(
+        channel_key="voice",
+        instance_id="instance-1",
+    )
+
+    stop_calls = 0
+
+    async def retry_old_stop() -> object:
+        """Time out once, then accept the old Runner stop retry."""
+        nonlocal stop_calls
+        stop_calls += 1
+        if stop_calls == 1:
+            raise RpcTimeoutError("old stop timed out")
+        return {"state": "stopped", "generation": 7}
+
+    old_peer = _ScriptedPeer(7, {"channel.stop": retry_old_stop})
+    old_client = CoreLifecycleClient(
+        cast(RpcPeer, old_peer),
+        registry.authority,
+        registry.prune,
+    )
+    await _activate_client(old_client)
+    old_params = IdentityParams.from_mapping(_identity())
+    with pytest.raises(RpcTimeoutError):
+        await old_client.stop(old_params)
+
+    async def fail_candidate_prepare() -> object:
+        """Fail the replacement after local candidate admission."""
+        raise RpcTimeoutError("candidate prepare timed out")
+
+    candidate_peer = _ScriptedPeer(
+        8,
+        {"channel.prepare": fail_candidate_prepare},
+    )
+    candidate = CoreLifecycleClient(
+        cast(RpcPeer, candidate_peer),
+        registry.authority,
+        registry.prune,
+    )
+    with pytest.raises(RpcTimeoutError):
+        await candidate.prepare(_prepare_params(generation=8))
+    assert registry.authority.snapshot.candidate is None
+    assert (await old_client.stop(old_params))["state"] == "stopped"
+    assert stop_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_old_stop_retry_does_not_revoke_new_active_generation() -> None:
+    """An old peer remains stoppable after a replacement commits."""
+    registry = CoreEndpointRegistry(
+        channel_key="voice",
+        instance_id="instance-1",
+    )
+
+    stop_calls = 0
+
+    async def retry_old_stop() -> object:
+        """Keep the first old stop result uncertain."""
+        nonlocal stop_calls
+        stop_calls += 1
+        if stop_calls == 1:
+            raise RpcTimeoutError("old stop timed out")
+        assert registry.resolve(8) is not None
+        return {"state": "stopped", "generation": 7}
+
+    old_peer = _ScriptedPeer(7, {"channel.stop": retry_old_stop})
+    old_client = CoreLifecycleClient(
+        cast(RpcPeer, old_peer),
+        registry.authority,
+        registry.prune,
+    )
+    await _activate_client(old_client)
+    with pytest.raises(RpcTimeoutError):
+        await old_client.stop(IdentityParams.from_mapping(_identity()))
+
+    new_client = CoreLifecycleClient(
+        cast(RpcPeer, _ScriptedPeer(8)),
+        registry.authority,
+        registry.prune,
+    )
+    await _activate_client(
+        new_client,
+        generation=8,
+        token="next-lease",
+    )
+    endpoint = EndpointParams.from_mapping(
+        {**_endpoint().to_mapping(), **_identity(generation=8)},
+    )
+    registry.register(endpoint)
+    assert registry.resolve(8) == endpoint
+
+    await old_client.stop(IdentityParams.from_mapping(_identity()))
+    assert stop_calls == 2
+    assert registry.resolve(8) == endpoint
+
+
+@pytest.mark.asyncio
+async def test_old_token_cannot_revoke_same_generation_new_epoch() -> None:
+    """An old peer token cannot fence a reused generation slot."""
+    registry = CoreEndpointRegistry(
+        channel_key="voice",
+        instance_id="instance-1",
+    )
+
+    stop_calls = 0
+
+    async def fail_old_prepare() -> object:
+        """Keep the old candidate result uncertain."""
+        raise RpcTimeoutError("old prepare timed out")
+
+    async def stop_old_peer() -> object:
+        """Accept shutdown on the failed old peer."""
+        nonlocal stop_calls
+        stop_calls += 1
+        return {"state": "stopped", "generation": 7}
+
+    old_peer = _ScriptedPeer(
+        7,
+        {
+            "channel.prepare": fail_old_prepare,
+            "channel.stop": stop_old_peer,
+        },
+    )
+    old_client = CoreLifecycleClient(
+        cast(RpcPeer, old_peer),
+        registry.authority,
+        registry.prune,
+    )
+    with pytest.raises(RpcTimeoutError):
+        await old_client.prepare(_prepare_params())
+
+    new_client = CoreLifecycleClient(
+        cast(RpcPeer, _ScriptedPeer(7)),
+        registry.authority,
+        registry.prune,
+    )
+    await _activate_client(new_client)
+    registry.register(_endpoint())
+    assert registry.resolve(7) == _endpoint()
+
+    await old_client.stop(IdentityParams.from_mapping(_identity()))
+    assert stop_calls == 1
+    assert registry.resolve(7) == _endpoint()
+
+
+@pytest.mark.asyncio
+async def test_quiesced_old_peer_survives_candidate_replacement() -> None:
+    """Candidate replacement cannot erase an old peer's stop capability."""
+    registry = CoreEndpointRegistry(
+        channel_key="voice",
+        instance_id="instance-1",
+    )
+
+    stop_calls = 0
+
+    async def timeout_old_quiesce() -> object:
+        """Keep the old quiesce result uncertain."""
+        raise RpcTimeoutError("old quiesce timed out")
+
+    async def stop_old_peer() -> object:
+        """Accept stop on the same old peer."""
+        nonlocal stop_calls
+        stop_calls += 1
+        return {"state": "stopped", "generation": 7}
+
+    old_peer = _ScriptedPeer(
+        7,
+        {
+            "channel.quiesce": timeout_old_quiesce,
+            "channel.stop": stop_old_peer,
+        },
+    )
+    old_client = CoreLifecycleClient(
+        cast(RpcPeer, old_peer),
+        registry.authority,
+        registry.prune,
+    )
+    await _activate_client(old_client)
+    with pytest.raises(RpcTimeoutError):
+        await old_client.quiesce(
+            QuiesceParams.from_mapping(
+                {**_identity(), "drain_timeout_ms": 10},
+            ),
+        )
+
+    candidate_8 = CoreLifecycleClient(
+        cast(RpcPeer, _ScriptedPeer(8)),
+        registry.authority,
+        registry.prune,
+    )
+    candidate_9 = CoreLifecycleClient(
+        cast(RpcPeer, _ScriptedPeer(9)),
+        registry.authority,
+        registry.prune,
+    )
+    await candidate_8.prepare(_prepare_params(generation=8))
+    await candidate_9.prepare(_prepare_params(generation=9))
+    assert registry.authority.snapshot.candidate is not None
+    assert registry.authority.snapshot.candidate.generation == 9
+
+    result = await old_client.stop(
+        IdentityParams.from_mapping(_identity()),
+    )
+    assert result["state"] == "stopped"
+    assert stop_calls == 1
+    assert registry.authority.snapshot.candidate is not None
+    assert registry.authority.snapshot.candidate.generation == 9
 
 
 @pytest.mark.asyncio
@@ -382,8 +632,6 @@ async def test_shutdown_detaches_endpoint_before_blocked_hook(
         instance_id="instance-1",
         clock_ms=clock,
     )
-    await _authorize_registry(registry)
-    registry.register(_endpoint())
     entered = asyncio.Event()
 
     class BlockingPeer:
@@ -397,6 +645,8 @@ async def test_shutdown_detaches_endpoint_before_blocked_hook(
             timeout: float | None = None,
         ) -> object:
             _ = timeout
+            if method not in {"channel.quiesce", "channel.stop"}:
+                return _runner_result(method, 7)
             assert method == f"channel.{operation}"
             assert registry.resolve(7) is None
             entered.set()
@@ -408,6 +658,8 @@ async def test_shutdown_detaches_endpoint_before_blocked_hook(
         registry.authority,
         registry.prune,
     )
+    await _activate_client(lifecycle)
+    registry.register(_endpoint())
     if operation == "quiesce":
         request = asyncio.create_task(
             lifecycle.quiesce(
@@ -484,6 +736,145 @@ async def test_reprepared_candidate_cannot_reuse_old_endpoint() -> None:
 
 
 @pytest.mark.asyncio
+async def test_bound_client_rejects_second_prepare_before_runner() -> None:
+    """One client cannot silently attach to another Runner generation."""
+    registry = CoreEndpointRegistry(
+        channel_key="voice",
+        instance_id="instance-1",
+    )
+
+    peer = _ScriptedPeer(7)
+    client = CoreLifecycleClient(
+        cast(RpcPeer, peer),
+        registry.authority,
+        registry.prune,
+    )
+    await _activate_client(client)
+    with pytest.raises(RpcError) as error:
+        await client.prepare(_prepare_params(generation=8))
+    assert error.value.data["reason_code"] == "INVALID_STATE_TRANSITION"
+    assert peer.calls.count("channel.prepare") == 1
+
+
+@pytest.mark.asyncio
+async def test_concurrent_prepare_binds_client_only_once() -> None:
+    """Concurrent prepare calls cannot bind one client to two epochs."""
+    registry = CoreEndpointRegistry(
+        channel_key="voice",
+        instance_id="instance-1",
+    )
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class BlockingPeer:
+        """Hold the first prepare while the second attempts admission."""
+
+        def __init__(self) -> None:
+            self.prepare_calls = 0
+
+        async def call(
+            self,
+            method: str,
+            _: object,
+            *,
+            timeout: float | None = None,
+        ) -> object:
+            _ = timeout
+            assert method == "channel.prepare"
+            self.prepare_calls += 1
+            entered.set()
+            await release.wait()
+            return _runner_result(method, 7)
+
+    peer = BlockingPeer()
+    client = CoreLifecycleClient(
+        cast(RpcPeer, peer),
+        registry.authority,
+        registry.prune,
+    )
+    first = asyncio.create_task(client.prepare(_prepare_params()))
+    await asyncio.wait_for(entered.wait(), timeout=0.1)
+    with pytest.raises(RpcError) as error:
+        await client.prepare(_prepare_params(generation=8))
+    assert error.value.data["reason_code"] == "INVALID_STATE_TRANSITION"
+    release.set()
+    await first
+    assert peer.prepare_calls == 1
+    assert registry.authority.snapshot.candidate is not None
+    assert registry.authority.snapshot.candidate.generation == 7
+
+
+@pytest.mark.asyncio
+async def test_unbound_client_cannot_control_another_client_slot() -> None:
+    """A new client cannot stop, activate, or renew another peer's slot."""
+    registry = CoreEndpointRegistry(
+        channel_key="voice",
+        instance_id="instance-1",
+    )
+
+    owner = CoreLifecycleClient(
+        cast(RpcPeer, _ScriptedPeer(7)),
+        registry.authority,
+        registry.prune,
+    )
+    lease = await _activate_client(owner)
+
+    class RejectUnexpectedPeer:
+        """Fail if another client reaches any Runner control method."""
+
+        async def call(self, *_: object, **__: object) -> object:
+            raise AssertionError("unbound client reached Runner")
+
+    other = CoreLifecycleClient(
+        cast(RpcPeer, RejectUnexpectedPeer()),
+        registry.authority,
+        registry.prune,
+    )
+    with pytest.raises(RpcError) as renew_error:
+        await other.lease_renew(lease)
+    assert renew_error.value.data["reason_code"] == "GENERATION_UNKNOWN"
+    with pytest.raises(RpcError) as stop_error:
+        await other.stop(IdentityParams.from_mapping(_identity()))
+    assert stop_error.value.data["reason_code"] == "GENERATION_UNKNOWN"
+    assert registry.authority.snapshot.active is not None
+    assert registry.authority.snapshot.active.generation == 7
+
+
+@pytest.mark.asyncio
+async def test_control_token_cannot_move_between_clients() -> None:
+    """A copied opaque token is still bound to its original client."""
+    registry = CoreEndpointRegistry(
+        channel_key="voice",
+        instance_id="instance-1",
+    )
+
+    owner = CoreLifecycleClient(
+        cast(RpcPeer, _ScriptedPeer(7)),
+        registry.authority,
+        registry.prune,
+    )
+    await _activate_client(owner)
+
+    class RejectUnexpectedPeer:
+        """Fail if a copied token reaches another Runner peer."""
+
+        async def call(self, *_: object, **__: object) -> object:
+            raise AssertionError("copied token reached another peer")
+
+    other = CoreLifecycleClient(
+        cast(RpcPeer, RejectUnexpectedPeer()),
+        registry.authority,
+        registry.prune,
+    )
+    setattr(other, "_control_token", getattr(owner, "_control_token"))
+    with pytest.raises(RpcError) as error:
+        await other.stop(IdentityParams.from_mapping(_identity()))
+    assert error.value.data["reason_code"] == "GENERATION_UNKNOWN"
+    assert registry.authority.snapshot.active is not None
+    assert registry.authority.snapshot.active.generation == 7
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("operation", ["stop", "quiesce"])
 @pytest.mark.parametrize(
     ("field", "value", "reason_code"),
@@ -503,20 +894,29 @@ async def test_invalid_shutdown_identity_does_not_revoke_or_call_runner(
         channel_key="voice",
         instance_id="instance-1",
     )
-    await _authorize_registry(registry)
-    registry.register(_endpoint())
 
     class RejectUnexpectedPeer:
         """Fail if an invalid control request reaches the Runner."""
 
-        async def call(self, *_: object, **__: object) -> object:
-            raise AssertionError("invalid identity reached Runner")
+        async def call(
+            self,
+            method: str,
+            _: object,
+            *,
+            timeout: float | None = None,
+        ) -> object:
+            _ = timeout
+            if method in {"channel.stop", "channel.quiesce"}:
+                raise AssertionError("invalid identity reached Runner")
+            return _runner_result(method, 7)
 
     lifecycle = CoreLifecycleClient(
         cast(RpcPeer, RejectUnexpectedPeer()),
         registry.authority,
         registry.prune,
     )
+    await _activate_client(lifecycle)
+    registry.register(_endpoint())
     identity = {**_identity(), field: value}
     with pytest.raises(RpcError) as error:
         if operation == "stop":
@@ -648,11 +1048,6 @@ async def test_cancelled_commit_finishes_core_settlement() -> None:
         instance_id="instance-1",
         authority=authority,
     )
-    prepare = await registry.authority.prepare_start(_prepare_params())
-    await registry.authority.prepare_complete(prepare)
-    lease = _lease_params()
-    activate = await registry.authority.activate_start(lease)
-    await registry.authority.activate_complete(activate, lease)
 
     class SuccessfulPeer:
         """Return the Runner commit result before Core settlement blocks."""
@@ -665,18 +1060,16 @@ async def test_cancelled_commit_finishes_core_settlement() -> None:
             timeout: float | None = None,
         ) -> object:
             _ = timeout
-            assert method == "channel.commit"
-            return {
-                "state": "active",
-                "generation": 7,
-                "consuming": True,
-            }
+            return _runner_result(method, 7)
 
     lifecycle = CoreLifecycleClient(
         cast(RpcPeer, SuccessfulPeer()),
         registry.authority,
         registry.prune,
     )
+    await lifecycle.prepare(_prepare_params())
+    lease = _lease_params()
+    await lifecycle.activate(lease)
     request = asyncio.create_task(lifecycle.commit(lease))
     await asyncio.wait_for(authority.entered.wait(), timeout=0.1)
     request.cancel()

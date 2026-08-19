@@ -690,6 +690,23 @@ Core 发起
 撤销 authorization；RPC 超时、失败或 Runner 断联均不得恢复。合法的重复 stop/quiesce 即使
 前一次 RPC 超时也可继续调用 Runner，但 authorization 始终保持撤销。
 
+该 shutdown 重试资格属于具体 Core control client 与其绑定的 Runner peer，不属于 route
+authorization。Core 在一个 client 首次成功完成本地 prepare admission 时签发不透明、仅进程内
+使用的 control capability，并绑定 authority 私有 nonce、client 私有 nonce、generation 和
+candidate epoch；该 capability 不进入 wire DTO、checkpoint 或持久状态。它从 candidate 贯穿
+active、prepare abort、candidate replacement 和 retired，直到 client/peer 被释放；authority
+不保存 retired generation 或 capability 历史集合。同一 client 不得再次 prepare 其他 generation
+或 epoch，必须为新 Runner 创建新的 peer-bound client。
+
+stop/quiesce 必须依次校验 channel/instance identity、params generation、authority/client
+binding，再检查当前 slot。slot 仍为 capability 对应的 generation 和 epoch 时先单调 revoke；
+slot 已消失或 epoch 已变化时不得修改当前 authority，但仍向 capability 绑定的旧 Runner peer
+发送控制请求。因此旧 Runner 的 stop/quiesce 重试不会被后续 candidate abort、replacement 或
+新 generation commit 覆盖，也不能撤销同 generation 的新 epoch。该 capability 只能发送
+stop/quiesce 以及约束同一 peer 的 activate/commit/renew 调用，不能恢复 route、允许 Host RPC、
+注册 endpoint 或绕过 lease、phase、readiness 门禁。quiesce 的重复调用仍服从 Runner 自身的
+稳定状态转换语义；quiesce 结果不确定后，同一旧 client 必须仍能继续发送 stop。
+
 同步 endpoint resolve 只读取 authority 在锁内发布的 immutable snapshot，不读取异步锁保护
 的可变 slot。正式 Host State、event、delivery 和 endpoint admission 使用同一 authority；
 不得再次读取独立 Runner Controller。`host.state.get` 在 `preparing`、`standby` 和 `active`

@@ -453,10 +453,28 @@ admission closure；平台 handler、endpoint hook 和 transport I/O 均在锁�
 拆分；重构前后既有 collection 均为 `83`，另新增 endpoint register hook 锁外重入回归后为
 `84`。
 
-当前唯一验证证据：CH-0-004 聚焦测试 `123 passed`；
+`300667db` 提交时的历史验证证据：CH-0-004 聚焦测试 `123 passed`；
 `tests/unit/channel_isolation` 为 `322 passed`；CH-0-007 与飞书 unit/contract 相邻矩阵为
 `185 passed, 1 skipped`。改动文件 pre-commit（包含 mypy、black、flake8 和 pylint）通过，
 `git diff --check` 通过。CH-0-004 保持 `[-]`，等待重新独立 Review。
+
+对 `300667db` 的复审发现单一 `_shutdown_generation` 会被后续 candidate abort 或 replacement
+覆盖，使结果不确定的旧 Runner 丢失 stop/quiesce 重试资格。本轮按 peer ownership 消除该
+全局字段：每个 `CoreLifecycleClient` 在首次 prepare admission 时取得 authority 签发的不透明
+control capability，绑定 authority/client 私有 nonce、generation 与 candidate epoch，并由
+具体 Runner peer 持有到 client 释放。authority 仍只保存一个 active、一个 candidate 和
+generation watermark，不增加 retired generation 或 token 历史集合。
+
+同一 client 不得 prepare 其他 generation/epoch；activate、commit、renew 和 shutdown 均验证
+peer-bound capability。shutdown 在 identity、generation 与 binding 通过后，仅当当前 slot 仍
+匹配 generation/epoch 时撤销 authorization；slot 已消失或已被同 generation 新 epoch 替换时只
+调用旧 peer，不改变当前 authority。确定性测试覆盖 stop timeout 后 candidate prepare abort、
+quiesce timeout 后 candidate replacement、new generation commit 后旧 stop、同 generation 新
+epoch、跨 client token 复制、未绑定 client 控制和第二次 prepare。CH-0-004 继续保持 `[-]`，
+等待独立 Review。本轮当前唯一验证证据：CH-0-004 聚焦测试 `131 passed`；
+`tests/unit/channel_isolation` 为 `330 passed`；CH-0-007 与飞书 unit/contract 相邻矩阵为
+`185 passed, 1 skipped`。改动文件 pre-commit（包含 mypy、black、flake8 和 pylint）通过，
+`git diff --check` 通过。未运行全仓测试和真实 Windows/Linux/macOS 跨进程测试。
 
 ### CH-0-005：可靠事件、ACK 和幂等原型
 

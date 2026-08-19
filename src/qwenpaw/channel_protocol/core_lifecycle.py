@@ -6,13 +6,14 @@ from __future__ import annotations
 import asyncio
 import time
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
     Any,
     AsyncIterator,
     Awaitable,
     Callable,
+    Literal,
     Mapping,
 )
 
@@ -61,6 +62,16 @@ class CoreOperationToken:
     sequence: int
 
 
+@dataclass(frozen=True, slots=True, eq=False)
+class _CoreControlToken:
+    """Opaque capability binding one Core client to one Runner slot."""
+
+    authority_nonce: object
+    client_nonce: object
+    generation: int
+    epoch: int
+
+
 class _Slot:
     """Mutable state for one bounded Core generation slot."""
 
@@ -107,9 +118,9 @@ class CoreGenerationAuthority:
         self._candidate: _Slot | None = None
         self._highest_generation = -1
         self._fenced_generation = -1
-        self._shutdown_generation: int | None = None
         self._next_epoch = 0
         self._next_sequence = 0
+        self._control_nonce = object()
         self._snapshot = CoreAuthorizationSnapshot()
         self._lock = asyncio.Lock()
 
@@ -202,7 +213,6 @@ class CoreGenerationAuthority:
     def _revoke_slot(self, slot: _Slot) -> None:
         """Irreversibly revoke one active or candidate slot."""
         slot.operation = None
-        self._shutdown_generation = slot.generation
         self._fenced_generation = max(
             self._fenced_generation,
             slot.generation,
@@ -245,7 +255,6 @@ class CoreGenerationAuthority:
         if self._candidate is not None:
             if self._candidate.generation == params.generation:
                 raise self._identity_error("GENERATION_ALREADY_PREPARED")
-            self._shutdown_generation = self._candidate.generation
             self._candidate = None
         self._highest_generation = max(
             self._highest_generation,
@@ -257,8 +266,6 @@ class CoreGenerationAuthority:
             self._next_epoch,
             frozenset(params.capabilities),
         )
-        if self._shutdown_generation == params.generation:
-            self._shutdown_generation = None
         token = self._next_operation("prepare", self._candidate)
         self._publish()
         return token
@@ -268,7 +275,6 @@ class CoreGenerationAuthority:
         slot = self._slot(token.generation)
         if slot is not None and slot.operation == token:
             self._candidate = None
-            self._shutdown_generation = token.generation
             self._publish()
 
     def _prepare_complete(self, token: CoreOperationToken) -> None:
@@ -334,7 +340,6 @@ class CoreGenerationAuthority:
         self._active = slot
         self._candidate = None
         if previous is not None and previous is not slot:
-            self._shutdown_generation = previous.generation
             self._fenced_generation = max(
                 self._fenced_generation,
                 previous.generation,
@@ -400,11 +405,86 @@ class CoreGenerationAuthority:
         self._check_identity(params)
         slot = self._slot(params.generation)
         if slot is None:
-            if self._shutdown_generation == params.generation:
-                return
-            raise self._identity_error("GENERATION_UNKNOWN")
-        self._shutdown_generation = params.generation
+            raise self.generation_error(params.generation)
         self._revoke_slot(slot)
+
+    def _issue_control_token(
+        self,
+        slot: _Slot,
+        client_nonce: object,
+    ) -> _CoreControlToken:
+        """Create one opaque Runner control capability."""
+        return _CoreControlToken(
+            authority_nonce=self._control_nonce,
+            client_nonce=client_nonce,
+            generation=slot.generation,
+            epoch=slot.epoch,
+        )
+
+    def _validate_control_token(
+        self,
+        params: IdentityParams,
+        token: _CoreControlToken | None,
+        client_nonce: object,
+    ) -> _CoreControlToken:
+        """Validate a peer-bound control capability without slot lookup."""
+        self._check_identity(params)
+        if (
+            token is None
+            or token.authority_nonce is not self._control_nonce
+            or token.client_nonce is not client_nonce
+            or token.generation != params.generation
+        ):
+            raise self._identity_error("GENERATION_UNKNOWN")
+        return token
+
+    def _revoke_for_control(
+        self,
+        params: IdentityParams,
+        token: _CoreControlToken | None,
+        client_nonce: object,
+    ) -> None:
+        """Fence a current slot while retaining old peer control rights."""
+        control = self._validate_control_token(
+            params,
+            token,
+            client_nonce,
+        )
+        slot = self._slot(control.generation)
+        if slot is not None and slot.epoch == control.epoch:
+            self._revoke_slot(slot)
+
+    def _current_control_slot(
+        self,
+        params: IdentityParams,
+        token: _CoreControlToken | None,
+        client_nonce: object,
+    ) -> _Slot:
+        """Return the current slot owned by one peer-bound client."""
+        control = self._validate_control_token(
+            params,
+            token,
+            client_nonce,
+        )
+        slot = self._slot(control.generation)
+        if slot is None or slot.epoch != control.epoch:
+            raise self._identity_error("GENERATION_REVOKED")
+        return slot
+
+    def _reject_bound_prepare(
+        self,
+        params: PrepareParams,
+        token: _CoreControlToken,
+        client_nonce: object,
+    ) -> None:
+        """Reject reuse of one client for another Runner admission."""
+        self._check_identity(params)
+        if (
+            token.authority_nonce is not self._control_nonce
+            or token.client_nonce is not client_nonce
+        ):
+            raise self._identity_error("GENERATION_UNKNOWN")
+        raise self._lifecycle_error("INVALID_STATE_TRANSITION")
 
     def endpoint_snapshot(self, generation: int) -> CoreSlotSnapshot | None:
         """Return a slot snapshot for synchronous endpoint admission."""
@@ -496,6 +576,41 @@ class CoreGenerationAuthority:
         async with self._lock:
             return self._prepare_start(params)
 
+    async def control_start(
+        self,
+        kind: Literal["prepare", "activate", "commit", "renew"],
+        params: PrepareParams | LeaseParams,
+        token: _CoreControlToken | None,
+        client_nonce: object,
+    ) -> tuple[CoreOperationToken, _CoreControlToken]:
+        """Reserve one operation for the peer that owns the slot."""
+        async with self._lock:
+            if kind == "prepare":
+                if not isinstance(params, PrepareParams):
+                    raise TypeError("prepare requires PrepareParams")
+                if token is not None:
+                    self._reject_bound_prepare(params, token, client_nonce)
+                operation = self._prepare_start(params)
+                slot = self._candidate
+                if slot is None or slot.operation != operation:
+                    raise AssertionError(
+                        "prepare admission lost its candidate",
+                    )
+                control = self._issue_control_token(slot, client_nonce)
+                return operation, control
+            if not isinstance(params, LeaseParams):
+                raise TypeError(f"{kind} requires LeaseParams")
+            self._current_control_slot(params, token, client_nonce)
+            if kind == "activate":
+                operation = self._activate_start(params)
+            elif kind == "commit":
+                operation = self._commit_start(params)
+            else:
+                operation = self._renew_start(params)
+            if token is None:
+                raise AssertionError("validated control token is missing")
+            return operation, token
+
     async def prepare_abort(self, token: CoreOperationToken) -> None:
         """Abort a prepare operation if it is still current."""
         async with self._lock:
@@ -553,6 +668,16 @@ class CoreGenerationAuthority:
         async with self._lock:
             self._revoke_for_shutdown(params)
 
+    async def control_shutdown(
+        self,
+        params: IdentityParams,
+        token: _CoreControlToken | None,
+        client_nonce: object,
+    ) -> None:
+        """Fence a current slot for one peer-bound shutdown call."""
+        async with self._lock:
+            self._revoke_for_control(params, token, client_nonce)
+
     async def abort_operation(self, token: CoreOperationToken) -> None:
         """Release a failed or cancelled control operation."""
         async with self._lock:
@@ -566,6 +691,24 @@ class CoreLifecycleClient:
     peer: RpcPeer
     authority: CoreGenerationAuthority
     prune_endpoints: Callable[[], None] | None = None
+    _client_nonce: object = field(
+        default_factory=object,
+        init=False,
+        repr=False,
+        compare=False,
+    )
+    _control_token: _CoreControlToken | None = field(
+        default=None,
+        init=False,
+        repr=False,
+        compare=False,
+    )
+    _binding_lock: asyncio.Lock = field(
+        default_factory=asyncio.Lock,
+        init=False,
+        repr=False,
+        compare=False,
+    )
 
     def _prune_endpoints(self) -> None:
         """Discard endpoint records outside the two authority slots."""
@@ -594,7 +737,14 @@ class CoreLifecycleClient:
         timeout: float | None = None,
     ) -> Any:
         """Stage Core admission around one Runner prepare request."""
-        token = await self.authority.prepare_start(params)
+        async with self._binding_lock:
+            token, control_token = await self.authority.control_start(
+                "prepare",
+                params,
+                self._control_token,
+                self._client_nonce,
+            )
+            self._control_token = control_token
         self._prune_endpoints()
         try:
             result = await self.peer.call(
@@ -623,7 +773,12 @@ class CoreLifecycleClient:
         timeout: float | None = None,
     ) -> Any:
         """Record a provisional Core lease after Runner activation."""
-        token = await self.authority.activate_start(params)
+        token, _ = await self.authority.control_start(
+            "activate",
+            params,
+            self._control_token,
+            self._client_nonce,
+        )
         try:
             result = await self.peer.call(
                 "channel.activate",
@@ -651,7 +806,12 @@ class CoreLifecycleClient:
         timeout: float | None = None,
     ) -> Any:
         """Authorize routing only after Runner commit succeeds."""
-        token = await self.authority.commit_start(params)
+        token, _ = await self.authority.control_start(
+            "commit",
+            params,
+            self._control_token,
+            self._client_nonce,
+        )
         try:
             result = await self.peer.call(
                 "channel.commit",
@@ -679,7 +839,12 @@ class CoreLifecycleClient:
         timeout: float | None = None,
     ) -> Any:
         """Renew Runner and Core leases without reviving fenced state."""
-        token = await self.authority.renew_start(params)
+        token, _ = await self.authority.control_start(
+            "renew",
+            params,
+            self._control_token,
+            self._client_nonce,
+        )
         try:
             result = await self.peer.call(
                 "channel.lease_renew",
@@ -708,7 +873,11 @@ class CoreLifecycleClient:
         timeout: float | None = None,
     ) -> Any:
         """Revoke formal routing before asking Runner to quiesce."""
-        await self.authority.revoke_for_shutdown(params)
+        await self.authority.control_shutdown(
+            params,
+            self._control_token,
+            self._client_nonce,
+        )
         self._prune_endpoints()
         return await self.peer.call(
             "channel.quiesce",
@@ -723,7 +892,11 @@ class CoreLifecycleClient:
         timeout: float | None = None,
     ) -> Any:
         """Revoke formal routing before asking Runner to stop."""
-        await self.authority.revoke_for_shutdown(params)
+        await self.authority.control_shutdown(
+            params,
+            self._control_token,
+            self._client_nonce,
+        )
         self._prune_endpoints()
         return await self.peer.call(
             "channel.stop",
