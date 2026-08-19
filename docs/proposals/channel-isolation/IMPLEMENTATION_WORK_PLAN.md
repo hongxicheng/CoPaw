@@ -352,7 +352,8 @@ send/reaction、in-flight delivery、重复 finish、冲突 outcome、恢复 tom
 `lifecycle.py`、`host.py` 和 `outbound.py`，
 公共导出与错误类型位于 `__init__.py`、`errors.py`；聚焦测试位于
 `tests/unit/channel_isolation/test_ch_0_004_models.py`、`test_ch_0_004_rpc.py`、
-`test_ch_0_004_lifecycle.py`、`test_ch_0_004_host_adapter.py`、
+`test_ch_0_004_lifecycle.py`、`test_ch_0_004_core_lifecycle.py`、
+`test_ch_0_004_host_adapter.py`、
 `test_ch_0_004_outbound.py` 和 `test_ch_0_004_response_lifecycle.py`，Design 7.3
 对应的边界矩阵位于
 `docs/proposals/channel-isolation/CH-0-001_CORE_RUNNER_BOUNDARY.md`；`e987a202` 复审前的
@@ -411,6 +412,28 @@ generation；lease expiry 完全按 Core 时钟 fencing。正式路由只允许 
 阻塞/超时前撤销、延迟 unregister、Core lease expiry、readiness 组合、健康恢复和新旧
 generation 竞态。
 
+对 `983eafe0` 的复审进一步发现 Host State、event 和 delivery 仍读取未同步的 Core 侧
+`LifecycleController`，且错误 identity 的 stop/quiesce 会在校验前撤销合法 route。本轮不再
+在 endpoint registry 和 Controller 两侧追加判断，而是引入唯一 Core-owned
+`CoreGenerationAuthority`：其可变状态有界为一个 active、一个 candidate 和 generation
+watermark；Core control client 使用 candidate epoch 与 operation token 线性化 prepare、
+activate、commit 和 renew，迟到响应不能越过 shutdown、replacement 或新 generation
+commit；Runner 成功 response 后的 Core settlement 抗调用方取消，避免两侧 phase 分叉。
+authority 在锁内发布 immutable snapshot，endpoint 同步 resolve 只读取 snapshot；
+Host State、event、delivery 和 endpoint admission 全部使用同一 authority，兼容保留的
+hello Controller 只处理 handshake 且构造时强制 identity 一致。endpoint registry 退化为
+epoch-bound DTO store，不再重复保存 lifecycle。
+
+新旧 generation 切换保持旧 active 服务到新 commit；candidate prepare 失败或取消不影响旧
+active，相同 generation 重试获得新 epoch，旧 endpoint 不可复用。stop/quiesce 先校验
+identity 再同步 revoke；RPC 超时后可安全重试 Runner，authorization 不恢复。revoked
+generation 的 endpoint unregister 保持幂等，register/update、Host State 写、event 和
+delivery 稳定拒绝；`host.state.get` 明确允许 preparing/standby/active 以支持 checkpoint
+import。共享四类 RPC error code 已移到 `errors.py`，Core authority 不再反向依赖 Runner
+lifecycle 模块。确定性测试覆盖 active/candidate 并存、candidate replacement、迟到
+prepare/activate/commit/renew、prepare failure/cancel、stop retry、identity mismatch、lease
+expiry、精确 code/reason_code 矩阵和独立双向 `RpcPeer` Host RPC 闭环。
+
 本轮依据 ADR-037 和 Design §7.3、§7.4、§11.0、§14.1 扩展 response lifecycle：新增
 `response_lifecycle` capability、`InboundEvent.response_handle` 和
 `channel.response.finish`；Runner scope 仅在显式 finish 后进入 closed tombstone，
@@ -430,10 +453,10 @@ admission closure；平台 handler、endpoint hook 和 transport I/O 均在锁�
 拆分；重构前后既有 collection 均为 `83`，另新增 endpoint register hook 锁外重入回归后为
 `84`。
 
-当前唯一验证证据：CH-0-004 聚焦测试 `100 passed`；
-`tests/unit/channel_isolation` 为 `299 passed`；CH-0-005、CH-0-007、飞书 unit/contract
-相邻矩阵为 `198 passed, 1 skipped`。改动文件 pre-commit（包含 mypy、black、flake8 和
-pylint）通过，`git diff --check` 通过。CH-0-004 保持 `[-]`，等待重新独立 Review。
+当前唯一验证证据：CH-0-004 聚焦测试 `123 passed`；
+`tests/unit/channel_isolation` 为 `322 passed`；CH-0-007 与飞书 unit/contract 相邻矩阵为
+`185 passed, 1 skipped`。改动文件 pre-commit（包含 mypy、black、flake8 和 pylint）通过，
+`git diff --check` 通过。CH-0-004 保持 `[-]`，等待重新独立 Review。
 
 ### CH-0-005：可靠事件、ACK 和幂等原型
 

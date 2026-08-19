@@ -670,16 +670,41 @@ endpoint 的路由登记必须在 quiesce/stop/lease fencing 的生命周期临�
 best-effort 语义约束，不得延迟状态转换。drain cohort 使用绝对 monotonic deadline；一旦
 deadline 到达，即使 attempt 正在等待生命周期锁，也不得再提交 ACK、target 或 sequence。
 
-Core endpoint registry 必须持有独立于 Runner 进程状态的 route authorization，不能通过
-共享 `LifecycleController` 或其他同进程对象推断正式路由。Core 在调用 prepare 前暂存
-candidate admission，使 Runner 可在 prepare 内登记本地 endpoint；prepare 失败或取消时必须
-删除该 candidate。activate 成功后记录 provisional lease；只有 `channel.commit` 成功返回
-active generation 后才授权该 generation。Core 发起 `channel.quiesce` 或 `channel.stop` 时，
-必须在调用 Runner RPC 前同步撤销 authorization；RPC 超时、失败或 Runner 断联均不得恢复。
-Core 时钟观察到 lease expiry 或新的 generation commit 时也必须同步撤销旧 generation。
-generation 一旦因 quiesce、stop、lease expiry 或 generation replacement 被撤销，迟到的
-endpoint register/update/unregister 或 lease renew 不得重新授权；只有新的有效 generation
-完成唯一 commit 才能建立新的 authorization。
+Core 必须持有独立于 Runner 进程状态的 generation authority，不能通过共享
+`LifecycleController` 或其他同进程对象推断 Host RPC 或正式路由。该 authority 的可变状态
+有界为至多一个 authorized active generation、至多一个 candidate generation，以及单调
+`highest_generation` watermark；旧 active 在新 candidate 的 prepare/activate 期间继续服务，
+直到新 generation 的 commit 成功才被替换。Core 在调用 prepare 前建立 candidate admission，
+使 Runner 可在 prepare 内登记本地 endpoint；prepare 失败或取消只删除 candidate，不影响旧
+active。相同 generation 的 prepare 重试必须获得新的 candidate epoch，旧 endpoint 记录不能
+被复用。endpoint registry 只保存 endpoint DTO 和对应 epoch，不重复保存 lifecycle 事实。
+
+prepare、activate、commit 和 lease renewal 在释放 authority lock、等待 Runner RPC 前都必须
+取得 operation token；RPC 返回后只有 generation、candidate epoch、operation sequence 和
+phase 仍匹配时才能提交。quiesce、stop、lease expiry、新 candidate replacement 或新
+generation commit 会使旧 token 失效，迟到的成功响应不得复活 generation。Core 发起
+Runner control response 已成功返回后，Core authority settlement 必须抗调用方取消并先
+收敛；取消仍向上层传播，但不能让 Runner 已进入新状态而 Core 留在旧 phase。
+Core 发起
+`channel.quiesce` 或 `channel.stop` 时，必须先校验完整 identity，再在调用 Runner RPC 前同步
+撤销 authorization；RPC 超时、失败或 Runner 断联均不得恢复。合法的重复 stop/quiesce 即使
+前一次 RPC 超时也可继续调用 Runner，但 authorization 始终保持撤销。
+
+同步 endpoint resolve 只读取 authority 在锁内发布的 immutable snapshot，不读取异步锁保护
+的可变 slot。正式 Host State、event、delivery 和 endpoint admission 使用同一 authority；
+不得再次读取独立 Runner Controller。`host.state.get` 在 `preparing`、`standby` 和 `active`
+允许，用于 checkpoint/import；`host.state.put/delete`、`event.batch` 和 `delivery.update` 只在
+`active` 允许。endpoint register/update 在 candidate 和 active 可用，仍保留 capability、
+外部暴露鉴权和 standby 外部绑定限制；revoked generation 的 register/update 稳定拒绝，
+unregister 继续幂等成功但不得恢复 authorization。Core 时钟观察到 lease expiry 或新的
+generation commit 时同步撤销旧 generation；只有新的有效 generation 完成唯一 commit 才能
+建立新的 authorization。
+
+Core authority 的错误分类冻结为：identity mismatch、generation unknown/stale/revoked 使用
+`-32011`；phase/state violation 与首次观察到的 lease expiry 使用 `-32010`；lease token
+mismatch 使用 `-32012`；capability 缺失使用 `-32013`。首次 expiry 将 slot 单调撤销，后续同
+generation 请求返回 `GENERATION_REVOKED`。兼容保留的 `runner.hello` Controller 必须与
+authority 的 `channel_key`、`instance_id` 一致，不能形成第二份身份事实来源。
 
 provisional lease 不单列为生命周期状态；Runner 在收到 `channel.commit` 前仍对外表现为
 `standby`。它可以完成连接预热和资源准备，但不能绑定正式 ingress、消费平台事件或
@@ -2060,4 +2085,4 @@ Core Channel、runner-process Channel 和 legacy Plugin Channel 混合运行、�
 | ADR-035 | v1 标识使用带唯一 string escape 和 finite decimal 的受限 canonical JSON、domain separator + NUL、完整 SHA-256 和稳定前缀；逻辑 ID 与 `dir1_` 磁盘目录键分离，目录 manifest 保留并核对完整逻辑 ID；platform tag 必须属于版本化 release target registry | 已确认 |
 | ADR-036 | v1 descriptor 使用 closed object、显式空值和字段级 required/nullable/secret/condition 语义；Requirement 在 digest 前统一 canonicalize，重复折叠且拒绝 `extra` marker；condition domain 必须有限；`config_fields` 是支持 number 的 UI 投影，完整 value schema 仍由 Pydantic/JSON Schema 或 plugin artifact schema 负责；身份声明可引用 secret 字段但 secret value 仅在 Core 内比较；静态读取不得 import 平台模块；process mode 唯一派生驱动接口 | 已确认 |
 | ADR-037 | request-scoped response 的终止由 Core 通过可重试、幂等的 `channel.response.finish` 显式通知 Runner；不得由 message、stream 或 delivery ACK 推断。Runner 以有界 closed tombstone 保持关闭单调性，并在线性化边界上与在途出站操作排序 | 已确认 |
-| ADR-038 | Core 独立持有 endpoint route authorization；只有 committed generation 的 `ready && !quiescing` endpoint 可接收正式流量。quiesce/stop 在 Runner RPC 前撤销，lease expiry 和 generation replacement 单调 fencing，迟到 register/update/renew 不得复活旧 generation | 已确认 |
+| ADR-038 | Core 以有界 generation authority 同时持有一个 active 和一个 candidate，并通过 immutable snapshot、candidate epoch 与 operation token 统一 Host RPC 和 endpoint route authorization；只有 committed generation 的 `ready && !quiescing` endpoint 可接收正式流量。quiesce/stop 在 Runner RPC 前撤销，lease expiry 和 generation replacement 单调 fencing，迟到 control/endpoint 响应不得复活旧 generation | 已确认 |

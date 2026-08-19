@@ -12,6 +12,10 @@ from typing import TYPE_CHECKING, Any, Callable, Mapping
 
 from .errors import (
     PlatformAuthenticationError,
+    RPC_AUTH_ERROR,
+    RPC_CAPABILITY_ERROR,
+    RPC_FENCING_ERROR,
+    RPC_LIFECYCLE_ERROR,
     RpcError,
     SecretHandleConsumedError,
     SecretHandleInvalidError,
@@ -47,11 +51,6 @@ from .rpc import RpcPeer, RpcResponsePublication, request_was_cancelled
 
 if TYPE_CHECKING:
     from .host import CoreLifecycleAdapter, HostStateStore
-
-RPC_LIFECYCLE_ERROR = -32010
-RPC_FENCING_ERROR = -32011
-RPC_AUTH_ERROR = -32012
-RPC_CAPABILITY_ERROR = -32013
 
 
 class FixtureSecretHandleConsumer:

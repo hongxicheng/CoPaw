@@ -107,6 +107,7 @@ async def _active_rpc_pair(
     core = RpcPeer(left)
     runner = RpcPeer(right, limits=runner_limits)
     adapter.register_rpc_methods(core)
+    controller.register_rpc_methods(runner)
     controller.accept_hello(
         HelloParams.from_mapping(
             {
@@ -124,16 +125,14 @@ async def _active_rpc_pair(
             },
         ),
     )
-    await controller.prepare(
-        PrepareParams.from_mapping(
-            {
-                "channel_key": "voice",
-                "instance_id": "instance-1",
-                "generation": 7,
-                "host_context": {},
-                "capabilities": [],
-            },
-        ),
+    prepare = PrepareParams.from_mapping(
+        {
+            "channel_key": "voice",
+            "instance_id": "instance-1",
+            "generation": 7,
+            "host_context": {},
+            "capabilities": [],
+        },
     )
     lease = LeaseParams(
         channel_key="voice",
@@ -142,9 +141,11 @@ async def _active_rpc_pair(
         lease_token="token",
         lease_ttl_ms=1000,
     )
-    await controller.activate(lease)
-    await controller.commit(lease)
     await asyncio.gather(core.start(), runner.start())
+    lifecycle = adapter.lifecycle_client(core)
+    await lifecycle.prepare(prepare)
+    await lifecycle.activate(lease)
+    await lifecycle.commit(lease)
     return adapter, core, runner
 
 

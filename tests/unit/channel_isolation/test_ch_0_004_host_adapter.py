@@ -7,14 +7,15 @@ from __future__ import annotations
 
 import asyncio
 import math
-from typing import Any, cast
+from typing import Any
 
 import pytest
 
 from qwenpaw.channel_protocol import (
     CoreEndpointRegistry,
+    CoreGenerationAuthority,
     CoreLifecycleAdapter,
-    CoreLifecycleClient,
+    DeliveryUpdateParams,
     EndpointParams,
     EventBatchParams,
     HostStateParams,
@@ -27,7 +28,6 @@ from qwenpaw.channel_protocol import (
     QuiesceParams,
     RpcError,
     RpcPeer,
-    RpcTimeoutError,
     RunnerState,
     SendParams,
 )
@@ -72,7 +72,7 @@ def _lease_params(
     )
 
 
-def _authorize_registry(
+async def _authorize_registry(
     registry: CoreEndpointRegistry,
     *,
     generation: int = 7,
@@ -85,9 +85,39 @@ def _authorize_registry(
         token=token,
         ttl_ms=ttl_ms,
     )
-    registry.prepare(_prepare_params(generation))
-    registry.activate(lease)
-    registry.commit(lease)
+    prepare_token = await registry.authority.prepare_start(
+        _prepare_params(generation),
+    )
+    await registry.authority.prepare_complete(prepare_token)
+    activate_token = await registry.authority.activate_start(lease)
+    await registry.authority.activate_complete(activate_token, lease)
+    commit_token = await registry.authority.commit_start(lease)
+    await registry.authority.commit_complete(commit_token, lease)
+    return lease
+
+
+async def _authorize_adapter(
+    adapter: CoreLifecycleAdapter,
+    *,
+    capabilities: tuple[str, ...],
+    token: str = "route-lease",
+    ttl_ms: int = 100,
+) -> LeaseParams:
+    """Prepare, activate, and commit one Core adapter authority."""
+    prepare = PrepareParams.from_mapping(
+        {
+            **_identity(),
+            "host_context": {},
+            "capabilities": list(capabilities),
+        },
+    )
+    prepare_token = await adapter.authority.prepare_start(prepare)
+    await adapter.authority.prepare_complete(prepare_token)
+    lease = _lease_params(token=token, ttl_ms=ttl_ms)
+    activate_token = await adapter.authority.activate_start(lease)
+    await adapter.authority.activate_complete(activate_token, lease)
+    commit_token = await adapter.authority.commit_start(lease)
+    await adapter.authority.commit_complete(commit_token, lease)
     return lease
 
 
@@ -144,20 +174,19 @@ async def test_endpoint_and_host_state_require_active_generation() -> None:
     clock = Clock()
     controller = _controller(clock)
     adapter = CoreLifecycleAdapter(controller)
-    controller.accept_hello(_hello())
-    await controller.prepare(
-        PrepareParams.from_mapping(
-            {
-                **_identity(),
-                "host_context": {},
-                "capabilities": [
-                    "host_state",
-                    "ingress_endpoint",
-                    "media",
-                ],
-            },
-        ),
+    prepare = PrepareParams.from_mapping(
+        {
+            **_identity(),
+            "host_context": {},
+            "capabilities": [
+                "host_state",
+                "ingress_endpoint",
+                "media",
+            ],
+        },
     )
+    prepare_token = await adapter.authority.prepare_start(prepare)
+    await adapter.authority.prepare_complete(prepare_token)
     endpoint = EndpointParams.from_mapping(
         {
             **_identity(),
@@ -172,14 +201,15 @@ async def test_endpoint_and_host_state_require_active_generation() -> None:
             "quiescing": False,
         },
     )
-    registered = await controller.endpoint_register(endpoint)
+    registered = await adapter.endpoint_register(endpoint)
     assert registered["status"] == "registered"
     lease = LeaseParams.from_mapping(
         {**_identity(), "lease_token": "opaque", "lease_ttl_ms": 100},
     )
-    await controller.activate(lease)
+    activate_token = await adapter.authority.activate_start(lease)
+    await adapter.authority.activate_complete(activate_token, lease)
     with pytest.raises(RpcError):
-        await controller.endpoint_register(
+        await adapter.endpoint_register(
             EndpointParams.from_mapping(
                 {
                     **endpoint.to_mapping(),
@@ -189,8 +219,9 @@ async def test_endpoint_and_host_state_require_active_generation() -> None:
                 },
             ),
         )
-    await controller.commit(lease)
-    await controller.endpoint_register(endpoint)
+    commit_token = await adapter.authority.commit_start(lease)
+    await adapter.authority.commit_complete(commit_token, lease)
+    await adapter.endpoint_register(endpoint)
     state = HostStateParams.from_mapping(
         {
             **_identity(),
@@ -201,19 +232,49 @@ async def test_endpoint_and_host_state_require_active_generation() -> None:
     )
     assert (await adapter.host_state_put(state))["status"] == "stored"
     assert (await adapter.host_state_get(state))["value"] == {"ok": True}
-    assert (await controller.endpoint_update(endpoint))["status"] == "updated"
-    await controller.quiesce(
-        QuiesceParams.from_mapping({**_identity(), "drain_timeout_ms": 10}),
+    assert (await adapter.endpoint_update(endpoint))["status"] == "updated"
+    await adapter.authority.revoke_for_shutdown(
+        IdentityParams.from_mapping(_identity()),
     )
-    assert controller.state is RunnerState.QUIESCING
-    assert controller.endpoint is None
     assert (
-        await controller.endpoint_unregister(
+        await adapter.endpoint_unregister(
             IdentityParams.from_mapping(_identity()),
         )
     )["status"] == "unregistered"
     with pytest.raises(RpcError):
         await adapter.host_state_put(state)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["preparing", "standby", "active"])
+async def test_host_state_get_is_available_during_import_phases(
+    phase: str,
+) -> None:
+    """Checkpoint reads remain available throughout candidate import."""
+    adapter = CoreLifecycleAdapter(_controller(Clock()))
+    await adapter.host_state_store.put("checkpoint", 1, {"ok": True})
+    prepare = PrepareParams.from_mapping(
+        {
+            **_identity(),
+            "host_context": {},
+            "capabilities": ["host_state"],
+        },
+    )
+    prepare_token = await adapter.authority.prepare_start(prepare)
+    if phase in {"standby", "active"}:
+        await adapter.authority.prepare_complete(prepare_token)
+    if phase == "active":
+        lease = _lease_params()
+        activate = await adapter.authority.activate_start(lease)
+        await adapter.authority.activate_complete(activate, lease)
+        commit = await adapter.authority.commit_start(lease)
+        await adapter.authority.commit_complete(commit, lease)
+    result = await adapter.host_state_get(
+        HostStateParams.from_mapping(
+            {**_identity(), "key": "checkpoint"},
+        ),
+    )
+    assert result["value"] == {"ok": True}
 
 
 @pytest.mark.asyncio
@@ -367,188 +428,6 @@ async def test_core_route_authority_is_independent_from_runner_state() -> None:
 
 
 @pytest.mark.asyncio
-async def test_control_timeout_keeps_generation_revoked() -> None:
-    """A failed control RPC cannot restore a route revoked before send."""
-    clock = Clock()
-    registry = CoreEndpointRegistry(
-        channel_key="voice",
-        instance_id="instance-1",
-        clock_ms=clock,
-    )
-    lease = _authorize_registry(registry)
-    registry.register(_endpoint())
-
-    class TimeoutPeer:
-        """Fail after observing the pre-call Core fencing boundary."""
-
-        async def call(
-            self,
-            method: str,
-            _: object,
-            *,
-            timeout: float | None = None,
-        ) -> object:
-            _ = timeout
-            assert method == "channel.stop"
-            assert registry.resolve(7) is None
-            raise RpcTimeoutError("stop timed out")
-
-    lifecycle = CoreLifecycleClient(cast(RpcPeer, TimeoutPeer()), registry)
-    with pytest.raises(RpcTimeoutError):
-        await lifecycle.stop(IdentityParams.from_mapping(_identity()))
-    assert registry.resolve(7) is None
-    with pytest.raises(RpcError) as renew_error:
-        registry.renew(lease)
-    assert renew_error.value.data["reason_code"] == "GENERATION_REVOKED"
-
-
-@pytest.mark.asyncio
-async def test_real_rpc_timeout_keeps_generation_revoked() -> None:
-    """The exported Core call path fences before a real blocked RPC."""
-    clock = Clock()
-    hook_started = asyncio.Event()
-
-    async def blocked_unregister(
-        operation: str,
-        _: EndpointParams | None,
-    ) -> None:
-        """Keep quiesce inside the Runner after Core sends the request."""
-        if operation == "unregister":
-            hook_started.set()
-            await asyncio.Event().wait()
-
-    left_transport, right_transport = _transport_pair()
-    core = RpcPeer(left_transport)
-    runner = RpcPeer(right_transport)
-    controller = LifecycleController(
-        channel_key="voice",
-        instance_id="instance-1",
-        generation=7,
-        environment_spec_id="ches1_" + "1" * 64,
-        environment_id="ches1_" + "1" * 64 + ".install1_" + "2" * 32,
-        capabilities=("ingress_endpoint",),
-        endpoint_handler=blocked_unregister,
-        clock_ms=clock,
-    )
-    controller.accept_hello(_hello())
-    controller.register_rpc_methods(runner)
-    registry = CoreEndpointRegistry(
-        channel_key="voice",
-        instance_id="instance-1",
-        clock_ms=clock,
-    )
-    adapter = CoreLifecycleAdapter(
-        _controller(clock),
-        endpoint_registry=registry,
-    )
-    adapter.register_rpc_methods(core)
-    lifecycle = adapter.lifecycle_client(core)
-    await core.start()
-    await runner.start()
-    try:
-        await lifecycle.prepare(_prepare_params())
-        lease = _lease_params()
-        await lifecycle.activate(lease)
-        await lifecycle.commit(lease)
-        await controller.endpoint_register(_endpoint())
-        await adapter.endpoint_register(_endpoint())
-        assert adapter.resolve_endpoint(7) == _endpoint()
-        with pytest.raises(RpcTimeoutError):
-            await lifecycle.quiesce(
-                QuiesceParams.from_mapping(
-                    {**_identity(), "drain_timeout_ms": 1000},
-                ),
-                timeout=0.01,
-            )
-        await asyncio.wait_for(hook_started.wait(), timeout=0.1)
-        assert adapter.resolve_endpoint(7) is None
-        with pytest.raises(RpcError) as update_error:
-            await adapter.endpoint_update(_endpoint())
-        assert update_error.value.data["reason_code"] == "GENERATION_REVOKED"
-    finally:
-        await core.aclose()
-        await runner.aclose()
-
-
-@pytest.mark.parametrize(
-    ("readiness", "quiescing", "expected"),
-    [
-        ("starting", False, False),
-        ("ready", False, True),
-        ("degraded", False, False),
-        ("stopped", False, False),
-        ("ready", True, False),
-    ],
-)
-def test_endpoint_readiness_controls_formal_routing(
-    readiness: str,
-    quiescing: bool,
-    expected: bool,
-) -> None:
-    """Only ready, non-quiescing endpoints accept formal traffic."""
-    clock = Clock()
-    registry = CoreEndpointRegistry(
-        channel_key="voice",
-        instance_id="instance-1",
-        clock_ms=clock,
-    )
-    _authorize_registry(registry)
-    endpoint = EndpointParams.from_mapping(
-        {
-            **_endpoint().to_mapping(),
-            "readiness": readiness,
-            "quiescing": quiescing,
-        },
-    )
-    registry.register(endpoint)
-    assert (registry.resolve(7) is not None) is expected
-
-
-def test_ready_update_recovers_only_before_lifecycle_revoke() -> None:
-    """Health updates recover routes, but lifecycle fencing is monotonic."""
-    clock = Clock()
-    registry = CoreEndpointRegistry(
-        channel_key="voice",
-        instance_id="instance-1",
-        clock_ms=clock,
-    )
-    _authorize_registry(registry)
-    degraded = EndpointParams.from_mapping(
-        {**_endpoint().to_mapping(), "readiness": "degraded"},
-    )
-    registry.register(degraded)
-    assert registry.resolve(7) is None
-    registry.register(_endpoint())
-    assert registry.resolve(7) == _endpoint()
-    registry.revoke(7)
-    with pytest.raises(RpcError) as update_error:
-        registry.register(_endpoint())
-    assert update_error.value.data["reason_code"] == "GENERATION_REVOKED"
-
-
-def test_new_generation_commit_fences_late_old_updates() -> None:
-    """A newer commit prevents old generation traffic from returning."""
-    clock = Clock()
-    registry = CoreEndpointRegistry(
-        channel_key="voice",
-        instance_id="instance-1",
-        clock_ms=clock,
-    )
-    _authorize_registry(registry)
-    registry.register(_endpoint())
-    _authorize_registry(registry, generation=8, token="next-lease")
-    next_endpoint = EndpointParams.from_mapping(
-        {**_endpoint().to_mapping(), **_identity(generation=8)},
-    )
-    registry.register(next_endpoint)
-    assert registry.resolve(7) is None
-    assert registry.resolve(8) == next_endpoint
-    with pytest.raises(RpcError) as old_update:
-        registry.register(_endpoint())
-    assert old_update.value.data["reason_code"] == "GENERATION_REVOKED"
-
-
-@pytest.mark.asyncio
 async def test_capability_gates_and_bounded_host_state() -> None:
     """Methods requiring undeclared capabilities return stable errors."""
     clock = Clock()
@@ -581,25 +460,11 @@ async def test_capability_gates_and_bounded_host_state() -> None:
     )
     controller = _controller(clock)
     adapter = CoreLifecycleAdapter(controller, host_state_store=store)
-    controller.accept_hello(_hello())
-    await controller.prepare(
-        PrepareParams.from_mapping(
-            {
-                **_identity(),
-                "host_context": {},
-                "capabilities": [
-                    "host_state",
-                    "ingress_endpoint",
-                    "media",
-                ],
-            },
-        ),
+    await _authorize_adapter(
+        adapter,
+        capabilities=("host_state", "ingress_endpoint", "media"),
+        token="opaque",
     )
-    lease = LeaseParams.from_mapping(
-        {**_identity(), "lease_token": "opaque", "lease_ttl_ms": 100},
-    )
-    await controller.activate(lease)
-    await controller.commit(lease)
     with pytest.raises(ProtocolValidationError) as limit_error:
         await adapter.host_state_put(
             HostStateParams.from_mapping(
@@ -619,21 +484,12 @@ async def test_prepare_subset_is_the_effective_capability_set() -> None:
     clock = Clock()
     controller = _controller(clock)
     adapter = CoreLifecycleAdapter(controller)
-    controller.accept_hello(_hello())
-    await controller.prepare(
-        PrepareParams.from_mapping(
-            {
-                **_identity(),
-                "host_context": {},
-                "capabilities": ["ingress_endpoint"],
-            },
-        ),
+    await activate_outbound_controller(controller, ["ingress_endpoint"])
+    await _authorize_adapter(
+        adapter,
+        capabilities=("ingress_endpoint",),
+        token="subset",
     )
-    lease = LeaseParams.from_mapping(
-        {**_identity(), "lease_token": "subset", "lease_ttl_ms": 100},
-    )
-    await controller.activate(lease)
-    await controller.commit(lease)
     media = SendParams.from_mapping(
         {
             **_identity(),
@@ -662,6 +518,7 @@ async def test_response_handle_requires_capability_at_event_boundary() -> None:
     controller = _controller(clock)
     await activate_outbound_controller(controller, [])
     adapter = CoreLifecycleAdapter(controller)
+    await _authorize_adapter(adapter, capabilities=())
     ack = await adapter.event_batch(
         EventBatchParams.from_mapping(
             {
@@ -681,85 +538,116 @@ async def test_response_handle_requires_capability_at_event_boundary() -> None:
     assert not adapter.inbound_inbox.persisted_event_ids
 
 
-@pytest.mark.asyncio
-async def test_lease_expiry_removes_core_endpoint_registry() -> None:
-    """Core-clock expiry fences routing without Runner health polling."""
-    clock = Clock()
-    registry = CoreEndpointRegistry(
-        channel_key="voice",
+def test_core_authority_must_match_hello_identity() -> None:
+    """Compatibility hello identity cannot diverge from Core authority."""
+    authority = CoreGenerationAuthority(
+        channel_key="other",
         instance_id="instance-1",
-        clock_ms=clock,
     )
-    lease = _authorize_registry(registry, token="expire", ttl_ms=10)
-    registry.register(_endpoint())
-    assert registry.resolve(7) == _endpoint()
-    clock.now = 1011
-    assert registry.resolve(7) is None
-    with pytest.raises(RpcError) as renew_error:
-        registry.renew(lease)
-    assert renew_error.value.data["reason_code"] == "GENERATION_REVOKED"
-    with pytest.raises(RpcError) as register_error:
-        registry.register(_endpoint())
-    assert register_error.value.data["reason_code"] == "GENERATION_REVOKED"
+    with pytest.raises(ValueError, match="identity must match"):
+        CoreLifecycleAdapter(_controller(Clock()), authority=authority)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("operation", ["quiesce", "stop"])
-async def test_shutdown_detaches_endpoint_before_blocked_hook(
-    operation: str,
-) -> None:
-    """Core revoke precedes a blocked Runner control request."""
+async def test_revoked_authority_rejects_all_formal_host_operations() -> None:
+    """Host State, events, and delivery share one revoked Core authority."""
+    adapter = CoreLifecycleAdapter(_controller(Clock()))
+    await _authorize_adapter(
+        adapter,
+        capabilities=("host_state", "response_lifecycle"),
+    )
+    await adapter.authority.revoke_for_shutdown(
+        IdentityParams.from_mapping(_identity()),
+    )
+    state = HostStateParams.from_mapping(
+        {**_identity(), "key": "revoked", "value": {"ok": True}},
+    )
+    event = EventBatchParams(
+        batch_id="revoked-batch",
+        events=(_response_event(),),
+        identity=IdentityParams.from_mapping(_identity()),
+    )
+    delivery = DeliveryUpdateParams.from_mapping(
+        {
+            **_identity(),
+            "delivery_id": "revoked-delivery",
+            "state": "acknowledged",
+        },
+    )
+    for operation in (
+        adapter.host_state_put(state),
+        adapter.event_batch(event),
+        adapter.delivery_update(delivery),
+    ):
+        with pytest.raises(RpcError) as error:
+            await operation
+        assert error.value.data["reason_code"] == "GENERATION_REVOKED"
+
+
+@pytest.mark.asyncio
+async def test_independent_rpc_authority_admits_core_host_methods() -> None:
+    """Core Host RPCs use authority rather than Runner lifecycle state."""
     clock = Clock()
-    registry = CoreEndpointRegistry(
-        channel_key="voice",
-        instance_id="instance-1",
-        clock_ms=clock,
-    )
-    _authorize_registry(registry)
-    registry.register(_endpoint())
-    entered = asyncio.Event()
-
-    class BlockingPeer:
-        """Assert route fencing before blocking one control RPC."""
-
-        async def call(
-            self,
-            method: str,
-            _: object,
-            *,
-            timeout: float | None = None,
-        ) -> object:
-            _ = timeout
-            assert method == f"channel.{operation}"
-            assert registry.resolve(7) is None
-            entered.set()
-            await asyncio.Event().wait()
-            raise AssertionError("blocking call unexpectedly resumed")
-
-    lifecycle = CoreLifecycleClient(
-        cast(RpcPeer, BlockingPeer()),
-        registry,
-    )
-    if operation == "quiesce":
-        request = asyncio.create_task(
-            lifecycle.quiesce(
-                QuiesceParams.from_mapping(
-                    {**_identity(), "drain_timeout_ms": 10},
-                ),
-            ),
+    left_transport, right_transport = _transport_pair()
+    core = RpcPeer(left_transport)
+    runner = RpcPeer(right_transport)
+    runner_controller = _controller(clock)
+    runner_controller.register_rpc_methods(runner)
+    core_controller = _controller(clock)
+    adapter = CoreLifecycleAdapter(core_controller, clock_ms=clock)
+    adapter.register_rpc_methods(core)
+    lifecycle = adapter.lifecycle_client(core)
+    await core.start()
+    await runner.start()
+    try:
+        runner_controller.accept_hello(_hello())
+        prepare = PrepareParams.from_mapping(
+            {
+                **_identity(),
+                "host_context": {},
+                "capabilities": [
+                    "host_state",
+                    "response_lifecycle",
+                ],
+            },
         )
-    else:
-        request = asyncio.create_task(
-            lifecycle.stop(IdentityParams.from_mapping(_identity())),
+        await lifecycle.prepare(prepare)
+        lease = _lease_params()
+        await lifecycle.activate(lease)
+        await lifecycle.commit(lease)
+        state = HostStateParams.from_mapping(
+            {**_identity(), "key": "independent", "value": {"ok": True}},
         )
-    await asyncio.wait_for(entered.wait(), timeout=0.1)
-    assert registry.resolve(7) is None
-    request.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await request
-    with pytest.raises(RpcError) as update_error:
-        registry.register(_endpoint())
-    assert update_error.value.data["reason_code"] == "GENERATION_REVOKED"
+        assert (await runner.call("host.state.put", state.to_mapping()))[
+            "status"
+        ] == "stored"
+        event = _response_event()
+        ack = await runner.call(
+            "event.batch",
+            EventBatchParams(
+                batch_id="independent-batch",
+                events=(event,),
+                identity=IdentityParams.from_mapping(_identity()),
+            ).to_mapping(),
+        )
+        assert ack["accepted_event_ids"] == ["event-1"]
+        delivery = DeliveryUpdateParams.from_mapping(
+            {
+                **_identity(),
+                "delivery_id": "independent-delivery",
+                "state": "acknowledged",
+            },
+        )
+        result = await runner.call(
+            "delivery.update",
+            delivery.to_mapping(),
+        )
+        assert result["state"] == "acknowledged"
+        assert core_controller.state is RunnerState.CREATED
+        assert runner_controller.state is RunnerState.ACTIVE
+    finally:
+        await core.aclose()
+        await runner.aclose()
 
 
 @pytest.mark.asyncio
@@ -811,38 +699,26 @@ async def test_core_host_state_put_linearizes_before_stop() -> None:
     controller = _controller(clock)
     store = BlockingHostStateStore()
     adapter = CoreLifecycleAdapter(controller, host_state_store=store)
-    controller.accept_hello(_hello())
-    await controller.prepare(
-        PrepareParams.from_mapping(
-            {
-                **_identity(),
-                "host_context": {},
-                "capabilities": [
-                    "host_state",
-                    "ingress_endpoint",
-                    "media",
-                ],
-            },
-        ),
+    await _authorize_adapter(
+        adapter,
+        capabilities=("host_state", "ingress_endpoint", "media"),
+        token="blocked",
     )
-    lease = LeaseParams.from_mapping(
-        {**_identity(), "lease_token": "blocked", "lease_ttl_ms": 100},
-    )
-    await controller.activate(lease)
-    await controller.commit(lease)
     params = HostStateParams.from_mapping(
         {**_identity(), "key": "blocked", "value": {"ok": True}},
     )
     write = asyncio.create_task(adapter.host_state_put(params))
     await store.started.wait()
     stop = asyncio.create_task(
-        controller.stop(IdentityParams.from_mapping(_identity())),
+        adapter.authority.revoke_for_shutdown(
+            IdentityParams.from_mapping(_identity()),
+        ),
     )
     await asyncio.sleep(0)
     assert not stop.done()
     store.release.set()
     assert (await write)["status"] == "stored"
-    assert (await stop)["state"] == "stopped"
+    await stop
     assert await store.get("blocked") == (1, {"ok": True})
 
 
@@ -852,25 +728,11 @@ async def test_host_state_rejects_non_finite_numbers() -> None:
     clock = Clock()
     controller = _controller(clock)
     adapter = CoreLifecycleAdapter(controller)
-    controller.accept_hello(_hello())
-    await controller.prepare(
-        PrepareParams.from_mapping(
-            {
-                **_identity(),
-                "host_context": {},
-                "capabilities": [
-                    "host_state",
-                    "ingress_endpoint",
-                    "media",
-                ],
-            },
-        ),
+    await _authorize_adapter(
+        adapter,
+        capabilities=("host_state", "ingress_endpoint", "media"),
+        token="finite",
     )
-    lease = LeaseParams.from_mapping(
-        {**_identity(), "lease_token": "finite", "lease_ttl_ms": 100},
-    )
-    await controller.activate(lease)
-    await controller.commit(lease)
     with pytest.raises(ProtocolValidationError) as value_error:
         await adapter.host_state_put(
             HostStateParams.from_mapping(

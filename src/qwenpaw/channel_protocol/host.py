@@ -5,27 +5,27 @@ from __future__ import annotations
 
 import asyncio
 import json
-import time
-from dataclasses import dataclass
-from typing import Any, Callable, Mapping
+from typing import Any, Callable
 
-from .errors import ProtocolValidationError, RpcError
-from .lifecycle import (
+from .core_lifecycle import (
+    CoreGenerationAuthority,
+    CoreLifecycleClient,
+)
+from .errors import (
+    ProtocolValidationError,
     RPC_AUTH_ERROR,
+    RPC_CAPABILITY_ERROR,
     RPC_FENCING_ERROR,
     RPC_LIFECYCLE_ERROR,
-    LifecycleController,
-    RunnerState,
+    RpcError,
 )
+from .lifecycle import LifecycleController
 from .models import (
     DeliveryUpdateParams,
     EndpointParams,
     EventBatchParams,
     HostStateParams,
     IdentityParams,
-    LeaseParams,
-    PrepareParams,
-    QuiesceParams,
     RejectedEvent,
     is_external_host,
 )
@@ -108,19 +108,8 @@ class HostStateStore:
             self._values.pop(key, None)
 
 
-@dataclass
-class _GenerationRouteState:
-    """Core-owned route facts for one Runner generation."""
-
-    capabilities: frozenset[str] = frozenset()
-    lease_token: str | None = None
-    lease_expires_at_ms: int | None = None
-    authorized: bool = False
-    revoked: bool = False
-
-
 class CoreEndpointRegistry:
-    """Own candidate endpoints and monotonic Core route authorization."""
+    """Own bounded candidate and active endpoints for Core routing."""
 
     def __init__(
         self,
@@ -128,139 +117,60 @@ class CoreEndpointRegistry:
         channel_key: str,
         instance_id: str,
         clock_ms: Callable[[], int] | None = None,
+        authority: CoreGenerationAuthority | None = None,
     ) -> None:
         self.channel_key = channel_key
         self.instance_id = instance_id
-        self._clock_ms = clock_ms or (lambda: time.monotonic_ns() // 1_000_000)
-        self._entries: dict[int, EndpointParams] = {}
-        self._generations: dict[int, _GenerationRouteState] = {}
-        self._authorized_generation: int | None = None
-        self._highest_generation = -1
-
-    def prepare(self, params: PrepareParams) -> None:
-        """Stage a candidate so prepare-time endpoint RPC can be accepted."""
-        self._check_identity(params)
-        state = self._generations.get(params.generation)
-        if state is not None and state.revoked:
-            raise self._fencing_error("GENERATION_REVOKED")
-        if state is not None and (
-            state.authorized or state.lease_token is not None
+        if authority is not None and (
+            authority.channel_key != channel_key
+            or authority.instance_id != instance_id
         ):
-            raise self._fencing_error("GENERATION_ALREADY_PREPARED")
-        if params.generation < self._highest_generation:
-            raise self._fencing_error("GENERATION_STALE")
-        self._highest_generation = max(
-            self._highest_generation,
-            params.generation,
+            raise ValueError(
+                "endpoint registry and authority identity must match",
+            )
+        self.authority = authority or CoreGenerationAuthority(
+            channel_key=channel_key,
+            instance_id=instance_id,
+            clock_ms=clock_ms,
         )
-        self._entries.pop(params.generation, None)
-        self._generations[params.generation] = _GenerationRouteState(
-            capabilities=frozenset(params.capabilities),
-        )
-
-    def abort_prepare(self, generation: int) -> None:
-        """Discard an uncommitted candidate after prepare RPC failure."""
-        state = self._generations.get(generation)
-        if state is None or state.authorized or state.revoked:
-            return
-        self._entries.pop(generation, None)
-        self._generations.pop(generation, None)
-
-    def activate(self, params: LeaseParams) -> None:
-        """Record a provisional Core lease without authorizing routing."""
-        state = self._candidate_state(params)
-        state.lease_token = params.lease_token
-        state.lease_expires_at_ms = self._clock_ms() + params.lease_ttl_ms
-
-    def commit(self, params: LeaseParams) -> None:
-        """Authorize one successfully committed, unexpired generation."""
-        state = self._lease_state(params)
-        self._expire_if_needed(params.generation, state)
-        if state.revoked:
-            raise self._fencing_error("GENERATION_REVOKED")
-        previous = self._authorized_generation
-        if previous is not None and previous != params.generation:
-            self.revoke(previous)
-        state.authorized = True
-        self._authorized_generation = params.generation
-
-    def renew(self, params: LeaseParams) -> None:
-        """Extend a live Core lease without reviving a fenced generation."""
-        state = self._lease_state(params)
-        self._expire_if_needed(params.generation, state)
-        if state.revoked:
-            raise self._fencing_error("GENERATION_REVOKED")
-        state.lease_expires_at_ms = self._clock_ms() + params.lease_ttl_ms
-
-    def assert_renewable(self, params: LeaseParams) -> None:
-        """Reject a lease renewal before contacting a stale Runner."""
-        state = self._lease_state(params)
-        self._expire_if_needed(params.generation, state)
-        if state.revoked:
-            raise self._fencing_error("GENERATION_REVOKED")
-
-    def revoke(self, generation: int) -> None:
-        """Irreversibly revoke formal routing for one generation."""
-        state = self._generations.setdefault(
-            generation,
-            _GenerationRouteState(),
-        )
-        state.authorized = False
-        state.revoked = True
-        state.lease_token = None
-        state.lease_expires_at_ms = None
-        if self._authorized_generation == generation:
-            self._authorized_generation = None
+        self._entries: dict[int, tuple[int, EndpointParams]] = {}
 
     def register(self, endpoint: EndpointParams) -> None:
         """Store one generation endpoint without making it routable early."""
-        self._check_identity(endpoint)
-        state = self._generations.get(endpoint.generation)
-        if state is None:
-            raise self._fencing_error("GENERATION_UNKNOWN")
-        self._expire_if_needed(endpoint.generation, state)
-        if state.revoked:
-            raise self._fencing_error("GENERATION_REVOKED")
-        if "ingress_endpoint" not in state.capabilities:
+        self.authority.check_identity(endpoint)
+        slot = self.authority.endpoint_snapshot(endpoint.generation)
+        if slot is None:
+            raise self.authority.generation_error(endpoint.generation)
+        if "ingress_endpoint" not in slot.capabilities:
             raise RpcError(
-                RPC_LIFECYCLE_ERROR,
+                RPC_CAPABILITY_ERROR,
                 "ingress endpoint capability was not selected",
                 data={
                     "reason_code": "CAPABILITY_REQUIRED",
                     "capability": "ingress_endpoint",
                 },
             )
-        if is_external_host(endpoint.host) and not self.is_authorized(
-            endpoint.generation,
-        ):
+        if is_external_host(endpoint.host) and slot.phase != "active":
             raise self._fencing_error("STANDBY_ENDPOINT_FORBIDDEN")
-        self._entries[endpoint.generation] = endpoint
+        self._entries[endpoint.generation] = (slot.epoch, endpoint)
 
     def unregister(self, params: IdentityParams) -> None:
         """Idempotently remove one generation endpoint."""
-        self._check_identity(params)
+        self.authority.check_identity(params)
         self._entries.pop(params.generation, None)
 
     def resolve(self, generation: int) -> EndpointParams | None:
         """Return only an endpoint whose generation is currently routable."""
-        endpoint = self._entries.get(generation)
-        if endpoint is None:
+        entry = self._entries.get(generation)
+        if entry is None:
+            return None
+        epoch, endpoint = entry
+        slot = self.authority.route_snapshot(generation)
+        if slot is None or slot.epoch != epoch:
             return None
         if endpoint.readiness != "ready" or endpoint.quiescing:
             return None
-        return endpoint if self.is_authorized(generation) else None
-
-    def is_authorized(self, generation: int) -> bool:
-        """Return whether Core currently authorizes formal routing."""
-        state = self._generations.get(generation)
-        if state is None:
-            return False
-        self._expire_if_needed(generation, state)
-        return (
-            not state.revoked
-            and state.authorized
-            and self._authorized_generation == generation
-        )
+        return endpoint
 
     def snapshot(self) -> dict[int, EndpointParams]:
         """Return a copy containing only currently routable endpoints."""
@@ -271,43 +181,17 @@ class CoreEndpointRegistry:
                 snapshot[generation] = endpoint
         return snapshot
 
-    def _candidate_state(
-        self,
-        params: IdentityParams,
-    ) -> _GenerationRouteState:
-        """Return a prepared, non-revoked generation state."""
-        self._check_identity(params)
-        state = self._generations.get(params.generation)
-        if state is None:
-            raise self._fencing_error("GENERATION_UNKNOWN")
-        if state.revoked:
-            raise self._fencing_error("GENERATION_REVOKED")
-        return state
-
-    def _lease_state(self, params: LeaseParams) -> _GenerationRouteState:
-        """Return a generation whose Core lease token still matches."""
-        state = self._candidate_state(params)
-        if state.lease_token != params.lease_token:
-            raise self._fencing_error("LEASE_TOKEN_MISMATCH")
-        return state
-
-    def _expire_if_needed(
-        self,
-        generation: int,
-        state: _GenerationRouteState,
-    ) -> None:
-        """Apply Core-clock lease expiry as irreversible fencing."""
-        expires_at = state.lease_expires_at_ms
-        if expires_at is None or self._clock_ms() < expires_at:
-            return
-        self.revoke(generation)
-
-    def _check_identity(self, params: IdentityParams) -> None:
-        """Validate stable instance identity independently of Runner state."""
-        if params.channel_key != self.channel_key:
-            raise self._fencing_error("CHANNEL_KEY_MISMATCH")
-        if params.instance_id != self.instance_id:
-            raise self._fencing_error("INSTANCE_ID_MISMATCH")
+    def prune(self) -> None:
+        """Keep endpoint storage bounded to active and candidate slots."""
+        snapshot = self.authority.snapshot
+        retained = {
+            slot.generation
+            for slot in (snapshot.active, snapshot.candidate)
+            if slot is not None
+        }
+        for generation in tuple(self._entries):
+            if generation not in retained:
+                self._entries.pop(generation, None)
 
     @staticmethod
     def _fencing_error(reason_code: str) -> RpcError:
@@ -319,141 +203,6 @@ class CoreEndpointRegistry:
         )
 
 
-@dataclass
-class CoreLifecycleClient:
-    """Linearize Core route state with Core-to-Runner control calls."""
-
-    peer: RpcPeer
-    endpoints: CoreEndpointRegistry
-
-    async def prepare(
-        self,
-        params: PrepareParams,
-        *,
-        timeout: float | None = None,
-    ) -> Any:
-        """Stage Core admission around one Runner prepare request."""
-        self.endpoints.prepare(params)
-        try:
-            result = await self.peer.call(
-                "channel.prepare",
-                params.to_mapping(),
-                timeout=timeout,
-            )
-        except asyncio.CancelledError:
-            self.endpoints.abort_prepare(params.generation)
-            raise
-        except Exception:
-            self.endpoints.abort_prepare(params.generation)
-            raise
-        return result
-
-    async def activate(
-        self,
-        params: LeaseParams,
-        *,
-        timeout: float | None = None,
-    ) -> Any:
-        """Record the provisional Core lease after Runner activation."""
-        result = await self.peer.call(
-            "channel.activate",
-            params.to_mapping(),
-            timeout=timeout,
-        )
-        self.endpoints.activate(params)
-        return result
-
-    async def commit(
-        self,
-        params: LeaseParams,
-        *,
-        timeout: float | None = None,
-    ) -> Any:
-        """Authorize routing only after Runner commit succeeds."""
-        result = await self.peer.call(
-            "channel.commit",
-            params.to_mapping(),
-            timeout=timeout,
-        )
-        self._require_active_result(result, params.generation)
-        self.endpoints.commit(params)
-        return result
-
-    async def lease_renew(
-        self,
-        params: LeaseParams,
-        *,
-        timeout: float | None = None,
-    ) -> Any:
-        """Renew Runner and Core leases without reviving an expired route."""
-        self.endpoints.assert_renewable(params)
-        result = await self.peer.call(
-            "channel.lease_renew",
-            params.to_mapping(),
-            timeout=timeout,
-        )
-        self._require_generation_result(result, params.generation)
-        self.endpoints.renew(params)
-        return result
-
-    async def quiesce(
-        self,
-        params: QuiesceParams,
-        *,
-        timeout: float | None = None,
-    ) -> Any:
-        """Revoke formal routing before asking Runner to quiesce."""
-        self.endpoints.revoke(params.generation)
-        return await self.peer.call(
-            "channel.quiesce",
-            params.to_mapping(),
-            timeout=timeout,
-        )
-
-    async def stop(
-        self,
-        params: IdentityParams,
-        *,
-        timeout: float | None = None,
-    ) -> Any:
-        """Revoke formal routing before asking Runner to stop."""
-        self.endpoints.revoke(params.generation)
-        return await self.peer.call(
-            "channel.stop",
-            params.to_mapping(),
-            timeout=timeout,
-        )
-
-    @staticmethod
-    def _require_active_result(result: Any, generation: int) -> None:
-        """Require a successful active commit response."""
-        CoreLifecycleClient._require_generation_result(result, generation)
-        if result.get("state") != "active" or not result.get("consuming"):
-            raise RpcError(
-                RPC_LIFECYCLE_ERROR,
-                "Runner commit did not establish an active generation",
-                data={"reason_code": "INVALID_COMMIT_RESULT"},
-            )
-
-    @staticmethod
-    def _require_generation_result(result: Any, generation: int) -> None:
-        """Require a mapping response for the controlled generation."""
-        if (
-            not isinstance(result, Mapping)
-            or result.get(
-                "generation",
-            )
-            != generation
-        ):
-            raise RpcError(
-                RPC_LIFECYCLE_ERROR,
-                "Runner returned an invalid generation result",
-                data={"reason_code": "INVALID_GENERATION_RESULT"},
-            )
-
-
-# Package-internal lifecycle guards intentionally cross this module boundary.
-# pylint: disable=protected-access
 class CoreLifecycleAdapter:
     """Receive Runner-owned requests and retain Core-owned state."""
 
@@ -465,16 +214,39 @@ class CoreLifecycleAdapter:
         delivery_ledger: OutboundDeliveryLedger | None = None,
         inbound_inbox: InboundInbox | None = None,
         endpoint_registry: CoreEndpointRegistry | None = None,
+        authority: CoreGenerationAuthority | None = None,
         clock_ms: Callable[[], int] | None = None,
     ) -> None:
         self.controller = controller
         self.host_state_store = host_state_store or HostStateStore()
         self.delivery_ledger = delivery_ledger or OutboundDeliveryLedger()
         self.inbound_inbox = inbound_inbox or InboundInbox()
+        if authority is not None and endpoint_registry is not None:
+            if endpoint_registry.authority is not authority:
+                raise ValueError(
+                    "endpoint registry and authority must share ownership",
+                )
+        self.authority = authority or (
+            endpoint_registry.authority
+            if endpoint_registry is not None
+            else CoreGenerationAuthority(
+                channel_key=controller.channel_key,
+                instance_id=controller.instance_id,
+                clock_ms=clock_ms,
+            )
+        )
+        if (
+            controller.channel_key != self.authority.channel_key
+            or controller.instance_id != self.authority.instance_id
+        ):
+            raise ValueError(
+                "hello controller and Core authority identity must match",
+            )
         self._endpoint_registry = endpoint_registry or CoreEndpointRegistry(
             channel_key=controller.channel_key,
             instance_id=controller.instance_id,
             clock_ms=clock_ms,
+            authority=self.authority,
         )
 
     @property
@@ -488,7 +260,11 @@ class CoreLifecycleAdapter:
 
     def lifecycle_client(self, peer: RpcPeer) -> CoreLifecycleClient:
         """Return the Core control path bound to this route registry."""
-        return CoreLifecycleClient(peer, self._endpoint_registry)
+        return CoreLifecycleClient(
+            peer,
+            self.authority,
+            self._endpoint_registry.prune,
+        )
 
     def register_rpc_methods(self, peer: RpcPeer) -> None:
         """Register Core-owned Runner-to-Core methods."""
@@ -540,14 +316,11 @@ class CoreLifecycleAdapter:
                 "INVALID_EVENT_BATCH",
                 data={"reason_code": "INVALID_EVENT_BATCH"},
             )
-        async with self.controller._host_operation(
+        async with self.authority.host_operation(
             params.identity,
-            allowed_states=(RunnerState.ACTIVE,),
-            expire_lease=True,
-        ):
-            if "response_lifecycle" not in (
-                self.controller.effective_capabilities
-            ):
+            allowed_phases=("active",),
+        ) as slot:
+            if "response_lifecycle" not in slot.capabilities:
                 rejected = tuple(
                     RejectedEvent(
                         event_id=event.event_id,
@@ -577,10 +350,9 @@ class CoreLifecycleAdapter:
         params: DeliveryUpdateParams,
     ) -> dict[str, Any]:
         """Record a Runner delivery result after identity validation."""
-        async with self.controller._host_operation(
+        async with self.authority.host_operation(
             params,
-            allowed_states=(RunnerState.ACTIVE,),
-            expire_lease=True,
+            allowed_phases=("active",),
         ):
             state = self.delivery_ledger.apply(params)
             return {
@@ -600,7 +372,14 @@ class CoreLifecycleAdapter:
                 "external endpoint requires authentication",
                 data={"reason_code": "AUTH_FAILED"},
             )
-        self._endpoint_registry.register(params)
+        async with self.authority.endpoint_operation(params) as slot:
+            if slot is None:
+                raise RpcError(
+                    RPC_FENCING_ERROR,
+                    "GENERATION_REVOKED",
+                    data={"reason_code": "GENERATION_REVOKED"},
+                )
+            self._endpoint_registry.register(params)
         return {
             "status": "registered",
             "generation": params.generation,
@@ -618,7 +397,11 @@ class CoreLifecycleAdapter:
         params: IdentityParams,
     ) -> dict[str, Any]:
         """Idempotently unregister a Runner-owned endpoint."""
-        self._endpoint_registry.unregister(params)
+        async with self.authority.endpoint_operation(
+            params,
+            allow_revoked=True,
+        ):
+            self._endpoint_registry.unregister(params)
         return {
             "status": "unregistered",
             "generation": params.generation,
@@ -629,33 +412,31 @@ class CoreLifecycleAdapter:
         params: HostStateParams,
     ) -> dict[str, Any]:
         """Read Core-owned host state."""
-        async with self.controller._host_operation(
+        async with self.authority.host_operation(
             params,
             capability="host_state",
+            allowed_phases=("preparing", "standby", "active"),
         ):
-            pass
-        entry = await self.host_state_store.get(params.key)
-        if entry is None:
-            return {"found": False, "key": params.key}
-        schema_version, value = entry
-        return {
-            "found": True,
-            "key": params.key,
-            "schema_version": schema_version,
-            "value": value,
-        }
+            entry = await self.host_state_store.get(params.key)
+            if entry is None:
+                return {"found": False, "key": params.key}
+            schema_version, value = entry
+            return {
+                "found": True,
+                "key": params.key,
+                "schema_version": schema_version,
+                "value": value,
+            }
 
     async def host_state_put(
         self,
         params: HostStateParams,
     ) -> dict[str, Any]:
         """Write Core-owned host state with generation fencing."""
-        async with self.controller._host_operation(
+        async with self.authority.host_operation(
             params,
             capability="host_state",
-            allowed_states=(RunnerState.ACTIVE,),
-            expire_lease=True,
-            expired_reason="LEASE_EXPIRED",
+            allowed_phases=("active",),
         ):
             await self.host_state_store.put(
                 params.key,
@@ -669,12 +450,10 @@ class CoreLifecycleAdapter:
         params: HostStateParams,
     ) -> dict[str, Any]:
         """Delete Core-owned host state with generation fencing."""
-        async with self.controller._host_operation(
+        async with self.authority.host_operation(
             params,
             capability="host_state",
-            allowed_states=(RunnerState.ACTIVE,),
-            expire_lease=True,
-            expired_reason="LEASE_EXPIRED",
+            allowed_phases=("active",),
         ):
             await self.host_state_store.delete(params.key)
             return {"status": "deleted", "key": params.key}

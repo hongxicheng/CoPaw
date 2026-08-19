@@ -9,6 +9,11 @@ from collections.abc import Sequence
 
 PathPart = str | int
 
+RPC_LIFECYCLE_ERROR = -32010
+RPC_FENCING_ERROR = -32011
+RPC_AUTH_ERROR = -32012
+RPC_CAPABILITY_ERROR = -32013
+
 
 class DescriptorValidationError(ValueError):
     """Report an invalid descriptor or related pure value model."""

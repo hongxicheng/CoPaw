@@ -22,6 +22,10 @@ from .errors import (
     SecretHandleInvalidError,
 )
 from .framing import FrameReader, FramedTransport, FramingLimits, encode_frame
+from .core_lifecycle import (
+    CoreGenerationAuthority,
+    CoreLifecycleClient,
+)
 from .lifecycle import (
     FixtureSecretHandleConsumer,
     LifecycleController,
@@ -30,7 +34,6 @@ from .lifecycle import (
 from .host import (
     CoreEndpointRegistry,
     CoreLifecycleAdapter,
-    CoreLifecycleClient,
     HostStateStore,
 )
 from .models import (
@@ -169,6 +172,7 @@ __all__ = [
     "OutboundResult",
     "LifecycleController",
     "CoreEndpointRegistry",
+    "CoreGenerationAuthority",
     "CoreLifecycleAdapter",
     "CoreLifecycleClient",
     "FixtureSecretHandleConsumer",

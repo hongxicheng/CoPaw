@@ -141,7 +141,7 @@ async def test_generation_fencing_expiry_and_quiesce() -> None:
     """Stale generations and expired leases cannot continue operating."""
     clock = Clock()
     controller = _controller(clock)
-    adapter = CoreLifecycleAdapter(controller)
+    adapter = CoreLifecycleAdapter(controller, clock_ms=clock)
     controller.accept_hello(_hello())
     await controller.prepare(
         PrepareParams.from_mapping(
@@ -161,6 +161,24 @@ async def test_generation_fencing_expiry_and_quiesce() -> None:
     )
     await controller.activate(lease)
     await controller.commit(lease)
+    prepare_token = await adapter.authority.prepare_start(
+        PrepareParams.from_mapping(
+            {
+                **_identity(),
+                "host_context": {},
+                "capabilities": [
+                    "host_state",
+                    "ingress_endpoint",
+                    "media",
+                ],
+            },
+        ),
+    )
+    await adapter.authority.prepare_complete(prepare_token)
+    activate_token = await adapter.authority.activate_start(lease)
+    await adapter.authority.activate_complete(activate_token, lease)
+    commit_token = await adapter.authority.commit_start(lease)
+    await adapter.authority.commit_complete(commit_token, lease)
     clock.now = 1011
     with pytest.raises(RpcError) as expired_write:
         await adapter.host_state_put(

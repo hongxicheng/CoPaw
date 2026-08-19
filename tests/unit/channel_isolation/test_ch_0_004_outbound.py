@@ -666,19 +666,21 @@ async def test_send_handler_can_call_reverse_host_state_rpc() -> None:
     adapter.register_rpc_methods(core)
     await asyncio.gather(core.start(), runner.start())
     await runner.call("runner.hello", _hello().to_mapping())
-    await core.call(
-        "channel.prepare",
-        {
-            **_identity(),
-            "host_context": {},
-            "capabilities": ["host_state"],
-        },
+    lifecycle = adapter.lifecycle_client(core)
+    await lifecycle.prepare(
+        PrepareParams.from_mapping(
+            {
+                **_identity(),
+                "host_context": {},
+                "capabilities": ["host_state"],
+            },
+        ),
     )
     lease = LeaseParams.from_mapping(
         {**_identity(), "lease_token": "reverse", "lease_ttl_ms": 100},
     )
-    await core.call("channel.activate", lease.to_mapping())
-    await core.call("channel.commit", lease.to_mapping())
+    await lifecycle.activate(lease)
+    await lifecycle.commit(lease)
     result = await core.call(
         "channel.send",
         {
