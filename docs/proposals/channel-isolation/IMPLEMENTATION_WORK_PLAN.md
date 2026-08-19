@@ -306,7 +306,7 @@ descriptor validator 和聚焦单测机械验证；ADR-035/036 已确认。独�
 
 ### CH-0-004：JSON-RPC 2.0、Schema 和生命周期
 
-- 状态：[-] 实施完成，等待本轮审查修复的独立 Review
+- 状态：[x] 独立 Review 和最终验证通过
 
 - [x] 实现 JSON-RPC 2.0 request、response、notification、error 和 cancel。
 - [x] 实现 pending request 上限、request timeout、未知方法和重复 response 处理。
@@ -482,11 +482,12 @@ capability 可能向错误 Runner 发送 stop/quiesce；authority 同时保留�
 nonce、control capability 和 binding lock 收敛为该 client 的私有可变状态；shutdown
 只允许经过 peer-bound client，authority 不再提供无 token revoke 入口。既有测试旁路已
 全部迁移到真实 `CoreLifecycleClient` 控制路径，回归验证 peer 替换在 Runner RPC 前被拒绝，
-且 stop 只到达原始 peer。CH-0-004 继续保持 `[-]`，等待独立 Review。本轮当前唯一验证
-证据：CH-0-004 聚焦测试 `133 passed`；`tests/unit/channel_isolation` 为 `332 passed`；
+且 stop 只到达原始 peer。本轮最终验证证据：CH-0-004 聚焦测试 `133 passed`；
+`tests/unit/channel_isolation` 为 `332 passed`；
 CH-0-007 与飞书 unit/contract 相邻矩阵为 `185 passed, 1 skipped`。改动文件 pre-commit
 （包含 mypy、black、flake8 和 pylint）通过，`git diff --check` 通过。未运行全仓测试和
-真实 Windows/Linux/macOS 跨进程测试。
+真实 Windows/Linux/macOS 跨进程测试。独立 Review 已通过（用户确认）；最终修复提交为
+`d790fe82`。CH-0-004 已完成，但 G0 仍须单独完成纵向原型、目标平台向量及阶段 Gate 验收。
 
 ### CH-0-005：可靠事件、ACK 和幂等原型
 
