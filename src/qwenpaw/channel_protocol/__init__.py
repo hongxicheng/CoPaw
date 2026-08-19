@@ -23,12 +23,11 @@ from .errors import (
 )
 from .framing import FrameReader, FramedTransport, FramingLimits, encode_frame
 from .lifecycle import (
-    CoreLifecycleAdapter,
     FixtureSecretHandleConsumer,
-    HostStateStore,
     LifecycleController,
     RunnerState,
 )
+from .host import CoreLifecycleAdapter, HostStateStore
 from .models import (
     ApprovalCardParams,
     ApprovalSeverity,
@@ -55,6 +54,9 @@ from .models import (
     RpcNotification,
     RpcRequest,
     RpcResponse,
+    ResponseFinishParams,
+    ResponseFinishResult,
+    ResponseOutcome,
     SendParams,
     StreamType,
     VoiceEvent,
@@ -64,6 +66,7 @@ from .models import (
     parse_rpc_message,
     validate_content_part,
     validate_method_params,
+    validate_response_handle,
     is_external_host,
     voice_event_from_setup,
     voice_event_from_status_callback,
@@ -171,6 +174,9 @@ __all__ = [
     "RpcNotification",
     "RpcRequest",
     "RpcResponse",
+    "ResponseFinishParams",
+    "ResponseFinishResult",
+    "ResponseOutcome",
     "RunnerState",
     "SendParams",
     "StreamType",
@@ -181,6 +187,7 @@ __all__ = [
     "parse_rpc_message",
     "validate_content_part",
     "validate_method_params",
+    "validate_response_handle",
     "is_external_host",
     "voice_event_from_setup",
     "voice_event_from_status_callback",

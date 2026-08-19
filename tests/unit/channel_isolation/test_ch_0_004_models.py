@@ -10,6 +10,7 @@ from qwenpaw.channel_protocol import (
     EndpointParams,
     HostContext,
     HostStateParams,
+    InboundEvent,
     LeaseParams,
     DeliveryState,
     OutboundResult,
@@ -18,6 +19,9 @@ from qwenpaw.channel_protocol import (
     RpcRequest,
     RpcResponse,
     ReactionParams,
+    ResponseFinishParams,
+    ResponseFinishResult,
+    ResponseOutcome,
     SendParams,
     OutboundOperation,
     StreamType,
@@ -211,6 +215,65 @@ def test_outbound_operation_dtos_are_closed_and_platform_independent() -> None:
             {
                 **reaction.to_mapping(),
                 "reaction": "DONE",
+            },
+        )
+
+
+def test_response_scope_dtos_and_opaque_handle_validation() -> None:
+    """Response finalization remains closed and platform-independent."""
+    params = ResponseFinishParams.from_mapping(
+        {
+            **_identity(),
+            "response_handle": "feishu:reply:event-1",
+            "outcome": "completed",
+        },
+    )
+    assert params.outcome is ResponseOutcome.COMPLETED
+    result = ResponseFinishResult.from_mapping(
+        {
+            "response_handle": params.response_handle,
+            "outcome": "completed",
+            "state": "closed",
+        },
+    )
+    assert result.to_mapping()["state"] == "closed"
+    event = {
+        "event_id": "event-1",
+        "event_kind": "message.received",
+        "channel_key": "voice",
+        "instance_id": "instance-1",
+        "generation": 7,
+        "conversation": {"id": "chat-1", "type": "group"},
+        "sender_id": "sender-1",
+        "acl_sender_id": "sender-1",
+        "sender_name": "Sender",
+        "content_parts": [{"type": "text", "text": "hello"}],
+        "metadata": {},
+        "response_handle": params.response_handle,
+    }
+    assert (
+        InboundEvent.from_mapping(event).to_mapping()["response_handle"]
+        == params.response_handle
+    )
+    with pytest.raises(ProtocolValidationError):
+        ResponseFinishParams.from_mapping(
+            {
+                **params.to_mapping(),
+                "response_handle": "",
+            },
+        )
+    with pytest.raises(ProtocolValidationError):
+        ResponseFinishParams.from_mapping(
+            {
+                **params.to_mapping(),
+                "response_handle": "bad\nhandle",
+            },
+        )
+    with pytest.raises(ProtocolValidationError):
+        ResponseFinishParams.from_mapping(
+            {
+                **params.to_mapping(),
+                "outcome": "unknown",
             },
         )
 

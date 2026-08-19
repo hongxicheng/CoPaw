@@ -13,11 +13,11 @@ from typing import Any, Mapping
 from .errors import ProtocolValidationError
 from .identifiers import validate_channel_key, validate_digest
 
-
 JSONRPC_VERSION = "2.0"
 PROTOCOL_VERSION = 1
 MAX_METHOD_LENGTH = 128
 MAX_SECRET_HANDLE_LENGTH = 256
+MAX_RESPONSE_HANDLE_LENGTH = 512
 
 
 def _error(
@@ -89,12 +89,32 @@ def _string(
     """Require a JSON string."""
     if not isinstance(value, str) or (non_empty and not value):
         raise _error(
-            f"{name} must be a non-empty string"
-            if non_empty
-            else f"{name} must be a string",
+            (
+                f"{name} must be a non-empty string"
+                if non_empty
+                else f"{name} must be a string"
+            ),
             path=path + (name,),
         )
     return value
+
+
+def validate_response_handle(value: object) -> str:
+    """Validate one opaque request-scoped response handle."""
+    handle = _string(value, "response_handle")
+    if len(handle) > MAX_RESPONSE_HANDLE_LENGTH:
+        raise _error(
+            "response_handle exceeds the maximum length",
+            path=("response_handle",),
+        )
+    if any(
+        ord(character) < 32 or ord(character) == 127 for character in handle
+    ):
+        raise _error(
+            "response_handle must not contain control characters",
+            path=("response_handle",),
+        )
+    return handle
 
 
 def _integer(
@@ -860,6 +880,7 @@ class InboundEvent:
     content_parts: tuple[dict[str, Any], ...]
     event_kind: str
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    response_handle: str | None = None
 
     @classmethod
     def from_mapping(cls, value: object) -> "InboundEvent":
@@ -879,6 +900,7 @@ class InboundEvent:
                 "sender_name",
                 "content_parts",
                 "metadata",
+                "response_handle",
             },
         )
         content_parts = _list(data.get("content_parts"), "content_parts")
@@ -913,6 +935,12 @@ class InboundEvent:
                 validate_content_part(item) for item in content_parts
             ),
             metadata=dict(metadata),
+            response_handle=(
+                validate_response_handle(data["response_handle"])
+                if "response_handle" in data
+                and data["response_handle"] is not None
+                else None
+            ),
         )
 
     def to_mapping(self) -> dict[str, Any]:
@@ -930,6 +958,8 @@ class InboundEvent:
             "metadata": dict(self.metadata),
         }
         result["event_kind"] = self.event_kind
+        if self.response_handle is not None:
+            result["response_handle"] = self.response_handle
         return result
 
 
@@ -1761,6 +1791,109 @@ class CancelParams:
         return result
 
 
+class ResponseOutcome(StrEnum):
+    """Stable terminal outcomes for one request-scoped response."""
+
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+@dataclass(frozen=True)
+class ResponseFinishParams(IdentityParams):
+    """Close one opaque request-scoped response lifecycle."""
+
+    response_handle: str
+    outcome: ResponseOutcome
+
+    @classmethod
+    def from_mapping(cls, value: object) -> "ResponseFinishParams":
+        """Validate a response finalization request."""
+        data = _object(value)
+        _closed(
+            data,
+            {
+                "channel_key",
+                "instance_id",
+                "generation",
+                "response_handle",
+                "outcome",
+            },
+        )
+        identity = IdentityParams.from_mapping(
+            {
+                key: data[key]
+                for key in ("channel_key", "instance_id", "generation")
+            },
+        )
+        outcome_value = _string(data.get("outcome"), "outcome")
+        try:
+            outcome = ResponseOutcome(outcome_value)
+        except ValueError as exc:
+            raise _error(
+                "unsupported response outcome",
+                path=("outcome",),
+            ) from exc
+        return cls(
+            **identity.__dict__,
+            response_handle=validate_response_handle(
+                data.get("response_handle"),
+            ),
+            outcome=outcome,
+        )
+
+    def to_mapping(self) -> dict[str, Any]:
+        """Encode one response finalization request."""
+        return {
+            **super().to_mapping(),
+            "response_handle": self.response_handle,
+            "outcome": self.outcome.value,
+        }
+
+
+@dataclass(frozen=True)
+class ResponseFinishResult:
+    """Closed result returned by channel.response.finish."""
+
+    response_handle: str
+    outcome: ResponseOutcome
+    state: str = field(default="closed", init=False)
+
+    @classmethod
+    def from_mapping(cls, value: object) -> "ResponseFinishResult":
+        """Validate a response finalization result."""
+        data = _object(value)
+        _closed(data, {"response_handle", "outcome", "state"})
+        if data.get("state") != "closed":
+            raise _error(
+                "response finish result must be closed",
+                path=("state",),
+                reason_code="SCHEMA_MISMATCH",
+            )
+        outcome_value = _string(data.get("outcome"), "outcome")
+        try:
+            outcome = ResponseOutcome(outcome_value)
+        except ValueError as exc:
+            raise _error(
+                "unsupported response outcome",
+                path=("outcome",),
+            ) from exc
+        return cls(
+            response_handle=validate_response_handle(
+                data.get("response_handle"),
+            ),
+            outcome=outcome,
+        )
+
+    def to_mapping(self) -> dict[str, Any]:
+        """Encode a response finalization result."""
+        return {
+            "response_handle": self.response_handle,
+            "outcome": self.outcome.value,
+            "state": self.state,
+        }
+
+
 @dataclass(frozen=True)
 class QuiesceParams(IdentityParams):
     """Stop new work and drain a bounded amount of existing work."""
@@ -1999,6 +2132,7 @@ METHOD_SCHEMAS: dict[str, type[Any]] = {
     "channel.stop": IdentityParams,
     "channel.send": SendParams,
     "channel.reaction": ReactionParams,
+    "channel.response.finish": ResponseFinishParams,
     "event.batch": EventBatchParams,
     "delivery.update": DeliveryUpdateParams,
     "ingress.endpoint.register": EndpointParams,

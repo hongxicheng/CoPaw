@@ -455,7 +455,7 @@ def test_driver_rpc_mapping_matches_design_without_checkpoint_method() -> None:
     )
     documented = {row[0] for row in rows}
     assert documented == _design_rpc_methods()
-    assert len(rows) == 21
+    assert len(rows) == 22
     assert "`checkpoint` wire method" in text
     assert "`checkpoint` |" not in text
     assert "不是 wire API" in text

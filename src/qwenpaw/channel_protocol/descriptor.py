@@ -112,6 +112,7 @@ _CAPABILITIES = frozenset(
         "ingress_endpoint",
         "checkpoint",
         "host_state",
+        "response_lifecycle",
     },
 )
 

@@ -517,6 +517,7 @@ def test_capability_and_ingress_combinations() -> None:
         "ingress_endpoint",
         "checkpoint",
         "host_state",
+        "response_lifecycle",
     ],
 )
 def test_capability_registry_accepts_every_v1_value(capability: str) -> None:

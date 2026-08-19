@@ -306,7 +306,7 @@ descriptor validator 和聚焦单测机械验证；ADR-035/036 已确认。独�
 
 ### CH-0-004：JSON-RPC 2.0、Schema 和生命周期
 
-- 状态：[x] 独立 Review 和最终验证通过
+- 状态：[-] 实施完成，等待本轮 response lifecycle 扩展的独立 Review
 
 - [x] 实现 JSON-RPC 2.0 request、response、notification、error 和 cancel。
 - [x] 实现 pending request 上限、request timeout、未知方法和重复 response 处理。
@@ -332,6 +332,9 @@ descriptor validator 和聚焦单测机械验证；ADR-035/036 已确认。独�
   新增 Design §7.3 之外的 RPC 方法。
 - [x] 冻结 `secret_handle` 的不透明、prepare/generation scoped、一次性消费和稳定错误
   语义；Phase 0 只实现 fixture consumer，真实跨平台 pipe/handle 留给 CH-1-006。
+- [x] 冻结 request-scoped `response_handle` 和 `response_lifecycle` capability；实现
+  `channel.response.finish` 的 completed/failed/cancelled 闭合 DTO、幂等 finish、冲突和
+  closed tombstone 语义，并将 finish 与出站 publication 的 in-flight fencing 绑定。
 
 验收：mock Core/Runner 能完成 hello、prepare、activate、commit、lease renewal、
 health、cancel 和 stop；commit 前不能正式消费。非法状态转换、Schema 不匹配、超时和
@@ -339,19 +342,27 @@ health、cancel 和 stop；commit 前不能正式消费。非法状态转换、S
 create/update、stream start/delta/end 和 approval card，`channel.reaction` 能表达
 completed reaction；capability、target、sequence、lease 和 generation 门禁返回稳定
 结果。fixture secret handle 只在 prepare 中按 generation 消费一次，secret value 不进入
-JSON-RPC frame、返回值或 Runner 保存的 host context。
+JSON-RPC frame、返回值或 Runner 保存的 host context。声明
+`response_lifecycle` 的 Runner 能携带并回显不透明 `response_handle`；Core 在整轮
+response 完成时通过可靠、幂等的 `channel.response.finish` 关闭 route，finish 前后的
+send/reaction、in-flight delivery、重复 finish、冲突 outcome、恢复 tombstone 和清理失败
+重试均返回稳定结果。
 
-实现位于 `src/qwenpaw/channel_protocol/models.py`、`rpc.py` 和 `lifecycle.py`，
+实现位于 `src/qwenpaw/channel_protocol/models.py`、`descriptor.py`、`rpc.py`、
+`lifecycle.py`、`host.py` 和 `outbound.py`，
 公共导出与错误类型位于 `__init__.py`、`errors.py`；聚焦测试位于
-`tests/unit/channel_isolation/test_ch_0_004_models.py`、`test_ch_0_004_rpc.py` 和
-`test_ch_0_004_lifecycle.py`。当前聚焦测试命令
-`conda run -n qwenpaw pytest -q tests/unit/channel_isolation/test_ch_0_004_models.py
-tests/unit/channel_isolation/test_ch_0_004_lifecycle.py
-tests/unit/channel_isolation/test_ch_0_004_rpc.py` 为 `74 passed`，framing 回归测试
+`tests/unit/channel_isolation/test_ch_0_004_models.py`、`test_ch_0_004_rpc.py`、
+`test_ch_0_004_lifecycle.py`、`test_ch_0_004_host_adapter.py`、
+`test_ch_0_004_outbound.py` 和 `test_ch_0_004_response_lifecycle.py`，Design 7.3
+对应的边界矩阵位于
+`docs/proposals/channel-isolation/CH-0-001_CORE_RUNNER_BOUNDARY.md`；当前聚焦测试命令
+`conda run -n qwenpaw pytest -q tests/unit/channel_isolation/test_ch_0_004_*.py`
+为 `84 passed`，descriptor 回归测试
+为 `48 passed`，framing 回归测试
 `tests/unit/channel_isolation/test_ch_0_003_transport.py` 为 `15 passed`，相邻可靠性测试
 `tests/unit/channel_isolation/test_ch_0_005_reliability.py` 为 `13 passed`，
 `tests/unit/channel_isolation/test_ch_0_006_bootstrap.py` 为 `20 passed`，
-`conda run -n qwenpaw pytest -q tests/unit/channel_isolation` 为 `271 passed`；目标文件
+`conda run -n qwenpaw pytest -q tests/unit/channel_isolation` 为 `283 passed`；目标文件
 pre-commit 全部通过（包括 mypy、black、flake8 和 pylint），`git diff --check` 通过。
 实现与历次修复提交为 `95836112`、`26958f06`、`339766f7`、`4cd74739`、
 `220aef20`、`85ed4907`、`deddbb65`、`f26d76a1`、`b4ab6c86`、`2ee4eecd`、
@@ -375,8 +386,31 @@ publication 边界延后到后台线程完成完整 HANDLE 写入，并让所有
 写入失败路径幂等收敛为 `unknown`。回归测试覆盖 Windows 零进展写入不建立 ACK/target，
 以及 prepare 等锁期间关闭 transport 后移除 attempt、清除 stream busy 标记且不推进
 sequence。
-最新修复提交 `59becc9a` 的独立 Review 已通过（用户确认）；上述聚焦、相邻、全组测试和
-目标文件 pre-commit 作为最终验证证据均通过，本任务状态更新为 `[x]`。
+此前修复提交 `59becc9a` 的独立 Review 已通过（用户确认）；本轮扩展后需重新 Review。
+
+本轮依据 ADR-037 和 Design §7.3、§7.4、§11.0、§14.1 扩展 response lifecycle：新增
+`response_lifecycle` capability、`InboundEvent.response_handle` 和
+`channel.response.finish`；Runner scope 仅在显式 finish 后进入 closed tombstone，
+message/approval/stream/reaction/delivery ACK 不再推断整轮完成。finish handler 在锁外
+执行，in-flight delivery 直到 publication 或 unknown 终态才释放；Driver 可显式 GC
+完成的 tombstone。新增契约测试覆盖能力拒绝、DTO 闭合校验、无出站完成、幂等和冲突、
+finish 后无副作用、busy fencing、清理失败重试、恢复和真实 RPC dispatch。
+
+本轮同时完成有边界的内部结构重构：Core-owned `CoreLifecycleAdapter`、Host State 和
+endpoint registry 已迁入 `host.py`，Runner 仅保留本地 endpoint admission 和显式
+unregister hook，Adapter 不再反向写入 Controller 私有 registry callback；delivery、target、
+attempt 和 publication 已收敛到同步、无锁、无 I/O 的 `OutboundDeliveryState`，response
+scope、finish 和 tombstone 独立收敛到 `ResponseScopeRegistry`。Controller 继续唯一拥有
+lifecycle lock、identity、generation、lease、capability、Driver/RPC 编排和 quiesce/stop
+admission closure；平台 handler、endpoint hook 和 transport I/O 均在锁外执行。测试不再
+读取 delivery/target/attempt/response 的裸字典，改用 immutable snapshot，并按 ownership
+拆分；重构前后既有 collection 均为 `83`，另新增 endpoint register hook 锁外重入回归后为
+`84`。
+
+当前聚焦测试为 `84 passed`；CH-0-001～CH-0-007 相关矩阵为 `192 passed`；
+`tests/unit/channel_isolation` 为 `283 passed`；飞书相邻 unit/contract 为
+`184 passed, 1 skipped`。目标文件 pre-commit（含 mypy、black、flake8、pylint）通过，
+`git diff --check` 通过；本任务等待独立 Review，未标记完成。
 
 ### CH-0-005：可靠事件、ACK 和幂等原型
 

@@ -214,6 +214,7 @@ strings、numbers、booleans、null、arrays 和 objects。
 | `channel.health` | Core -> Runner request | invoke Driver platform probe |
 | `channel.stop` | Core -> Runner request | stop Driver lifecycle and resources |
 | `channel.send` | Core -> Runner request | invoke Driver outbound operation |
+| `channel.response.finish` | Core -> Runner request, optional | finalize one request-scoped Driver response |
 | `channel.typing` | Core -> Runner request, optional | invoke optional Driver typing operation |
 | `channel.reaction` | Core -> Runner request, optional | invoke optional Driver reaction operation |
 | `ingress.endpoint.register` | Runner -> Core request, optional | publish Runner-owned ingress readiness |

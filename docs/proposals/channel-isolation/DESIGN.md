@@ -490,6 +490,7 @@ channel.quiesce    Core -> Runner request
 channel.health     Core -> Runner request
 channel.stop       Core -> Runner request
 channel.send       Core -> Runner request
+channel.response.finish Core -> Runner request, optional
 channel.typing     Core -> Runner request, optional
 channel.reaction   Core -> Runner request, optional
 ingress.endpoint.register   Runner -> Core request, optional
@@ -580,6 +581,47 @@ prepared ACK/target/order 发布为正式状态；在 settlement 完成前，这
 `reaction=completed`，目标必须是先前成功接收的 `message.create` 或 `stream.start`；
 平台 emoji/reaction key 由 Runner 映射，不进入协议。
 
+request-scoped 回复目标使用独立的 response lifecycle，不能从单次 delivery 推断整轮
+Agent 响应是否结束。声明 `response_lifecycle` capability 的 Runner 可以在
+`InboundEvent` 中携带可选 `response_handle`；该字段是长度不超过 512、不得包含控制字符
+的非空不透明字符串。Core 只原样保存并作为该轮 `channel.send.to_handle`、
+`channel.reaction.to_handle` 和最终 `channel.response.finish.response_handle` 回传，不能
+解析其中的平台 message、thread 或 topic 身份。未协商该 capability 时 Runner 不得发送
+该字段，Core 也不得调用 `channel.response.finish`。
+
+ChannelDriver 在提交带 handle 的 `event.batch` 前，通过 Runner 内部的
+`open_response_scope()` 登记 active scope；该调用不是 RPC，也不产生平台副作用。事件获得
+accepted/duplicate ACK 后保留 scope；永久 rejected 时通过 `discard_response_scope()` 撤销
+尚无在途 delivery 的登记。恢复时 Driver 从自己的有界持久状态重新登记 active route，并
+把尚在 TTL 内的 closed tombstone 注入 lifecycle controller。Core 收到未协商 capability
+却携带 `response_handle` 的事件时，按事件返回不可重试的 `CAPABILITY_REQUIRED` rejection。
+
+`channel.response.finish` 是可靠、幂等的 Core -> Runner request，使用 closed DTO，包含
+共同 identity、`response_handle` 和 `outcome=completed|failed|cancelled`。它表示 Core
+确认一轮 request-scoped response 已经终止，此后不会再使用该 handle 产生新的平台副作用；
+它不依附于某个 `delivery_id`，也不使用 notification。`message.create`（包括 approval
+card）、`stream.end`、completed reaction 和 delivery `acknowledged` 都只描述各自操作，
+不得隐式关闭 response scope。成功但没有任何出站消息的 response 同样可以 finish。
+
+Runner 为每个 active response scope 保存有界状态，并由 ChannelDriver 的可选 finish
+handler 幂等释放平台 route、typing/card 等资源。关闭使用单调 tombstone，而不是无记录
+删除：同一 handle、同一 outcome 重复 finish 返回成功；冲突 outcome 返回
+`RESPONSE_OUTCOME_CONFLICT`；未知 handle 返回 `RESPONSE_HANDLE_UNKNOWN`；closed handle 上
+的新 `channel.send` 或 `channel.reaction` 返回 `RESPONSE_CLOSED`，且不得调用平台 handler。
+Driver 的持久化清理失败时 scope 仍保持逻辑关闭，返回可重试的
+`RESPONSE_FINISH_FAILED`；相同 outcome 的重试再次执行幂等 handler。Runner 重启只恢复
+active route 和尚在 TTL 内的 closed tombstone，closed tombstone 不得恢复为 active；有界
+TTL GC 之后再次 finish 可以返回 unknown。
+
+finish 与出站操作共享短生命周期临界区，但不得跨平台 handler await 持锁。若 send 或
+reaction 先完成准入，finish 返回可重试的 `RESPONSE_BUSY`，由 Core 在该 attempt 的
+publication settlement 后重试；若 finish 先原子关闭准入，后续操作返回
+`RESPONSE_CLOSED`。in-flight 状态必须持续到 response frame publication 成功或 attempt
+收敛为 failed/timeout/unknown，不能在平台 handler 返回时提前释放。finish handler 在锁外
+执行；同 outcome 的并发 finish 共享同一个幂等清理 attempt，request cancel 或 response
+丢失不会重新开放 scope。所有 open、finish、send 和 reaction 仍受 active state、lease、
+generation 和 identity fencing。
+
 出站 capability 绑定是协议事实来源：非文本 ContentPart 要求 `media`；所有 stream 操作
 和 `message.update` 要求 `streaming`；带 `approval` 的 `message.create` 要求
 `approval_card`；`channel.reaction` 要求 `reaction`。缺少 capability 返回
@@ -649,6 +691,11 @@ RUNNER_SHUTTING_DOWN
 CAPABILITY_REQUIRED
 OUTBOUND_TARGET_UNKNOWN
 OUTBOUND_ORDER_VIOLATION
+RESPONSE_CLOSED
+RESPONSE_HANDLE_UNKNOWN
+RESPONSE_OUTCOME_CONFLICT
+RESPONSE_BUSY
+RESPONSE_FINISH_FAILED
 SECRET_HANDLE_INVALID
 SECRET_HANDLE_CONSUMED
 INGRESS_CONNECTION_UNKNOWN
@@ -1370,7 +1417,8 @@ locale key 和字符串值，不得借此引入其他字段：
   方法 Schema 绑定。未登记的 ID、重复项或与 `ingress_owner` 不一致的 ID 必须拒绝；没有
   能力用空 array，不用隐式默认值。v1 保留以下稳定 capability ID：
   `streaming`、`typing`、`reaction`、`media`、`approval_card`、`server_side_idempotency`、
-  `exactly-once-visible`、`ingress_endpoint`、`checkpoint` 和 `host_state`。
+  `exactly-once-visible`、`ingress_endpoint`、`checkpoint`、`host_state` 和
+  `response_lifecycle`。
   `exactly-once-visible` 只有在同时声明 `server_side_idempotency` 的平台 profile 中才可使用。
   能力声明只描述可用操作，
   不改变 `process_mode` 到驱动的唯一映射。
@@ -1993,3 +2041,4 @@ Core Channel、runner-process Channel 和 legacy Plugin Channel 混合运行、�
 | ADR-034 | 对需要入站媒体落盘的 Channel，Core 统一解析 `config.media_dir` → `workspace_dir/media` → `WORKING_DIR/media`；`from_env` 使用 `<CHANNEL>_MEDIA_DIR` → `WORKING_DIR/media`。最终目录平铺，不追加 Channel 子目录；各 Channel 保留现有下载、命名、覆盖和清理行为，不迁移既有文件 | 已确认；替代 ADR-032 |
 | ADR-035 | v1 标识使用带唯一 string escape 和 finite decimal 的受限 canonical JSON、domain separator + NUL、完整 SHA-256 和稳定前缀；逻辑 ID 与 `dir1_` 磁盘目录键分离，目录 manifest 保留并核对完整逻辑 ID；platform tag 必须属于版本化 release target registry | 已确认 |
 | ADR-036 | v1 descriptor 使用 closed object、显式空值和字段级 required/nullable/secret/condition 语义；Requirement 在 digest 前统一 canonicalize，重复折叠且拒绝 `extra` marker；condition domain 必须有限；`config_fields` 是支持 number 的 UI 投影，完整 value schema 仍由 Pydantic/JSON Schema 或 plugin artifact schema 负责；身份声明可引用 secret 字段但 secret value 仅在 Core 内比较；静态读取不得 import 平台模块；process mode 唯一派生驱动接口 | 已确认 |
+| ADR-037 | request-scoped response 的终止由 Core 通过可重试、幂等的 `channel.response.finish` 显式通知 Runner；不得由 message、stream 或 delivery ACK 推断。Runner 以有界 closed tombstone 保持关闭单调性，并在线性化边界上与在途出站操作排序 | 已确认 |
