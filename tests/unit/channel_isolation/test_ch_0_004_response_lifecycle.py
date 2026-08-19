@@ -15,6 +15,7 @@ import pytest
 from qwenpaw.channel_protocol import (
     CoreLifecycleAdapter,
     HelloParams,
+    JSONRPC_INVALID_PARAMS,
     LeaseParams,
     LifecycleController,
     PrepareParams,
@@ -272,6 +273,7 @@ async def test_response_scope_restore_and_driver_gc_are_bounded() -> None:
     await controller.restore_response_scope(
         "restored-response",
         ResponseOutcome.COMPLETED,
+        cleanup_complete=True,
     )
     with pytest.raises(RpcError) as closed:
         await controller.send(
@@ -378,6 +380,53 @@ async def test_response_finish_cleanup_failure_is_retryable() -> None:
 
 
 @pytest.mark.asyncio
+async def test_restored_failed_cleanup_is_retried_after_restart() -> None:
+    """A restart cannot turn pending cleanup into a completed tombstone."""
+    first = _controller(Clock())
+
+    async def failing_handler(_: ResponseFinishParams) -> None:
+        raise RuntimeError("platform cleanup failed")
+
+    first._response_finish_handler = failing_handler
+    await _activate(first, ["response_lifecycle"])
+    await first.open_response_scope("restart-response")
+    params = ResponseFinishParams.from_mapping(
+        {
+            **_identity(),
+            "response_handle": "restart-response",
+            "outcome": "failed",
+        },
+    )
+    with pytest.raises(RpcError) as failed:
+        await first.response_finish(params)
+    assert failed.value.data["reason_code"] == "RESPONSE_FINISH_FAILED"
+    snapshot = first._response_scopes.snapshot("restart-response")
+    assert snapshot is not None
+    assert snapshot.cleanup_complete is False
+
+    retries = 0
+
+    async def retry_handler(_: ResponseFinishParams) -> None:
+        nonlocal retries
+        retries += 1
+
+    restored = _controller(Clock())
+    restored._response_finish_handler = retry_handler
+    await _activate(restored, ["response_lifecycle"])
+    await restored.restore_response_scope(
+        "restart-response",
+        ResponseOutcome.FAILED,
+    )
+    assert (await restored.response_finish(params))["state"] == "closed"
+    assert retries == 1
+    restored_snapshot = restored._response_scopes.snapshot(
+        "restart-response",
+    )
+    assert restored_snapshot is not None
+    assert restored_snapshot.cleanup_complete is True
+
+
+@pytest.mark.asyncio
 async def test_response_finish_can_close_an_empty_response() -> None:
     """A response with no outbound delivery still has a terminal scope."""
     controller = _controller(Clock())
@@ -416,4 +465,23 @@ async def test_response_finish_is_registered_as_a_reliable_rpc() -> None:
     }
     assert await core.call("channel.response.finish", params) == expected
     assert await core.call("channel.response.finish", params) == expected
+    await asyncio.gather(core.aclose(), runner.aclose())
+
+
+@pytest.mark.asyncio
+async def test_response_finish_missing_identity_is_invalid_params() -> None:
+    """Raw response.finish identity failures retain JSON-RPC classification."""
+    _, core, runner = await _active_rpc_pair()
+    for missing_field in ("channel_key", "instance_id", "generation"):
+        params: dict[str, Any] = {
+            **_identity(),
+            "response_handle": "rpc-response",
+            "outcome": "completed",
+        }
+        params.pop(missing_field)
+        with pytest.raises(RpcError) as invalid:
+            await core.call("channel.response.finish", params)
+        assert invalid.value.code == JSONRPC_INVALID_PARAMS
+        assert invalid.value.data["reason_code"] == "SCHEMA_MISMATCH"
+        assert invalid.value.data["path"] == [missing_field]
     await asyncio.gather(core.aclose(), runner.aclose())

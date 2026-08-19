@@ -306,7 +306,7 @@ descriptor validator 和聚焦单测机械验证；ADR-035/036 已确认。独�
 
 ### CH-0-004：JSON-RPC 2.0、Schema 和生命周期
 
-- 状态：[-] 实施完成，等待本轮 response lifecycle 扩展的独立 Review
+- 状态：[-] 实施完成，等待本轮审查修复的独立 Review
 
 - [x] 实现 JSON-RPC 2.0 request、response、notification、error 和 cancel。
 - [x] 实现 pending request 上限、request timeout、未知方法和重复 response 处理。
@@ -357,12 +357,12 @@ send/reaction、in-flight delivery、重复 finish、冲突 outcome、恢复 tom
 对应的边界矩阵位于
 `docs/proposals/channel-isolation/CH-0-001_CORE_RUNNER_BOUNDARY.md`；当前聚焦测试命令
 `conda run -n qwenpaw pytest -q tests/unit/channel_isolation/test_ch_0_004_*.py`
-为 `84 passed`，descriptor 回归测试
+为 `90 passed`，descriptor 回归测试
 为 `48 passed`，framing 回归测试
 `tests/unit/channel_isolation/test_ch_0_003_transport.py` 为 `15 passed`，相邻可靠性测试
 `tests/unit/channel_isolation/test_ch_0_005_reliability.py` 为 `13 passed`，
 `tests/unit/channel_isolation/test_ch_0_006_bootstrap.py` 为 `20 passed`，
-`conda run -n qwenpaw pytest -q tests/unit/channel_isolation` 为 `283 passed`；目标文件
+`conda run -n qwenpaw pytest -q tests/unit/channel_isolation` 为 `289 passed`；目标文件
 pre-commit 全部通过（包括 mypy、black、flake8 和 pylint），`git diff --check` 通过。
 实现与历次修复提交为 `95836112`、`26958f06`、`339766f7`、`4cd74739`、
 `220aef20`、`85ed4907`、`deddbb65`、`f26d76a1`、`b4ab6c86`、`2ee4eecd`、
@@ -386,7 +386,17 @@ publication 边界延后到后台线程完成完整 HANDLE 写入，并让所有
 写入失败路径幂等收敛为 `unknown`。回归测试覆盖 Windows 零进展写入不建立 ACK/target，
 以及 prepare 等锁期间关闭 transport 后移除 attempt、清除 stream busy 标记且不推进
 sequence。
-此前修复提交 `59becc9a` 的独立 Review 已通过（用户确认）；本轮扩展后需重新 Review。
+此前修复提交 `59becc9a` 的独立 Review 已通过（用户确认）。对 `71230928` 的独立 Review
+发现 closed tombstone 恢复会丢失待重试 cleanup、endpoint hook 可在 Core 权威 registry
+撤销前阻塞、`response.finish` 缺失 identity 会泄露 `KeyError`，以及重构破坏 lifecycle
+模块旧导入路径。本轮已让 tombstone 恢复显式携带 cleanup 完成事实且缺省保守重试；Core
+endpoint registry 的正式解析统一校验 generation、active lease 和绝对 expiry，并在
+quiesce/stop/failed 或 lease expiry 后立即不可路由且清除撤销记录，平台 unregister hook
+继续保持锁外有界/best-effort；缺失 identity 现在返回带字段 path 的
+`JSONRPC_INVALID_PARAMS`；`lifecycle` 通过惰性 re-export 保留旧导入契约。回归覆盖 cleanup
+失败后跨 Controller 恢复重试、unregister RPC 发出前阻塞、stop 返回后路由不可见、lease
+到期但 health 尚未执行、三个缺失 identity 字段的真实 RPC envelope 和旧模块导入路径。
+本轮修复后仍需重新独立 Review。
 
 本轮依据 ADR-037 和 Design §7.3、§7.4、§11.0、§14.1 扩展 response lifecycle：新增
 `response_lifecycle` capability、`InboundEvent.response_handle` 和

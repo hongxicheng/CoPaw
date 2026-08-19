@@ -8,7 +8,7 @@ import time
 from contextlib import asynccontextmanager
 from collections.abc import AsyncIterator
 from enum import StrEnum
-from typing import Any, Callable, Mapping
+from typing import TYPE_CHECKING, Any, Callable, Mapping
 
 from .errors import (
     PlatformAuthenticationError,
@@ -44,6 +44,9 @@ from .outbound import (
     ResponseStateError,
 )
 from .rpc import RpcPeer, RpcResponsePublication, request_was_cancelled
+
+if TYPE_CHECKING:
+    from .host import CoreLifecycleAdapter, HostStateStore
 
 RPC_LIFECYCLE_ERROR = -32010
 RPC_FENCING_ERROR = -32011
@@ -508,8 +511,10 @@ class LifecycleController:
         self,
         response_handle: str,
         outcome: ResponseOutcome | None = None,
+        *,
+        cleanup_complete: bool = False,
     ) -> None:
-        """Restore an active scope or a closed tombstone from Driver state."""
+        """Restore Driver state with explicit cleanup completion evidence."""
         handle = validate_response_handle(response_handle)
         async with self._lock:
             self._check_response_capability()
@@ -519,7 +524,11 @@ class LifecycleController:
                 RunnerState.ACTIVE,
             )
             try:
-                self._response_scopes.restore(handle, outcome)
+                self._response_scopes.restore(
+                    handle,
+                    outcome,
+                    cleanup_complete=cleanup_complete,
+                )
             except ResponseStateError as exc:
                 raise self._response_error_from_state(exc) from exc
 
@@ -1299,9 +1308,20 @@ class LifecycleController:
         )
 
 
+def __getattr__(name: str) -> Any:
+    """Resolve pre-refactor Core host exports without a circular import."""
+    if name in {"CoreLifecycleAdapter", "HostStateStore"}:
+        from . import host
+
+        return getattr(host, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 __all__ = [
     "LifecycleController",
+    "CoreLifecycleAdapter",
     "FixtureSecretHandleConsumer",
+    "HostStateStore",
     "ResponseOutcome",
     "RPC_AUTH_ERROR",
     "RPC_FENCING_ERROR",

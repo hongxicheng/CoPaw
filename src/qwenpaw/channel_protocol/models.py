@@ -1822,7 +1822,7 @@ class ResponseFinishParams(IdentityParams):
         )
         identity = IdentityParams.from_mapping(
             {
-                key: data[key]
+                key: _required(data, key)
                 for key in ("channel_key", "instance_id", "generation")
             },
         )

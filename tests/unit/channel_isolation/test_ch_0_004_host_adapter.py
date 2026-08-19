@@ -76,6 +76,19 @@ def test_rpc_method_registration_preserves_owner_direction() -> None:
     assert core.methods.isdisjoint(runner.methods)
 
 
+def test_lifecycle_module_preserves_host_imports() -> None:
+    """The pre-refactor lifecycle import path remains compatible."""
+    from qwenpaw.channel_protocol.lifecycle import (
+        CoreLifecycleAdapter as LegacyCoreLifecycleAdapter,
+    )
+    from qwenpaw.channel_protocol.lifecycle import (
+        HostStateStore as LegacyHostStateStore,
+    )
+
+    assert LegacyCoreLifecycleAdapter is CoreLifecycleAdapter
+    assert LegacyHostStateStore is HostStateStore
+
+
 @pytest.mark.asyncio
 async def test_endpoint_and_host_state_require_active_generation() -> None:
     """Endpoint exposure and host writes honor standby and active fencing."""
@@ -448,7 +461,10 @@ async def test_lease_expiry_removes_core_endpoint_registry() -> None:
     await controller.endpoint_register(endpoint)
     await adapter.endpoint_register(endpoint)
     assert adapter.endpoints[7] == endpoint
+    assert adapter.resolve_endpoint(7) == endpoint
     clock.now = 1011
+    assert adapter.resolve_endpoint(7) is None
+    assert not adapter.endpoints
     await controller.health(IdentityParams.from_mapping(_identity()))
     await asyncio.wait_for(unregistered.wait(), timeout=0.1)
     assert controller.state is RunnerState.FAILED
@@ -460,22 +476,25 @@ async def test_lease_expiry_removes_core_endpoint_registry() -> None:
 async def test_shutdown_detaches_endpoint_before_blocked_hook(
     operation: str,
 ) -> None:
-    """Endpoint cleanup cannot delay lifecycle fencing or Core removal."""
+    """Core routing is fenced before a blocked unregister RPC can run."""
     clock = Clock()
     hook_started = asyncio.Event()
+    release_hook = asyncio.Event()
+    core_unregistered = asyncio.Event()
     adapter: CoreLifecycleAdapter
 
     async def blocked_hook(
         hook_operation: str,
         _: EndpointParams | None,
     ) -> None:
-        """Model external unregister cleanup with no natural deadline."""
+        """Block before the Runner can issue endpoint.unregister."""
         if hook_operation == "unregister":
+            hook_started.set()
+            await release_hook.wait()
             await adapter.endpoint_unregister(
                 IdentityParams.from_mapping(_identity()),
             )
-            hook_started.set()
-            await asyncio.Future()
+            core_unregistered.set()
 
     controller = LifecycleController(
         channel_key="voice",
@@ -492,6 +511,7 @@ async def test_shutdown_detaches_endpoint_before_blocked_hook(
     await controller.endpoint_register(_endpoint())
     await adapter.endpoint_register(_endpoint())
     assert adapter.endpoints
+    assert adapter.resolve_endpoint(7) == _endpoint()
     if operation == "quiesce":
         result = await asyncio.wait_for(
             controller.quiesce(
@@ -510,7 +530,12 @@ async def test_shutdown_detaches_endpoint_before_blocked_hook(
         assert result["state"] == "stopped"
     await asyncio.wait_for(hook_started.wait(), timeout=0.1)
     assert controller.endpoint is None
+    assert not core_unregistered.is_set()
     assert not adapter.endpoints
+    assert adapter.resolve_endpoint(7) is None
+    release_hook.set()
+    if operation == "stop":
+        await asyncio.wait_for(core_unregistered.wait(), timeout=0.1)
 
 
 @pytest.mark.asyncio

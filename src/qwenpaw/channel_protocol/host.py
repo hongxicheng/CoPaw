@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import Any
+from typing import Any, Callable
 
 from .errors import ProtocolValidationError, RpcError
 from .lifecycle import (
@@ -103,6 +103,45 @@ class HostStateStore:
             self._values.pop(key, None)
 
 
+class CoreEndpointRegistry:
+    """Keep Core-owned endpoints behind generation route authorization."""
+
+    def __init__(
+        self,
+        route_state: Callable[[int], tuple[bool, bool]],
+    ) -> None:
+        self._route_state = route_state
+        self._entries: dict[int, EndpointParams] = {}
+
+    def register(self, endpoint: EndpointParams) -> None:
+        """Store one generation endpoint without making it routable early."""
+        self._entries[endpoint.generation] = endpoint
+
+    def unregister(self, generation: int) -> None:
+        """Idempotently remove one generation endpoint."""
+        self._entries.pop(generation, None)
+
+    def resolve(self, generation: int) -> EndpointParams | None:
+        """Return only an endpoint whose generation is currently routable."""
+        endpoint = self._entries.get(generation)
+        if endpoint is None:
+            return None
+        routable, revoked = self._route_state(generation)
+        if revoked:
+            self._entries.pop(generation, None)
+            return None
+        return endpoint if routable else None
+
+    def snapshot(self) -> dict[int, EndpointParams]:
+        """Return a copy containing only currently routable endpoints."""
+        snapshot: dict[int, EndpointParams] = {}
+        for generation in tuple(self._entries):
+            endpoint = self.resolve(generation)
+            if endpoint is not None:
+                snapshot[generation] = endpoint
+        return snapshot
+
+
 # Package-internal lifecycle guards intentionally cross this module boundary.
 # pylint: disable=protected-access
 class CoreLifecycleAdapter:
@@ -120,7 +159,38 @@ class CoreLifecycleAdapter:
         self.host_state_store = host_state_store or HostStateStore()
         self.delivery_ledger = delivery_ledger or OutboundDeliveryLedger()
         self.inbound_inbox = inbound_inbox or InboundInbox()
-        self.endpoints: dict[int, EndpointParams] = {}
+        self._endpoint_registry = CoreEndpointRegistry(
+            self._generation_is_routable,
+        )
+
+    @property
+    def endpoints(self) -> dict[int, EndpointParams]:
+        """Return an immutable-by-copy view of authorized Core routes."""
+        return self._endpoint_registry.snapshot()
+
+    def resolve_endpoint(self, generation: int) -> EndpointParams | None:
+        """Resolve one route after lifecycle, lease, and generation fencing."""
+        return self._endpoint_registry.resolve(generation)
+
+    def _generation_is_routable(self, generation: int) -> tuple[bool, bool]:
+        """Return current route authorization and irreversible revocation."""
+        controller = self.controller
+        revoked = generation != controller.generation or controller.state in {
+            RunnerState.QUIESCING,
+            RunnerState.STOPPED,
+            RunnerState.FAILED,
+        }
+        if revoked:
+            return False, True
+        active = (
+            controller.state is RunnerState.ACTIVE
+            and controller.lease_token is not None
+        )
+        expires_at = controller.lease_expires_at_ms
+        if not active or expires_at is None:
+            return False, False
+        expired = controller._clock_ms() >= expires_at
+        return not expired, expired
 
     def register_rpc_methods(self, peer: RpcPeer) -> None:
         """Register Core-owned Runner-to-Core methods."""
@@ -245,7 +315,7 @@ class CoreLifecycleAdapter:
                     "external endpoint requires authentication",
                     data={"reason_code": "AUTH_FAILED"},
                 )
-            self.endpoints[params.generation] = params
+            self._endpoint_registry.register(params)
             return {
                 "status": "registered",
                 "generation": params.generation,
@@ -267,7 +337,7 @@ class CoreLifecycleAdapter:
             params,
             capability="ingress_endpoint",
         ):
-            self.endpoints.pop(params.generation, None)
+            self._endpoint_registry.unregister(params.generation)
             return {
                 "status": "unregistered",
                 "generation": params.generation,

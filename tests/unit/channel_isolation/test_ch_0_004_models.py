@@ -278,6 +278,26 @@ def test_response_scope_dtos_and_opaque_handle_validation() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "missing_field",
+    ["channel_key", "instance_id", "generation"],
+)
+def test_response_finish_requires_complete_identity(
+    missing_field: str,
+) -> None:
+    """Missing response identity fields use stable schema errors."""
+    payload = {
+        **_identity(),
+        "response_handle": "response-1",
+        "outcome": "completed",
+    }
+    payload.pop(missing_field)
+    with pytest.raises(ProtocolValidationError) as exc_info:
+        ResponseFinishParams.from_mapping(payload)
+    assert exc_info.value.reason_code == "SCHEMA_MISMATCH"
+    assert exc_info.value.path == (missing_field,)
+
+
 def test_outbound_result_is_closed_terminal_and_bound_to_delivery() -> None:
     """Outbound results expose only stable terminal delivery fields."""
     result = OutboundResult.from_mapping(

@@ -585,8 +585,12 @@ class ResponseScopeRegistry:
         self,
         response_handle: str,
         outcome: ResponseOutcome | None,
+        *,
+        cleanup_complete: bool = False,
     ) -> None:
-        """Restore one active scope or closed tombstone."""
+        """Restore a scope, conservatively leaving cleanup retryable."""
+        if outcome is None and cleanup_complete:
+            raise ValueError("an active response scope has no cleanup state")
         scope = self._scopes.get(response_handle)
         if scope is not None:
             if scope.outcome != outcome:
@@ -594,11 +598,13 @@ class ResponseScopeRegistry:
                     "RESPONSE_OUTCOME_CONFLICT",
                     "response scope outcome conflicts with restored state",
                 )
+            if cleanup_complete:
+                scope.cleanup_complete = True
             return
         self._ensure_capacity()
         self._scopes[response_handle] = _ResponseScope(
             outcome=outcome,
-            cleanup_complete=outcome is not None,
+            cleanup_complete=cleanup_complete,
         )
 
     def discard(self, response_handle: str) -> None:
