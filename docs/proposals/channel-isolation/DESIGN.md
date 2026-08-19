@@ -670,6 +670,17 @@ endpoint 的路由登记必须在 quiesce/stop/lease fencing 的生命周期临�
 best-effort 语义约束，不得延迟状态转换。drain cohort 使用绝对 monotonic deadline；一旦
 deadline 到达，即使 attempt 正在等待生命周期锁，也不得再提交 ACK、target 或 sequence。
 
+Core endpoint registry 必须持有独立于 Runner 进程状态的 route authorization，不能通过
+共享 `LifecycleController` 或其他同进程对象推断正式路由。Core 在调用 prepare 前暂存
+candidate admission，使 Runner 可在 prepare 内登记本地 endpoint；prepare 失败或取消时必须
+删除该 candidate。activate 成功后记录 provisional lease；只有 `channel.commit` 成功返回
+active generation 后才授权该 generation。Core 发起 `channel.quiesce` 或 `channel.stop` 时，
+必须在调用 Runner RPC 前同步撤销 authorization；RPC 超时、失败或 Runner 断联均不得恢复。
+Core 时钟观察到 lease expiry 或新的 generation commit 时也必须同步撤销旧 generation。
+generation 一旦因 quiesce、stop、lease expiry 或 generation replacement 被撤销，迟到的
+endpoint register/update/unregister 或 lease renew 不得重新授权；只有新的有效 generation
+完成唯一 commit 才能建立新的 authorization。
+
 provisional lease 不单列为生命周期状态；Runner 在收到 `channel.commit` 前仍对外表现为
 `standby`。它可以完成连接预热和资源准备，但不能绑定正式 ingress、消费平台事件或
 调用会产生外部副作用的平台 API。
@@ -718,6 +729,13 @@ Runner 通过 `ingress.endpoint.register` 向 Core 报告监听协议、host、p
 代理只把正式流量路由到 committed active generation。`endpoint.update` 用于端口、public
 URL 或健康状态变化，`endpoint.unregister` 用于 quiesce/stop。endpoint DTO 不包含 secret，
 public URL 也不作为跨边界的凭证使用。
+
+正式路由条件冻结为：generation 等于 Core 当前 authorized generation、authorization 为
+active、Core 时钟尚未到 lease expiry、`readiness == "ready"` 且 `quiescing == false`。
+`starting` endpoint 可以作为 candidate 提前登记但不接收正式流量；`degraded` 保留诊断信息
+但不接收正式流量；`stopped` 和 `ready && quiescing` 同样不可路由。未发生 lifecycle revoke
+时，endpoint update 回 `ready && !quiescing` 可以恢复路由；generation 已撤销后，同
+generation 的健康更新不能恢复 authorization。
 
 endpoint DTO 还必须携带**绑定暴露面和鉴权要求**，这来自 OneBot 已经落地的安全不变量：它
 默认绑定 `127.0.0.1`，并把“是否要求鉴权”从绑定地址推导出来（非 loopback 绑定即强制要求
@@ -2042,3 +2060,4 @@ Core Channel、runner-process Channel 和 legacy Plugin Channel 混合运行、�
 | ADR-035 | v1 标识使用带唯一 string escape 和 finite decimal 的受限 canonical JSON、domain separator + NUL、完整 SHA-256 和稳定前缀；逻辑 ID 与 `dir1_` 磁盘目录键分离，目录 manifest 保留并核对完整逻辑 ID；platform tag 必须属于版本化 release target registry | 已确认 |
 | ADR-036 | v1 descriptor 使用 closed object、显式空值和字段级 required/nullable/secret/condition 语义；Requirement 在 digest 前统一 canonicalize，重复折叠且拒绝 `extra` marker；condition domain 必须有限；`config_fields` 是支持 number 的 UI 投影，完整 value schema 仍由 Pydantic/JSON Schema 或 plugin artifact schema 负责；身份声明可引用 secret 字段但 secret value 仅在 Core 内比较；静态读取不得 import 平台模块；process mode 唯一派生驱动接口 | 已确认 |
 | ADR-037 | request-scoped response 的终止由 Core 通过可重试、幂等的 `channel.response.finish` 显式通知 Runner；不得由 message、stream 或 delivery ACK 推断。Runner 以有界 closed tombstone 保持关闭单调性，并在线性化边界上与在途出站操作排序 | 已确认 |
+| ADR-038 | Core 独立持有 endpoint route authorization；只有 committed generation 的 `ready && !quiescing` endpoint 可接收正式流量。quiesce/stop 在 Runner RPC 前撤销，lease expiry 和 generation replacement 单调 fencing，迟到 register/update/renew 不得复活旧 generation | 已确认 |

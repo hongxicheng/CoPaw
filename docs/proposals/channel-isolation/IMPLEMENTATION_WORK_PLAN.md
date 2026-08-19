@@ -355,15 +355,16 @@ send/reaction、in-flight delivery、重复 finish、冲突 outcome、恢复 tom
 `test_ch_0_004_lifecycle.py`、`test_ch_0_004_host_adapter.py`、
 `test_ch_0_004_outbound.py` 和 `test_ch_0_004_response_lifecycle.py`，Design 7.3
 对应的边界矩阵位于
-`docs/proposals/channel-isolation/CH-0-001_CORE_RUNNER_BOUNDARY.md`；当前聚焦测试命令
+`docs/proposals/channel-isolation/CH-0-001_CORE_RUNNER_BOUNDARY.md`；`e987a202` 复审前的
+聚焦测试命令
 `conda run -n qwenpaw pytest -q tests/unit/channel_isolation/test_ch_0_004_*.py`
 为 `90 passed`，descriptor 回归测试
 为 `48 passed`，framing 回归测试
 `tests/unit/channel_isolation/test_ch_0_003_transport.py` 为 `15 passed`，相邻可靠性测试
 `tests/unit/channel_isolation/test_ch_0_005_reliability.py` 为 `13 passed`，
 `tests/unit/channel_isolation/test_ch_0_006_bootstrap.py` 为 `20 passed`，
-`conda run -n qwenpaw pytest -q tests/unit/channel_isolation` 为 `289 passed`；目标文件
-pre-commit 全部通过（包括 mypy、black、flake8 和 pylint），`git diff --check` 通过。
+`conda run -n qwenpaw pytest -q tests/unit/channel_isolation` 当时为 `289 passed`；目标文件
+pre-commit 当时全部通过（包括 mypy、black、flake8 和 pylint），`git diff --check` 通过。
 实现与历次修复提交为 `95836112`、`26958f06`、`339766f7`、`4cd74739`、
 `220aef20`、`85ed4907`、`deddbb65`、`f26d76a1`、`b4ab6c86`、`2ee4eecd`、
 `9fcc9058`、`5c53ff7b` 和 `59becc9a`。
@@ -398,6 +399,18 @@ quiesce/stop/failed 或 lease expiry 后立即不可路由且清除撤销记录�
 到期但 health 尚未执行、三个缺失 identity 字段的真实 RPC envelope 和旧模块导入路径。
 本轮修复后仍需重新独立 Review。
 
+对 `e987a202` 的复审发现 Core endpoint fencing 仍通过同进程共享
+`LifecycleController` 推断 Runner 状态，且正式路由忽略 endpoint `readiness` 与
+`quiescing`。本轮按 ADR-038 将 endpoint candidate、Core lease 和 route authorization
+收敛为独立 Core-owned registry，并提供真实 Core 控制调用使用的薄 lifecycle client：
+prepare 前暂存 candidate admission 且失败回滚，commit 成功后才授权；quiesce/stop 在
+`peer.call()` 前单调 revoke，RPC 超时、失败和迟到 register/update/renew 均不复活旧
+generation；lease expiry 完全按 Core 时钟 fencing。正式路由只允许 committed generation
+的 `ready && !quiescing` endpoint，starting/degraded/stopped 仅保留候选或诊断状态。
+回归使用独立 Core/Runner Controller 和真实双向 `RpcPeer` 覆盖 commit 前不可见、RPC
+阻塞/超时前撤销、延迟 unregister、Core lease expiry、readiness 组合、健康恢复和新旧
+generation 竞态。
+
 本轮依据 ADR-037 和 Design §7.3、§7.4、§11.0、§14.1 扩展 response lifecycle：新增
 `response_lifecycle` capability、`InboundEvent.response_handle` 和
 `channel.response.finish`；Runner scope 仅在显式 finish 后进入 closed tombstone，
@@ -417,10 +430,10 @@ admission closure；平台 handler、endpoint hook 和 transport I/O 均在锁�
 拆分；重构前后既有 collection 均为 `83`，另新增 endpoint register hook 锁外重入回归后为
 `84`。
 
-当前聚焦测试为 `84 passed`；CH-0-001～CH-0-007 相关矩阵为 `192 passed`；
-`tests/unit/channel_isolation` 为 `283 passed`；飞书相邻 unit/contract 为
-`184 passed, 1 skipped`。目标文件 pre-commit（含 mypy、black、flake8、pylint）通过，
-`git diff --check` 通过；本任务等待独立 Review，未标记完成。
+当前唯一验证证据：CH-0-004 聚焦测试 `100 passed`；
+`tests/unit/channel_isolation` 为 `299 passed`；CH-0-005、CH-0-007、飞书 unit/contract
+相邻矩阵为 `198 passed, 1 skipped`。改动文件 pre-commit（包含 mypy、black、flake8 和
+pylint）通过，`git diff --check` 通过。CH-0-004 保持 `[-]`，等待重新独立 Review。
 
 ### CH-0-005：可靠事件、ACK 和幂等原型
 

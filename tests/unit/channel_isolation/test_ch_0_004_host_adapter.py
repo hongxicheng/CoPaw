@@ -7,12 +7,14 @@ from __future__ import annotations
 
 import asyncio
 import math
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
 from qwenpaw.channel_protocol import (
+    CoreEndpointRegistry,
     CoreLifecycleAdapter,
+    CoreLifecycleClient,
     EndpointParams,
     EventBatchParams,
     HostStateParams,
@@ -25,6 +27,7 @@ from qwenpaw.channel_protocol import (
     QuiesceParams,
     RpcError,
     RpcPeer,
+    RpcTimeoutError,
     RunnerState,
     SendParams,
 )
@@ -40,6 +43,52 @@ from tests.unit.channel_isolation._ch_0_004_support import (
     _transport_pair,
     activate_outbound_controller,
 )
+
+
+def _prepare_params(generation: int = 7) -> PrepareParams:
+    """Return the prepared endpoint capability set for one generation."""
+    return PrepareParams.from_mapping(
+        {
+            **_identity(generation=generation),
+            "host_context": {},
+            "capabilities": ["ingress_endpoint"],
+        },
+    )
+
+
+def _lease_params(
+    *,
+    generation: int = 7,
+    token: str = "route-lease",
+    ttl_ms: int = 100,
+) -> LeaseParams:
+    """Return a Core route lease fixture."""
+    return LeaseParams.from_mapping(
+        {
+            **_identity(generation=generation),
+            "lease_token": token,
+            "lease_ttl_ms": ttl_ms,
+        },
+    )
+
+
+def _authorize_registry(
+    registry: CoreEndpointRegistry,
+    *,
+    generation: int = 7,
+    token: str = "route-lease",
+    ttl_ms: int = 100,
+) -> LeaseParams:
+    """Prepare, lease, and commit one Core-owned route generation."""
+    lease = _lease_params(
+        generation=generation,
+        token=token,
+        ttl_ms=ttl_ms,
+    )
+    registry.prepare(_prepare_params(generation))
+    registry.activate(lease)
+    registry.commit(lease)
+    return lease
 
 
 def test_rpc_method_registration_preserves_owner_direction() -> None:
@@ -176,45 +225,43 @@ async def test_mock_core_runner_completes_control_lifecycle() -> None:
     runner = RpcPeer(right_transport)
     controller = _controller(clock)
     controller.register_rpc_methods(runner)
-    adapter = CoreLifecycleAdapter(controller)
+    adapter = CoreLifecycleAdapter(controller, clock_ms=clock)
     adapter.register_rpc_methods(core)
+    lifecycle = adapter.lifecycle_client(core)
     await core.start()
     await runner.start()
 
     hello = await runner.call("runner.hello", _hello().to_mapping())
     assert hello["protocol_version"] == 1
-    prepared = await core.call(
-        "channel.prepare",
-        PrepareParams.from_mapping(
-            {
-                **_identity(),
-                "host_context": {},
-                "capabilities": [
-                    "host_state",
-                    "ingress_endpoint",
-                    "media",
-                ],
-            },
-        ).to_mapping(),
+    prepare = PrepareParams.from_mapping(
+        {
+            **_identity(),
+            "host_context": {},
+            "capabilities": [
+                "host_state",
+                "ingress_endpoint",
+                "media",
+            ],
+        },
     )
+    prepared = await lifecycle.prepare(prepare)
     assert prepared["state"] == "standby"
     lease = LeaseParams.from_mapping(
         {**_identity(), "lease_token": "rpc-token", "lease_ttl_ms": 100},
     )
-    assert (await core.call("channel.activate", lease.to_mapping()))[
-        "state"
-    ] == "standby"
-    assert (await core.call("channel.commit", lease.to_mapping()))[
-        "state"
-    ] == "active"
+    assert (await lifecycle.activate(lease))["state"] == "standby"
+    assert (await lifecycle.commit(lease))["state"] == "active"
     assert (await core.call("channel.health", _identity()))[
         "consuming"
     ] is True
-    renewed = await core.call(
-        "channel.lease_renew",
+    renewed = await lifecycle.lease_renew(
         LeaseParams.from_mapping(
-            {**_identity(), "lease_token": "rpc-token", "lease_ttl_ms": 100},
-        ).to_mapping(),
+            {
+                **_identity(),
+                "lease_token": "rpc-token",
+                "lease_ttl_ms": 100,
+            },
+        ),
     )
     assert renewed["consuming"] is True
     endpoint = EndpointParams.from_mapping(
@@ -254,9 +301,251 @@ async def test_mock_core_runner_completes_control_lifecycle() -> None:
         IdentityParams.from_mapping(_identity()).to_mapping(),
     )
     assert not adapter.endpoints
-    assert (await core.call("channel.stop", _identity()))["state"] == "stopped"
+    assert (await lifecycle.stop(IdentityParams.from_mapping(_identity())))[
+        "state"
+    ] == "stopped"
     await core.aclose()
     await runner.aclose()
+
+
+@pytest.mark.asyncio
+async def test_core_route_authority_is_independent_from_runner_state() -> None:
+    """Core fencing does not read the separate Runner controller object."""
+    clock = Clock()
+    left_transport, right_transport = _transport_pair()
+    core = RpcPeer(left_transport)
+    runner = RpcPeer(right_transport)
+    runner_controller = _controller(clock)
+    core_controller = _controller(clock)
+    runner_controller.accept_hello(_hello())
+    runner_controller.register_rpc_methods(runner)
+    registry = CoreEndpointRegistry(
+        channel_key="voice",
+        instance_id="instance-1",
+        clock_ms=clock,
+    )
+    adapter = CoreLifecycleAdapter(
+        core_controller,
+        endpoint_registry=registry,
+    )
+    adapter.register_rpc_methods(core)
+    lifecycle = adapter.lifecycle_client(core)
+    await core.start()
+    await runner.start()
+    try:
+        await runner.call("runner.hello", _hello().to_mapping())
+        prepare = _prepare_params()
+        await lifecycle.prepare(prepare)
+        await runner.call(
+            "ingress.endpoint.register",
+            _endpoint().to_mapping(),
+        )
+        assert adapter.resolve_endpoint(7) is None
+        lease = _lease_params()
+        await lifecycle.activate(lease)
+        assert adapter.resolve_endpoint(7) is None
+        await lifecycle.commit(lease)
+        assert runner_controller.state is RunnerState.ACTIVE
+        assert core_controller.state is RunnerState.CREATED
+        assert adapter.resolve_endpoint(7) == _endpoint()
+        await lifecycle.quiesce(
+            QuiesceParams.from_mapping(
+                {**_identity(), "drain_timeout_ms": 10},
+            ),
+        )
+        assert runner_controller.state is RunnerState.QUIESCING
+        assert core_controller.state is RunnerState.CREATED
+        assert adapter.resolve_endpoint(7) is None
+        await runner.call(
+            "ingress.endpoint.unregister",
+            IdentityParams.from_mapping(_identity()).to_mapping(),
+        )
+        assert adapter.resolve_endpoint(7) is None
+    finally:
+        await core.aclose()
+        await runner.aclose()
+
+
+@pytest.mark.asyncio
+async def test_control_timeout_keeps_generation_revoked() -> None:
+    """A failed control RPC cannot restore a route revoked before send."""
+    clock = Clock()
+    registry = CoreEndpointRegistry(
+        channel_key="voice",
+        instance_id="instance-1",
+        clock_ms=clock,
+    )
+    lease = _authorize_registry(registry)
+    registry.register(_endpoint())
+
+    class TimeoutPeer:
+        """Fail after observing the pre-call Core fencing boundary."""
+
+        async def call(
+            self,
+            method: str,
+            _: object,
+            *,
+            timeout: float | None = None,
+        ) -> object:
+            _ = timeout
+            assert method == "channel.stop"
+            assert registry.resolve(7) is None
+            raise RpcTimeoutError("stop timed out")
+
+    lifecycle = CoreLifecycleClient(cast(RpcPeer, TimeoutPeer()), registry)
+    with pytest.raises(RpcTimeoutError):
+        await lifecycle.stop(IdentityParams.from_mapping(_identity()))
+    assert registry.resolve(7) is None
+    with pytest.raises(RpcError) as renew_error:
+        registry.renew(lease)
+    assert renew_error.value.data["reason_code"] == "GENERATION_REVOKED"
+
+
+@pytest.mark.asyncio
+async def test_real_rpc_timeout_keeps_generation_revoked() -> None:
+    """The exported Core call path fences before a real blocked RPC."""
+    clock = Clock()
+    hook_started = asyncio.Event()
+
+    async def blocked_unregister(
+        operation: str,
+        _: EndpointParams | None,
+    ) -> None:
+        """Keep quiesce inside the Runner after Core sends the request."""
+        if operation == "unregister":
+            hook_started.set()
+            await asyncio.Event().wait()
+
+    left_transport, right_transport = _transport_pair()
+    core = RpcPeer(left_transport)
+    runner = RpcPeer(right_transport)
+    controller = LifecycleController(
+        channel_key="voice",
+        instance_id="instance-1",
+        generation=7,
+        environment_spec_id="ches1_" + "1" * 64,
+        environment_id="ches1_" + "1" * 64 + ".install1_" + "2" * 32,
+        capabilities=("ingress_endpoint",),
+        endpoint_handler=blocked_unregister,
+        clock_ms=clock,
+    )
+    controller.accept_hello(_hello())
+    controller.register_rpc_methods(runner)
+    registry = CoreEndpointRegistry(
+        channel_key="voice",
+        instance_id="instance-1",
+        clock_ms=clock,
+    )
+    adapter = CoreLifecycleAdapter(
+        _controller(clock),
+        endpoint_registry=registry,
+    )
+    adapter.register_rpc_methods(core)
+    lifecycle = adapter.lifecycle_client(core)
+    await core.start()
+    await runner.start()
+    try:
+        await lifecycle.prepare(_prepare_params())
+        lease = _lease_params()
+        await lifecycle.activate(lease)
+        await lifecycle.commit(lease)
+        await controller.endpoint_register(_endpoint())
+        await adapter.endpoint_register(_endpoint())
+        assert adapter.resolve_endpoint(7) == _endpoint()
+        with pytest.raises(RpcTimeoutError):
+            await lifecycle.quiesce(
+                QuiesceParams.from_mapping(
+                    {**_identity(), "drain_timeout_ms": 1000},
+                ),
+                timeout=0.01,
+            )
+        await asyncio.wait_for(hook_started.wait(), timeout=0.1)
+        assert adapter.resolve_endpoint(7) is None
+        with pytest.raises(RpcError) as update_error:
+            await adapter.endpoint_update(_endpoint())
+        assert update_error.value.data["reason_code"] == "GENERATION_REVOKED"
+    finally:
+        await core.aclose()
+        await runner.aclose()
+
+
+@pytest.mark.parametrize(
+    ("readiness", "quiescing", "expected"),
+    [
+        ("starting", False, False),
+        ("ready", False, True),
+        ("degraded", False, False),
+        ("stopped", False, False),
+        ("ready", True, False),
+    ],
+)
+def test_endpoint_readiness_controls_formal_routing(
+    readiness: str,
+    quiescing: bool,
+    expected: bool,
+) -> None:
+    """Only ready, non-quiescing endpoints accept formal traffic."""
+    clock = Clock()
+    registry = CoreEndpointRegistry(
+        channel_key="voice",
+        instance_id="instance-1",
+        clock_ms=clock,
+    )
+    _authorize_registry(registry)
+    endpoint = EndpointParams.from_mapping(
+        {
+            **_endpoint().to_mapping(),
+            "readiness": readiness,
+            "quiescing": quiescing,
+        },
+    )
+    registry.register(endpoint)
+    assert (registry.resolve(7) is not None) is expected
+
+
+def test_ready_update_recovers_only_before_lifecycle_revoke() -> None:
+    """Health updates recover routes, but lifecycle fencing is monotonic."""
+    clock = Clock()
+    registry = CoreEndpointRegistry(
+        channel_key="voice",
+        instance_id="instance-1",
+        clock_ms=clock,
+    )
+    _authorize_registry(registry)
+    degraded = EndpointParams.from_mapping(
+        {**_endpoint().to_mapping(), "readiness": "degraded"},
+    )
+    registry.register(degraded)
+    assert registry.resolve(7) is None
+    registry.register(_endpoint())
+    assert registry.resolve(7) == _endpoint()
+    registry.revoke(7)
+    with pytest.raises(RpcError) as update_error:
+        registry.register(_endpoint())
+    assert update_error.value.data["reason_code"] == "GENERATION_REVOKED"
+
+
+def test_new_generation_commit_fences_late_old_updates() -> None:
+    """A newer commit prevents old generation traffic from returning."""
+    clock = Clock()
+    registry = CoreEndpointRegistry(
+        channel_key="voice",
+        instance_id="instance-1",
+        clock_ms=clock,
+    )
+    _authorize_registry(registry)
+    registry.register(_endpoint())
+    _authorize_registry(registry, generation=8, token="next-lease")
+    next_endpoint = EndpointParams.from_mapping(
+        {**_endpoint().to_mapping(), **_identity(generation=8)},
+    )
+    registry.register(next_endpoint)
+    assert registry.resolve(7) is None
+    assert registry.resolve(8) == next_endpoint
+    with pytest.raises(RpcError) as old_update:
+        registry.register(_endpoint())
+    assert old_update.value.data["reason_code"] == "GENERATION_REVOKED"
 
 
 @pytest.mark.asyncio
@@ -394,81 +683,24 @@ async def test_response_handle_requires_capability_at_event_boundary() -> None:
 
 @pytest.mark.asyncio
 async def test_lease_expiry_removes_core_endpoint_registry() -> None:
-    """Lease fencing also revokes Core routing state."""
+    """Core-clock expiry fences routing without Runner health polling."""
     clock = Clock()
-    adapter: CoreLifecycleAdapter
-    unregistered = asyncio.Event()
-
-    async def unregister_core_endpoint(
-        operation: str,
-        _: EndpointParams | None,
-    ) -> None:
-        """Model the Runner-to-Core unregister RPC client."""
-        if operation == "unregister":
-            await adapter.endpoint_unregister(
-                IdentityParams.from_mapping(_identity()),
-            )
-            unregistered.set()
-
-    controller = LifecycleController(
+    registry = CoreEndpointRegistry(
         channel_key="voice",
         instance_id="instance-1",
-        generation=7,
-        environment_spec_id="ches1_" + "1" * 64,
-        environment_id="ches1_" + "1" * 64 + ".install1_" + "2" * 32,
-        capabilities=(
-            "host_state",
-            "ingress_endpoint",
-            "media",
-        ),
-        endpoint_handler=unregister_core_endpoint,
         clock_ms=clock,
     )
-    adapter = CoreLifecycleAdapter(controller)
-    controller.accept_hello(_hello())
-    await controller.prepare(
-        PrepareParams.from_mapping(
-            {
-                **_identity(),
-                "host_context": {},
-                "capabilities": [
-                    "host_state",
-                    "ingress_endpoint",
-                    "media",
-                ],
-            },
-        ),
-    )
-    lease = LeaseParams.from_mapping(
-        {**_identity(), "lease_token": "expire", "lease_ttl_ms": 10},
-    )
-    await controller.activate(lease)
-    await controller.commit(lease)
-    endpoint = EndpointParams.from_mapping(
-        {
-            **_identity(),
-            "protocol": "http",
-            "host": "127.0.0.1",
-            "port": 8080,
-            "path": "/voice",
-            "public_base_url": None,
-            "readiness": "ready",
-            "bound_externally": False,
-            "auth_required": False,
-            "quiescing": False,
-        },
-    )
-    await controller.endpoint_register(endpoint)
-    await adapter.endpoint_register(endpoint)
-    assert adapter.endpoints[7] == endpoint
-    assert adapter.resolve_endpoint(7) == endpoint
+    lease = _authorize_registry(registry, token="expire", ttl_ms=10)
+    registry.register(_endpoint())
+    assert registry.resolve(7) == _endpoint()
     clock.now = 1011
-    assert adapter.resolve_endpoint(7) is None
-    assert not adapter.endpoints
-    await controller.health(IdentityParams.from_mapping(_identity()))
-    await asyncio.wait_for(unregistered.wait(), timeout=0.1)
-    assert controller.state is RunnerState.FAILED
-    assert not adapter.endpoints
+    assert registry.resolve(7) is None
+    with pytest.raises(RpcError) as renew_error:
+        registry.renew(lease)
+    assert renew_error.value.data["reason_code"] == "GENERATION_REVOKED"
+    with pytest.raises(RpcError) as register_error:
+        registry.register(_endpoint())
+    assert register_error.value.data["reason_code"] == "GENERATION_REVOKED"
 
 
 @pytest.mark.asyncio
@@ -476,66 +708,58 @@ async def test_lease_expiry_removes_core_endpoint_registry() -> None:
 async def test_shutdown_detaches_endpoint_before_blocked_hook(
     operation: str,
 ) -> None:
-    """Core routing is fenced before a blocked unregister RPC can run."""
+    """Core revoke precedes a blocked Runner control request."""
     clock = Clock()
-    hook_started = asyncio.Event()
-    release_hook = asyncio.Event()
-    core_unregistered = asyncio.Event()
-    adapter: CoreLifecycleAdapter
-
-    async def blocked_hook(
-        hook_operation: str,
-        _: EndpointParams | None,
-    ) -> None:
-        """Block before the Runner can issue endpoint.unregister."""
-        if hook_operation == "unregister":
-            hook_started.set()
-            await release_hook.wait()
-            await adapter.endpoint_unregister(
-                IdentityParams.from_mapping(_identity()),
-            )
-            core_unregistered.set()
-
-    controller = LifecycleController(
+    registry = CoreEndpointRegistry(
         channel_key="voice",
         instance_id="instance-1",
-        generation=7,
-        environment_spec_id="ches1_" + "1" * 64,
-        environment_id="ches1_" + "1" * 64 + ".install1_" + "2" * 32,
-        capabilities=("ingress_endpoint",),
-        endpoint_handler=blocked_hook,
         clock_ms=clock,
     )
-    adapter = CoreLifecycleAdapter(controller)
-    await activate_outbound_controller(controller, ["ingress_endpoint"])
-    await controller.endpoint_register(_endpoint())
-    await adapter.endpoint_register(_endpoint())
-    assert adapter.endpoints
-    assert adapter.resolve_endpoint(7) == _endpoint()
+    _authorize_registry(registry)
+    registry.register(_endpoint())
+    entered = asyncio.Event()
+
+    class BlockingPeer:
+        """Assert route fencing before blocking one control RPC."""
+
+        async def call(
+            self,
+            method: str,
+            _: object,
+            *,
+            timeout: float | None = None,
+        ) -> object:
+            _ = timeout
+            assert method == f"channel.{operation}"
+            assert registry.resolve(7) is None
+            entered.set()
+            await asyncio.Event().wait()
+            raise AssertionError("blocking call unexpectedly resumed")
+
+    lifecycle = CoreLifecycleClient(
+        cast(RpcPeer, BlockingPeer()),
+        registry,
+    )
     if operation == "quiesce":
-        result = await asyncio.wait_for(
-            controller.quiesce(
+        request = asyncio.create_task(
+            lifecycle.quiesce(
                 QuiesceParams.from_mapping(
                     {**_identity(), "drain_timeout_ms": 10},
                 ),
             ),
-            timeout=0.1,
         )
-        assert result["state"] == "quiescing"
     else:
-        result = await asyncio.wait_for(
-            controller.stop(IdentityParams.from_mapping(_identity())),
-            timeout=0.1,
+        request = asyncio.create_task(
+            lifecycle.stop(IdentityParams.from_mapping(_identity())),
         )
-        assert result["state"] == "stopped"
-    await asyncio.wait_for(hook_started.wait(), timeout=0.1)
-    assert controller.endpoint is None
-    assert not core_unregistered.is_set()
-    assert not adapter.endpoints
-    assert adapter.resolve_endpoint(7) is None
-    release_hook.set()
-    if operation == "stop":
-        await asyncio.wait_for(core_unregistered.wait(), timeout=0.1)
+    await asyncio.wait_for(entered.wait(), timeout=0.1)
+    assert registry.resolve(7) is None
+    request.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await request
+    with pytest.raises(RpcError) as update_error:
+        registry.register(_endpoint())
+    assert update_error.value.data["reason_code"] == "GENERATION_REVOKED"
 
 
 @pytest.mark.asyncio
@@ -566,10 +790,8 @@ async def test_endpoint_unregister_hook_can_reenter_lifecycle() -> None:
         endpoint_handler=reentrant_hook,
         clock_ms=clock,
     )
-    adapter = CoreLifecycleAdapter(controller)
     await activate_outbound_controller(controller, ["ingress_endpoint"])
     await controller.endpoint_register(_endpoint())
-    await adapter.endpoint_register(_endpoint())
     result = await asyncio.wait_for(
         controller.quiesce(
             QuiesceParams.from_mapping(

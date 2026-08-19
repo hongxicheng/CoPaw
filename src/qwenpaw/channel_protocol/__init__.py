@@ -27,7 +27,12 @@ from .lifecycle import (
     LifecycleController,
     RunnerState,
 )
-from .host import CoreLifecycleAdapter, HostStateStore
+from .host import (
+    CoreEndpointRegistry,
+    CoreLifecycleAdapter,
+    CoreLifecycleClient,
+    HostStateStore,
+)
 from .models import (
     ApprovalCardParams,
     ApprovalSeverity,
@@ -163,7 +168,9 @@ __all__ = [
     "OutboundOperation",
     "OutboundResult",
     "LifecycleController",
+    "CoreEndpointRegistry",
     "CoreLifecycleAdapter",
+    "CoreLifecycleClient",
     "FixtureSecretHandleConsumer",
     "HostStateStore",
     "PrepareParams",
