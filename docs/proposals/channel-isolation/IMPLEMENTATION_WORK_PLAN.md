@@ -476,6 +476,18 @@ epoch、跨 client token 复制、未绑定 client 控制和第二次 prepare。
 `185 passed, 1 skipped`。改动文件 pre-commit（包含 mypy、black、flake8 和 pylint）通过，
 `git diff --check` 通过。未运行全仓测试和真实 Windows/Linux/macOS 跨进程测试。
 
+对 `ef7a35b6` 的复审发现 `CoreLifecycleClient.peer` 仍可被重新赋值，使旧 control
+capability 可能向错误 Runner 发送 stop/quiesce；authority 同时保留了无 capability 的
+`revoke_for_shutdown` 旁路。本轮将 client 固定为构造时不可替换的 peer binding，并把
+nonce、control capability 和 binding lock 收敛为该 client 的私有可变状态；shutdown
+只允许经过 peer-bound client，authority 不再提供无 token revoke 入口。既有测试旁路已
+全部迁移到真实 `CoreLifecycleClient` 控制路径，回归验证 peer 替换在 Runner RPC 前被拒绝，
+且 stop 只到达原始 peer。CH-0-004 继续保持 `[-]`，等待独立 Review。本轮当前唯一验证
+证据：CH-0-004 聚焦测试 `133 passed`；`tests/unit/channel_isolation` 为 `332 passed`；
+CH-0-007 与飞书 unit/contract 相邻矩阵为 `185 passed, 1 skipped`。改动文件 pre-commit
+（包含 mypy、black、flake8 和 pylint）通过，`git diff --check` 通过。未运行全仓测试和
+真实 Windows/Linux/macOS 跨进程测试。
+
 ### CH-0-005：可靠事件、ACK 和幂等原型
 
 - 状态：[x] 独立 Review 和最终验证通过

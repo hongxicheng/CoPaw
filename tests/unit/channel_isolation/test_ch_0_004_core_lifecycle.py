@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import FrozenInstanceError
 from typing import Awaitable, Callable, cast
 
 import pytest
@@ -98,6 +99,10 @@ def _runner_result(method: str, generation: int) -> dict[str, object]:
         return {"state": "standby", "generation": generation}
     if method == "channel.lease_renew":
         return {"state": "active", "generation": generation}
+    if method == "channel.quiesce":
+        return {"state": "quiescing", "generation": generation}
+    if method == "channel.stop":
+        return {"state": "stopped", "generation": generation}
     raise AssertionError(f"unexpected lifecycle method: {method}")
 
 
@@ -548,7 +553,12 @@ async def test_ready_update_recovers_only_before_lifecycle_revoke() -> None:
         instance_id="instance-1",
         clock_ms=clock,
     )
-    await _authorize_registry(registry)
+    lifecycle = CoreLifecycleClient(
+        cast(RpcPeer, _ScriptedPeer(7)),
+        registry.authority,
+        registry.prune,
+    )
+    await _activate_client(lifecycle)
     degraded = EndpointParams.from_mapping(
         {**_endpoint().to_mapping(), "readiness": "degraded"},
     )
@@ -556,9 +566,7 @@ async def test_ready_update_recovers_only_before_lifecycle_revoke() -> None:
     assert registry.resolve(7) is None
     registry.register(_endpoint())
     assert registry.resolve(7) == _endpoint()
-    await registry.authority.revoke_for_shutdown(
-        IdentityParams.from_mapping(_identity()),
-    )
+    await lifecycle.stop(IdentityParams.from_mapping(_identity()))
     with pytest.raises(RpcError) as update_error:
         registry.register(_endpoint())
     assert update_error.value.data["reason_code"] == "GENERATION_REVOKED"
@@ -866,12 +874,49 @@ async def test_control_token_cannot_move_between_clients() -> None:
         registry.authority,
         registry.prune,
     )
-    setattr(other, "_control_token", getattr(owner, "_control_token"))
+    owner_state = vars(owner)["_state"]
+    other_state = vars(other)["_state"]
+    other_state.control_token = owner_state.control_token
     with pytest.raises(RpcError) as error:
         await other.stop(IdentityParams.from_mapping(_identity()))
     assert error.value.data["reason_code"] == "GENERATION_UNKNOWN"
     assert registry.authority.snapshot.active is not None
     assert registry.authority.snapshot.active.generation == 7
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["stop", "quiesce"])
+async def test_control_client_peer_cannot_be_replaced(
+    operation: str,
+) -> None:
+    """A control capability remains bound to its construction peer."""
+    registry = CoreEndpointRegistry(
+        channel_key="voice",
+        instance_id="instance-1",
+    )
+    peer_a = _ScriptedPeer(7)
+    peer_b = _ScriptedPeer(7)
+    lifecycle = CoreLifecycleClient(
+        cast(RpcPeer, peer_a),
+        registry.authority,
+        registry.prune,
+    )
+    await _activate_client(lifecycle)
+
+    with pytest.raises(FrozenInstanceError):
+        setattr(lifecycle, "peer", cast(RpcPeer, peer_b))
+
+    if operation == "stop":
+        await lifecycle.stop(IdentityParams.from_mapping(_identity()))
+    else:
+        await lifecycle.quiesce(
+            QuiesceParams.from_mapping(
+                {**_identity(), "drain_timeout_ms": 10},
+            ),
+        )
+    method = f"channel.{operation}"
+    assert peer_a.calls.count(method) == 1
+    assert method not in peer_b.calls
 
 
 @pytest.mark.asyncio
@@ -934,24 +979,36 @@ async def test_invalid_shutdown_identity_does_not_revoke_or_call_runner(
 @pytest.mark.asyncio
 async def test_late_commit_result_cannot_cross_shutdown_fencing() -> None:
     """A commit response arriving after stop cannot authorize its slot."""
-    authority = CoreGenerationAuthority(
+    registry = CoreEndpointRegistry(
         channel_key="voice",
         instance_id="instance-1",
     )
-    prepare = _prepare_params()
-    prepare_token = await authority.prepare_start(prepare)
-    await authority.prepare_complete(prepare_token)
-    lease = _lease_params()
-    activate_token = await authority.activate_start(lease)
-    await authority.activate_complete(activate_token, lease)
-    commit_token = await authority.commit_start(lease)
-    await authority.revoke_for_shutdown(
-        IdentityParams.from_mapping(_identity()),
+    commit_entered = asyncio.Event()
+    release_commit = asyncio.Event()
+
+    async def delayed_commit() -> object:
+        """Return commit only after shutdown fences its candidate."""
+        commit_entered.set()
+        await release_commit.wait()
+        return _runner_result("channel.commit", 7)
+
+    peer = _ScriptedPeer(7, {"channel.commit": delayed_commit})
+    lifecycle = CoreLifecycleClient(
+        cast(RpcPeer, peer),
+        registry.authority,
+        registry.prune,
     )
+    await lifecycle.prepare(_prepare_params())
+    lease = _lease_params()
+    await lifecycle.activate(lease)
+    commit = asyncio.create_task(lifecycle.commit(lease))
+    await asyncio.wait_for(commit_entered.wait(), timeout=0.1)
+    await lifecycle.stop(IdentityParams.from_mapping(_identity()))
+    release_commit.set()
     with pytest.raises(RpcError) as error:
-        await authority.commit_complete(commit_token, lease)
+        await commit
     assert error.value.data["reason_code"] == "GENERATION_REVOKED"
-    assert authority.snapshot.active is None
+    assert registry.authority.snapshot.active is None
 
 
 @pytest.mark.asyncio
@@ -1193,8 +1250,12 @@ async def test_core_authority_error_matrix_is_stable() -> None:
     assert identity_error.value.code == -32011
     assert identity_error.value.data["reason_code"] == "CHANNEL_KEY_MISMATCH"
 
+    lifecycle = CoreLifecycleClient(
+        cast(RpcPeer, _ScriptedPeer(8)),
+        authority,
+    )
     with pytest.raises(RpcError) as unknown_error:
-        await authority.revoke_for_shutdown(
+        await lifecycle.stop(
             IdentityParams.from_mapping(_identity(generation=8)),
         )
     assert unknown_error.value.code == -32011

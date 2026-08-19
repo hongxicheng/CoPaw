@@ -400,14 +400,6 @@ class CoreGenerationAuthority:
             slot.operation = None
             self._publish()
 
-    def _revoke_for_shutdown(self, params: IdentityParams) -> None:
-        """Validate identity and revoke before a shutdown RPC."""
-        self._check_identity(params)
-        slot = self._slot(params.generation)
-        if slot is None:
-            raise self.generation_error(params.generation)
-        self._revoke_slot(slot)
-
     def _issue_control_token(
         self,
         slot: _Slot,
@@ -663,11 +655,6 @@ class CoreGenerationAuthority:
         async with self._lock:
             self._renew_complete(token, params)
 
-    async def revoke_for_shutdown(self, params: IdentityParams) -> None:
-        """Fence one valid generation before contacting Runner."""
-        async with self._lock:
-            self._revoke_for_shutdown(params)
-
     async def control_shutdown(
         self,
         params: IdentityParams,
@@ -685,30 +672,47 @@ class CoreGenerationAuthority:
 
 
 @dataclass
-class CoreLifecycleClient:
-    """Linearize Core authority with Core-to-Runner control calls."""
+class _CoreClientState:
+    """Retain mutable control state for one immutable peer binding."""
 
-    peer: RpcPeer
+    client_nonce: object = field(default_factory=object)
+    control_token: _CoreControlToken | None = None
+    binding_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+
+@dataclass(frozen=True, init=False)
+class CoreLifecycleClient:
+    """Linearize Core authority with one immutable Runner peer."""
+
+    _peer: RpcPeer = field(repr=False, compare=False)
     authority: CoreGenerationAuthority
-    prune_endpoints: Callable[[], None] | None = None
-    _client_nonce: object = field(
-        default_factory=object,
-        init=False,
-        repr=False,
-        compare=False,
-    )
-    _control_token: _CoreControlToken | None = field(
+    prune_endpoints: Callable[[], None] | None = field(
         default=None,
+        repr=False,
+        compare=False,
+    )
+    _state: _CoreClientState = field(
+        default_factory=_CoreClientState,
         init=False,
         repr=False,
         compare=False,
     )
-    _binding_lock: asyncio.Lock = field(
-        default_factory=asyncio.Lock,
-        init=False,
-        repr=False,
-        compare=False,
-    )
+
+    def __init__(
+        self,
+        peer: RpcPeer,
+        authority: CoreGenerationAuthority,
+        prune_endpoints: Callable[[], None] | None = None,
+    ) -> None:
+        object.__setattr__(self, "_peer", peer)
+        object.__setattr__(self, "authority", authority)
+        object.__setattr__(self, "prune_endpoints", prune_endpoints)
+        object.__setattr__(self, "_state", _CoreClientState())
+
+    @property
+    def peer(self) -> RpcPeer:
+        """Return the immutable Runner peer bound at construction."""
+        return self._peer
 
     def _prune_endpoints(self) -> None:
         """Discard endpoint records outside the two authority slots."""
@@ -737,14 +741,14 @@ class CoreLifecycleClient:
         timeout: float | None = None,
     ) -> Any:
         """Stage Core admission around one Runner prepare request."""
-        async with self._binding_lock:
+        async with self._state.binding_lock:
             token, control_token = await self.authority.control_start(
                 "prepare",
                 params,
-                self._control_token,
-                self._client_nonce,
+                self._state.control_token,
+                self._state.client_nonce,
             )
-            self._control_token = control_token
+            self._state.control_token = control_token
         self._prune_endpoints()
         try:
             result = await self.peer.call(
@@ -776,8 +780,8 @@ class CoreLifecycleClient:
         token, _ = await self.authority.control_start(
             "activate",
             params,
-            self._control_token,
-            self._client_nonce,
+            self._state.control_token,
+            self._state.client_nonce,
         )
         try:
             result = await self.peer.call(
@@ -809,8 +813,8 @@ class CoreLifecycleClient:
         token, _ = await self.authority.control_start(
             "commit",
             params,
-            self._control_token,
-            self._client_nonce,
+            self._state.control_token,
+            self._state.client_nonce,
         )
         try:
             result = await self.peer.call(
@@ -842,8 +846,8 @@ class CoreLifecycleClient:
         token, _ = await self.authority.control_start(
             "renew",
             params,
-            self._control_token,
-            self._client_nonce,
+            self._state.control_token,
+            self._state.client_nonce,
         )
         try:
             result = await self.peer.call(
@@ -875,8 +879,8 @@ class CoreLifecycleClient:
         """Revoke formal routing before asking Runner to quiesce."""
         await self.authority.control_shutdown(
             params,
-            self._control_token,
-            self._client_nonce,
+            self._state.control_token,
+            self._state.client_nonce,
         )
         self._prune_endpoints()
         return await self.peer.call(
@@ -894,8 +898,8 @@ class CoreLifecycleClient:
         """Revoke formal routing before asking Runner to stop."""
         await self.authority.control_shutdown(
             params,
-            self._control_token,
-            self._client_nonce,
+            self._state.control_token,
+            self._state.client_nonce,
         )
         self._prune_endpoints()
         return await self.peer.call(

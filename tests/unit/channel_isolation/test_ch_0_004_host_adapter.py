@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import math
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -70,6 +70,36 @@ def _lease_params(
             "lease_ttl_ms": ttl_ms,
         },
     )
+
+
+class _LifecyclePeer:
+    """Return valid lifecycle responses for Core control-path tests."""
+
+    def __init__(self, generation: int = 7) -> None:
+        self.generation = generation
+        self.calls: list[str] = []
+
+    async def call(
+        self,
+        method: str,
+        _: object,
+        *,
+        timeout: float | None = None,
+    ) -> object:
+        """Record one control call and return its Runner state."""
+        _ = timeout
+        self.calls.append(method)
+        if method == "channel.commit":
+            return {
+                "state": "active",
+                "generation": self.generation,
+                "consuming": True,
+            }
+        if method in {"channel.prepare", "channel.activate"}:
+            return {"state": "standby", "generation": self.generation}
+        if method == "channel.stop":
+            return {"state": "stopped", "generation": self.generation}
+        raise AssertionError(f"unexpected lifecycle method: {method}")
 
 
 async def _authorize_registry(
@@ -174,6 +204,8 @@ async def test_endpoint_and_host_state_require_active_generation() -> None:
     clock = Clock()
     controller = _controller(clock)
     adapter = CoreLifecycleAdapter(controller)
+    peer = _LifecyclePeer()
+    lifecycle = adapter.lifecycle_client(cast(RpcPeer, peer))
     prepare = PrepareParams.from_mapping(
         {
             **_identity(),
@@ -185,8 +217,7 @@ async def test_endpoint_and_host_state_require_active_generation() -> None:
             ],
         },
     )
-    prepare_token = await adapter.authority.prepare_start(prepare)
-    await adapter.authority.prepare_complete(prepare_token)
+    await lifecycle.prepare(prepare)
     endpoint = EndpointParams.from_mapping(
         {
             **_identity(),
@@ -206,8 +237,7 @@ async def test_endpoint_and_host_state_require_active_generation() -> None:
     lease = LeaseParams.from_mapping(
         {**_identity(), "lease_token": "opaque", "lease_ttl_ms": 100},
     )
-    activate_token = await adapter.authority.activate_start(lease)
-    await adapter.authority.activate_complete(activate_token, lease)
+    await lifecycle.activate(lease)
     with pytest.raises(RpcError):
         await adapter.endpoint_register(
             EndpointParams.from_mapping(
@@ -219,8 +249,7 @@ async def test_endpoint_and_host_state_require_active_generation() -> None:
                 },
             ),
         )
-    commit_token = await adapter.authority.commit_start(lease)
-    await adapter.authority.commit_complete(commit_token, lease)
+    await lifecycle.commit(lease)
     await adapter.endpoint_register(endpoint)
     state = HostStateParams.from_mapping(
         {
@@ -233,7 +262,7 @@ async def test_endpoint_and_host_state_require_active_generation() -> None:
     assert (await adapter.host_state_put(state))["status"] == "stored"
     assert (await adapter.host_state_get(state))["value"] == {"ok": True}
     assert (await adapter.endpoint_update(endpoint))["status"] == "updated"
-    await adapter.authority.revoke_for_shutdown(
+    await lifecycle.stop(
         IdentityParams.from_mapping(_identity()),
     )
     assert (
@@ -552,11 +581,22 @@ def test_core_authority_must_match_hello_identity() -> None:
 async def test_revoked_authority_rejects_all_formal_host_operations() -> None:
     """Host State, events, and delivery share one revoked Core authority."""
     adapter = CoreLifecycleAdapter(_controller(Clock()))
-    await _authorize_adapter(
-        adapter,
-        capabilities=("host_state", "response_lifecycle"),
+    lifecycle = adapter.lifecycle_client(
+        cast(RpcPeer, _LifecyclePeer()),
     )
-    await adapter.authority.revoke_for_shutdown(
+    await lifecycle.prepare(
+        PrepareParams.from_mapping(
+            {
+                **_identity(),
+                "host_context": {},
+                "capabilities": ["host_state", "response_lifecycle"],
+            },
+        ),
+    )
+    lease = _lease_params()
+    await lifecycle.activate(lease)
+    await lifecycle.commit(lease)
+    await lifecycle.stop(
         IdentityParams.from_mapping(_identity()),
     )
     state = HostStateParams.from_mapping(
@@ -699,18 +739,32 @@ async def test_core_host_state_put_linearizes_before_stop() -> None:
     controller = _controller(clock)
     store = BlockingHostStateStore()
     adapter = CoreLifecycleAdapter(controller, host_state_store=store)
-    await _authorize_adapter(
-        adapter,
-        capabilities=("host_state", "ingress_endpoint", "media"),
-        token="blocked",
+    lifecycle = adapter.lifecycle_client(
+        cast(RpcPeer, _LifecyclePeer()),
     )
+    await lifecycle.prepare(
+        PrepareParams.from_mapping(
+            {
+                **_identity(),
+                "host_context": {},
+                "capabilities": [
+                    "host_state",
+                    "ingress_endpoint",
+                    "media",
+                ],
+            },
+        ),
+    )
+    lease = _lease_params(token="blocked")
+    await lifecycle.activate(lease)
+    await lifecycle.commit(lease)
     params = HostStateParams.from_mapping(
         {**_identity(), "key": "blocked", "value": {"ok": True}},
     )
     write = asyncio.create_task(adapter.host_state_put(params))
     await store.started.wait()
     stop = asyncio.create_task(
-        adapter.authority.revoke_for_shutdown(
+        lifecycle.stop(
             IdentityParams.from_mapping(_identity()),
         ),
     )

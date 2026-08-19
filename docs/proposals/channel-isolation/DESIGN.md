@@ -697,6 +697,9 @@ candidate epoch；该 capability 不进入 wire DTO、checkpoint 或持久状态
 active、prepare abort、candidate replacement 和 retired，直到 client/peer 被释放；authority
 不保存 retired generation 或 capability 历史集合。同一 client 不得再次 prepare 其他 generation
 或 epoch，必须为新 Runner 创建新的 peer-bound client。
+`CoreLifecycleClient` 的 Runner peer 在构造后不可替换；control capability 与该 client/peer
+绑定共同存续。shutdown 的唯一正式入口是该 client 的 stop/quiesce 控制路径，authority
+不得暴露无 capability 的 shutdown revoke 旁路。
 
 stop/quiesce 必须依次校验 channel/instance identity、params generation、authority/client
 binding，再检查当前 slot。slot 仍为 capability 对应的 generation 和 epoch 时先单调 revoke；
