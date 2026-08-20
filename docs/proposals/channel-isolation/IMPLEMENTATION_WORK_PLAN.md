@@ -308,6 +308,37 @@ descriptor validator 和聚焦单测机械验证；ADR-035/036 已确认。独�
 
 - 状态：[x] 独立 Review 和最终验证通过
 
+- [x] 用唯一 Runner route/cleanup aggregate 替换 lifecycle response scope、Driver route
+  tombstone 和 Host State 散落状态；本项与 CH-0-007 飞书基础设施做一次垂直迁移。
+- [x] lifecycle lock 统一线性化 response admission、outbound reservation、finish fence 和
+  in-flight 检查；平台和 Host State I/O 在锁外，既有 response publication 临界区继续持锁到
+  transport 接受或拒绝完整 response frame。
+- [x] resource refs 唯一属于 aggregate，并在 acknowledged publication 前持久化；snapshot
+  失败时 delivery 收敛为 unknown。
+- [x] active route 无 TTL，cleanup pending 不做普通 TTL GC，cleanup complete receipt 从
+  完成时固定保留 24 小时且无运行时覆盖参数；snapshot version 单调且集合确定性排序。
+- [x] Host State shard 分离 desired、durable、dirty 和 settlement；已应用但 response 丢失的
+  put/delete 不会被后续同 shard mutation 回退或复活；首次 provisional open 确定性拒绝时
+  aggregate 与 desired 共同精确回滚，后续同 shard 写入及重启不会恢复幽灵 route。
+- [x] Feishu route Host State 以内部 schema version `1` 作为新 aggregate 首次正式格式；
+  原型未上线，不实现开发期旧 route store 的 v1→v2 迁移或兼容解析。
+- [x] receipt TTL GC 后仅 finish 保证 `RESPONSE_HANDLE_UNKNOWN`；send/reaction 不建立第二套
+  历史 handle fence，Feishu 按普通 target 解析失败且无平台副作用。
+- [x] finish task 只作有界临时协调，等待者取消不取消共享清理，所有终态均清理 task。
+- [x] 删除未上线的 `ResponseScopeRegistry`、scope token、飞书 `_response_deliveries` 和
+  Driver lifecycle/tombstone 判断，不保留兼容 alias。
+- [x] CH-0-004、完整 channel isolation、CH-0-007/飞书相邻测试、目标文件 pre-commit 和
+  `git diff --check` 通过。
+- [x] CH-0-004 冻结 Runner 执行侧 aggregate、drain barrier、closed fence 和协议语义；真实
+  Core per-handle sequencer 作为 CH-2-005 的独立实现项继续验收，不阻塞本任务完成。
+
+本轮唯一当前验证证据：CH-0-004 聚焦矩阵 `139 passed`；完整
+`tests/unit/channel_isolation` 为 `338 passed`；CH-0-007 隔离 suite `42 passed`；旧飞书
+unit/contract 为 `184 passed, 1 skipped`。目标文件 pre-commit 全部通过（包含 mypy、black、
+flake8 和 pylint），`git diff --check` 通过。Runner/飞书垂直迁移已完成；真实 Core
+per-handle sequencer 仍由 CH-2-005 实现和验证，不属于 CH-0-004 的未完成项。本轮独立
+Review 和最终验证已通过（用户确认）。
+
 - [x] 实现 JSON-RPC 2.0 request、response、notification、error 和 cancel。
 - [x] 实现 pending request 上限、request timeout、未知方法和重复 response 处理。
 - [x] 定义 `runner.hello`、`channel.prepare/activate/quiesce/health/stop`、
@@ -445,10 +476,12 @@ finish 后无副作用、busy fencing、清理失败重试、恢复和真实 RPC
 本轮同时完成有边界的内部结构重构：Core-owned `CoreLifecycleAdapter`、Host State 和
 endpoint registry 已迁入 `host.py`，Runner 仅保留本地 endpoint admission 和显式
 unregister hook，Adapter 不再反向写入 Controller 私有 registry callback；delivery、target、
-attempt 和 publication 已收敛到同步、无锁、无 I/O 的 `OutboundDeliveryState`，response
-scope、finish 和 tombstone 独立收敛到 `ResponseScopeRegistry`。Controller 继续唯一拥有
+attempt 和 publication 已收敛到同步、无锁、无 I/O 的 `OutboundDeliveryState`；这是 aggregate
+重构前的历史结构，当前实现已将 response route、finish 和 cleanup 收敛到唯一
+`ResponseRouteAggregate`。Controller 继续唯一拥有
 lifecycle lock、identity、generation、lease、capability、Driver/RPC 编排和 quiesce/stop
-admission closure；平台 handler、endpoint hook 和 transport I/O 均在锁外执行。测试不再
+admission closure；平台 handler 与 endpoint hook 在锁外执行，response publication 保留
+prepare 到完整 frame 接受之间的锁内提交边界。测试不再
 读取 delivery/target/attempt/response 的裸字典，改用 immutable snapshot，并按 ownership
 拆分；重构前后既有 collection 均为 `83`，另新增 endpoint register hook 锁外重入回归后为
 `84`。
@@ -487,7 +520,9 @@ nonce、control capability 和 binding lock 收敛为该 client 的私有可变�
 CH-0-007 与飞书 unit/contract 相邻矩阵为 `185 passed, 1 skipped`。改动文件 pre-commit
 （包含 mypy、black、flake8 和 pylint）通过，`git diff --check` 通过。未运行全仓测试和
 真实 Windows/Linux/macOS 跨进程测试。独立 Review 已通过（用户确认）；最终修复提交为
-`d790fe82`。CH-0-004 已完成，但 G0 仍须单独完成纵向原型、目标平台向量及阶段 Gate 验收。
+`d790fe82`。该结论随后因 response lifecycle 的重复 Runner 状态源被重新打开；当前重构已
+收敛唯一 Runner aggregate 并通过独立 Review，最终状态以本节开头的 `[x]` 和当前验证证据
+为准。真实 Core per-handle sequencer 保持为 CH-2-005 的独立任务。
 
 ### CH-0-005：可靠事件、ACK 和幂等原型
 
@@ -539,7 +574,7 @@ Linux、真实 Windows 和真实 frozen desktop 发布制品验收，这些限�
 
 ### CH-0-007：飞书主动连接原型
 
-- 状态：[-] 初始实现和已确认审查问题修复完成，等待独立 Review 和最终验证
+- 状态：[x] 独立 Review 和最终验证通过
 
 - [x] 以最终 `FeishuDriver` → Runner-safe 飞书平台实现 → `lark-oapi` 生产路径为设计
   中心，从现有飞书实现迁移适合 Runner 边界的平台逻辑，不重新实现第二套平台连接。
@@ -571,37 +606,36 @@ Phase 3 的 durable pending、ACK 丢失重投和 Runner 重启恢复投递仍�
 后续独立 Review 发现同群多个 topic 共用 session alias 时，后入站会覆盖先前在途请求的
 回复目标。修复后 Driver 生成固定长度的不透明
 `feishu:reply:<sha256(event_id)>` handle，并由 mock Host 从 `InboundEvent.response_handle`
-原样保存和回传；`FeishuResponseRouteStore` 以确定性分片 Host State 保存 active route 和
-closed tombstone，在 Runner 重启时恢复 response scope。message、approval、stream、reaction
+原样保存和回传；历史实现曾由 `FeishuResponseRouteStore` 以确定性分片 Host State 保存
+active route 和 closed tombstone；当前实现改为 Host State 仅保存 `ResponseRouteAggregate`
+snapshot，在 Runner 重启时恢复 aggregate。message、approval、stream、reaction
 和 delivery ACK 都不再清理 request route，只有显式 `channel.response.finish` 才关闭并回收
 该 response 的 delivery targets。该请求级路由不改变群聊 session 共享策略，也未扩展
 CH-0-004 closed Schema；主动发送和既有 `feishu:sw:*` session handle 继续兼容。跨
 `host.state.put` 与 `event.batch` 的崩溃原子性和 durable pending/replay 仍归 `CH-3-001`。
 
-实现侧验证：CH-0-007 隔离 suite `38 passed`，普通聚焦入口包含在该隔离命令中；
-`tests/unit/channel_isolation` 为 `332 passed`，旧飞书 unit/contract 为
-`184 passed, 1 skipped`，CH-0-004 response lifecycle/HostAdapter 为 `25 passed`；目标文件
-pre-commit 全部通过（包含 mypy、black、flake8 和 pylint），`git diff --check` 通过。测试覆盖
+本轮垂直迁移的唯一当前验证证据记录在 CH-0-004。CH-0-007 测试覆盖
 两个 Agent 共用同一 `environment_id` 时的独立
 进程、配置、secret、checkpoint、路由和出站状态，Runner 崩溃后新 generation 从 Host
 State 恢复 Core reply，以及 thread reply/checkpoint 恢复、thread streaming fallback、
 同群 topic 顺序/反向完成、同一/不同发送者、多个在途请求 checkpoint 恢复、媒体目标、
 非 thread 群聊、私聊、显式主动发送及 session handle 兼容、半开连接恢复、disconnect/EOF
 有界清理和断连期间 health 可观测性。当前未运行真实飞书
-外部收发、Linux、真实 Windows、frozen desktop 和全仓库测试；这些限制等待独立 Review、
-G0 或发布验证处理，本任务不得据此标记为 `[x]`。
+外部收发、Linux、真实 Windows、frozen desktop 和全仓库测试；这些限制保留给 G0 或发布
+验证，不阻塞本原型任务完成。独立 Review 和最终验证已通过（用户确认）。
 
 #### 原型限制与后续工作
 
-本任务中的 `response_routes.py` 是 CH-0-007 的局部原型，用于验证
-`response_handle` 从 Runner 入站、经 Core 原样传递、再精确解析为飞书回复目标的闭环。
-它不是最终的跨 Channel route 基础设施。当前实现中的确定性分片、单片容量、总条目上限、
-TTL、Host State key 布局、并发读改写和 Driver 本地 delivery 索引，均属于待替换的实现
-选择，不构成 Design、协议或其他 Channel 的约束。
+本任务中的 `response_routes.py` 只负责把共享 `ResponseRouteAggregate` 的版本化 snapshot
+确定性分片到 Host State，并用于验证 `response_handle` 从 Runner 入站、经 Core 原样传递、
+再精确解析为飞书回复目标的闭环。它不维护 active/closed、outcome、cleanup 或 delivery
+索引；分片数量、单片容量和 Host State key 布局仍是 CH-0-007 原型的持久化选择，不构成
+协议或其他 Channel 的约束。
 
-后续 Phase 3 应提供共享 Runner route store，统一 active route、closed tombstone、恢复、
-容量和并发语义，并让 Feishu 迁移到该共享实现。后续 Channel 不得复制
-`response_routes.py` 的完整实现；只应提供平台目标的编码/解码和平台资源清理回调。
+后续 Phase 3 直接复用当前共享 `ResponseRouteAggregate`，补齐 durable pending、ACK 丢失
+重投和 Runner 重启恢复投递，不再建立另一套 route store。后续 Channel 不得复制
+`response_routes.py` 的 Feishu 分片实现；只应提供平台目标编码/解码、checkpoint adapter 和
+平台资源清理回调。
 
 以下问题已明确留给后续阶段，不作为本原型的额外完成条件：
 
@@ -800,6 +834,9 @@ stderr。
 - [ ] Proxy 实现 ChannelManager 所需的兼容方法。
 - [ ] 将 send、typing、reaction、media 转换为 RPC。
 - [ ] 对不支持 capability 返回稳定错误。
+- [ ] 为同一 response handle 提供真实 outbound sequencer：finish 等待所有已准入
+  send/reaction publication 或 unknown settlement，finish 后拒绝新提交，并覆盖 cancel、Core
+  重启、RPC 重连/重排和迟到 response。
 - [ ] 验证 proxy 与 legacy `BaseChannel` 并存。
 
 ### CH-2-006：Descriptor Registry 和实例解析

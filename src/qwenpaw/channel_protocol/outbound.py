@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Synchronous outbound delivery and response-scope state."""
+"""Synchronous outbound delivery and publication state."""
 
 from __future__ import annotations
 
@@ -13,7 +13,6 @@ from .models import (
     OutboundOperation,
     OutboundResult,
     ReactionParams,
-    ResponseOutcome,
     SendParams,
     StreamType,
 )
@@ -69,6 +68,7 @@ class OutboundAttempt:
     publication_send_params: SendParams | None = None
     publication_lock_held: bool = False
     response_handle: str | None = None
+    lifecycle_detached: bool = False
     drain_timer: asyncio.TimerHandle | None = None
     done: asyncio.Event = field(default_factory=asyncio.Event)
 
@@ -233,8 +233,9 @@ class OutboundDeliveryState:
 
     def detach_deferred(self, attempt: OutboundAttempt) -> bool:
         """Stop lifecycle waits while prepared ordering remains private."""
-        if self._attempts.pop(attempt.delivery_id, None) is not attempt:
+        if self._attempts.get(attempt.delivery_id) is not attempt:
             return False
+        attempt.lifecycle_detached = True
         self._clear_timer(attempt)
         attempt.done.set()
         return True
@@ -323,7 +324,11 @@ class OutboundDeliveryState:
     def fence_attempts(self) -> list[OutboundAttempt]:
         """Close the current admission epoch and snapshot in-flight work."""
         self._epoch += 1
-        return list(self._attempts.values())
+        return [
+            attempt
+            for attempt in self._attempts.values()
+            if not attempt.lifecycle_detached
+        ]
 
     def force_unknown(
         self,
@@ -410,7 +415,18 @@ class OutboundDeliveryState:
 
     def inflight_attempts(self) -> tuple[OutboundAttempt, ...]:
         """Return a stable tuple of currently tracked attempts."""
-        return tuple(self._attempts.values())
+        return tuple(
+            attempt
+            for attempt in self._attempts.values()
+            if not attempt.lifecycle_detached
+        )
+
+    def has_inflight_response(self, response_handle: str) -> bool:
+        """Return whether delivery/publication still uses one response."""
+        return any(
+            attempt.response_handle == response_handle
+            for attempt in self._attempts.values()
+        )
 
     @staticmethod
     def parse_result(value: object, delivery_id: str) -> OutboundResult:
@@ -529,227 +545,10 @@ class OutboundDeliveryState:
             attempt.drain_timer = None
 
 
-@dataclass(frozen=True)
-class ResponseScopeSnapshot:
-    """Return immutable response-scope state for tests and diagnostics."""
-
-    response_handle: str
-    outcome: ResponseOutcome | None
-    cleanup_complete: bool
-    inflight_delivery_ids: tuple[str, ...]
-    finish_pending: bool
-
-
-@dataclass(frozen=True)
-class ResponseStateError(Exception):
-    """Describe one stable response-state violation."""
-
-    reason_code: str
-    message: str
-    retryable: bool = False
-
-
-@dataclass
-class _ResponseScope:
-    """Retain one opaque response route and its cleanup state."""
-
-    outcome: ResponseOutcome | None = None
-    cleanup_complete: bool = False
-    inflight_delivery_ids: set[str] = field(default_factory=set)
-    finish_task: asyncio.Task[bool] | None = None
-
-
-class ResponseScopeRegistry:
-    """Manage bounded request-scoped response routes synchronously."""
-
-    def __init__(self, *, max_scopes: int) -> None:
-        if max_scopes <= 0:
-            raise ValueError("max_scopes must be positive")
-        self._max_scopes = max_scopes
-        self._scopes: dict[str, _ResponseScope] = {}
-
-    def open(self, response_handle: str) -> None:
-        """Open one response scope or accept an idempotent retry."""
-        scope = self._scopes.get(response_handle)
-        if scope is not None:
-            if scope.outcome is not None:
-                raise ResponseStateError(
-                    "RESPONSE_CLOSED",
-                    "response scope is already closed",
-                )
-            return
-        self._ensure_capacity()
-        self._scopes[response_handle] = _ResponseScope()
-
-    def restore(
-        self,
-        response_handle: str,
-        outcome: ResponseOutcome | None,
-        *,
-        cleanup_complete: bool = False,
-    ) -> None:
-        """Restore a scope, conservatively leaving cleanup retryable."""
-        if outcome is None and cleanup_complete:
-            raise ValueError("an active response scope has no cleanup state")
-        scope = self._scopes.get(response_handle)
-        if scope is not None:
-            if scope.outcome != outcome:
-                raise ResponseStateError(
-                    "RESPONSE_OUTCOME_CONFLICT",
-                    "response scope outcome conflicts with restored state",
-                )
-            if cleanup_complete:
-                scope.cleanup_complete = True
-            return
-        self._ensure_capacity()
-        self._scopes[response_handle] = _ResponseScope(
-            outcome=outcome,
-            cleanup_complete=cleanup_complete,
-        )
-
-    def discard(self, response_handle: str) -> None:
-        """Discard one rejected scope or Driver-GC'd tombstone."""
-        scope = self._scopes.get(response_handle)
-        if scope is None:
-            return
-        if scope.inflight_delivery_ids:
-            raise ResponseStateError(
-                "RESPONSE_BUSY",
-                "response scope cannot be discarded",
-                retryable=True,
-            )
-        if scope.outcome is not None and not scope.cleanup_complete:
-            raise ResponseStateError(
-                "RESPONSE_BUSY",
-                "response finish cleanup is still pending",
-                retryable=True,
-            )
-        self._scopes.pop(response_handle, None)
-
-    def admit_operation(self, response_handle: str) -> bool:
-        """Admit an operation and report whether its handle is scoped."""
-        scope = self._scopes.get(response_handle)
-        if scope is None:
-            return False
-        if scope.outcome is not None:
-            raise ResponseStateError(
-                "RESPONSE_CLOSED",
-                "response scope is closed",
-            )
-        return True
-
-    def add_inflight(self, response_handle: str, delivery_id: str) -> None:
-        """Link one admitted delivery to an active response scope."""
-        scope = self._scopes.get(response_handle)
-        if scope is not None:
-            scope.inflight_delivery_ids.add(delivery_id)
-
-    def discard_inflight(
-        self,
-        response_handle: str,
-        delivery_id: str,
-    ) -> None:
-        """Remove one settled delivery from its response scope."""
-        scope = self._scopes.get(response_handle)
-        if scope is not None:
-            scope.inflight_delivery_ids.discard(delivery_id)
-
-    def admit_finish(
-        self,
-        response_handle: str,
-        outcome: ResponseOutcome,
-    ) -> object:
-        """Close admission and return the matching cleanup record."""
-        scope = self._scopes.get(response_handle)
-        if scope is None:
-            raise ResponseStateError(
-                "RESPONSE_HANDLE_UNKNOWN",
-                "response handle is unknown",
-            )
-        if scope.outcome is not None and scope.outcome is not outcome:
-            raise ResponseStateError(
-                "RESPONSE_OUTCOME_CONFLICT",
-                "response outcome conflicts with a prior finish",
-            )
-        if scope.inflight_delivery_ids:
-            raise ResponseStateError(
-                "RESPONSE_BUSY",
-                "response has an in-flight delivery",
-                retryable=True,
-            )
-        if scope.outcome is None:
-            scope.outcome = outcome
-        return scope
-
-    def attach_finish_task(
-        self,
-        response_handle: str,
-        scope_token: object,
-        task: asyncio.Task[bool],
-    ) -> None:
-        """Attach the single cleanup task created outside this component."""
-        scope = self._scopes.get(response_handle)
-        if scope is scope_token:
-            scope.finish_task = task
-
-    def settle_finish(
-        self,
-        response_handle: str,
-        scope_token: object,
-        success: bool,
-    ) -> None:
-        """Record one finish-handler settlement."""
-        scope = self._scopes.get(response_handle)
-        if scope is scope_token:
-            scope.finish_task = None
-            scope.cleanup_complete = success
-
-    def snapshot(self, response_handle: str) -> ResponseScopeSnapshot | None:
-        """Return an immutable copy of one response scope."""
-        scope = self._scopes.get(response_handle)
-        if scope is None:
-            return None
-        return ResponseScopeSnapshot(
-            response_handle=response_handle,
-            outcome=scope.outcome,
-            cleanup_complete=scope.cleanup_complete,
-            inflight_delivery_ids=tuple(
-                sorted(scope.inflight_delivery_ids),
-            ),
-            finish_pending=scope.finish_task is not None,
-        )
-
-    @staticmethod
-    def cleanup_complete(scope_token: object) -> bool:
-        """Return whether cleanup already reached its terminal state."""
-        if not isinstance(scope_token, _ResponseScope):
-            raise TypeError("invalid response scope token")
-        return scope_token.cleanup_complete
-
-    @staticmethod
-    def finish_task(scope_token: object) -> asyncio.Task[bool] | None:
-        """Return the cleanup task currently shared by finish retries."""
-        if not isinstance(scope_token, _ResponseScope):
-            raise TypeError("invalid response scope token")
-        return scope_token.finish_task
-
-    def _ensure_capacity(self) -> None:
-        """Keep the in-memory response registry bounded."""
-        if len(self._scopes) >= self._max_scopes:
-            raise ResponseStateError(
-                "RESPONSE_SCOPE_LIMIT",
-                "response scope capacity is exhausted",
-                retryable=True,
-            )
-
-
 __all__ = [
     "OutboundAttempt",
     "OutboundAttemptSnapshot",
     "OutboundDeliveryState",
     "OutboundStateError",
     "OutboundTargetSnapshot",
-    "ResponseScopeRegistry",
-    "ResponseScopeSnapshot",
-    "ResponseStateError",
 ]

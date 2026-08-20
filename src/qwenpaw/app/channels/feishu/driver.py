@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 from collections import OrderedDict
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 import json
 import logging
 from pathlib import Path
@@ -22,15 +23,17 @@ from ....channel_protocol import (
     OutboundOperation,
     PlatformAuthenticationError,
     ReactionParams,
-    ResponseFinishParams,
     SendParams,
 )
 from ....channel_protocol.lifecycle import LifecycleController, RunnerState
+from ....channel_protocol.response_lifecycle import (
+    ResponseResourceRef,
+    RunnerDeliveryResult,
+)
 from .platform import FeishuDeliveryError, LarkOapiPlatform
 from .response_routes import (
+    FeishuResponseRouteCheckpoint,
     FeishuResponseRouteError,
-    FeishuResponseRouteStore,
-    FeishuResponseTarget,
     RESPONSE_HANDLE_PREFIX,
 )
 from .utils import sender_display_string, short_session_id_from_full_id
@@ -45,6 +48,8 @@ _RECEIVE_STATE_MAX_BYTES = 60 * 1024
 _PLATFORM_STOP_TIMEOUT = 6.0
 _CONNECTION_TASK_STOP_TIMEOUT = 1.0
 _PLATFORM_HEALTH_TIMEOUT = 0.5
+_ROUTE_REF_KIND = "feishu.route"
+_DELIVERY_REF_KIND = "feishu.delivery"
 
 
 class FeishuPlatform(Protocol):
@@ -122,7 +127,13 @@ class FeishuPlatform(Protocol):
         ...
 
 
-_ReceiveTarget = FeishuResponseTarget
+@dataclass(frozen=True)
+class _ReceiveTarget:
+    """Describe one Feishu receive target."""
+
+    receive_id_type: str
+    receive_id: str
+    thread_message_id: str = ""
 
 
 class _FeishuLifecycleController(LifecycleController):
@@ -195,7 +206,8 @@ class FeishuDriver:
         reconnect_initial_delay: float = 1.0,
         reconnect_max_delay: float = 60.0,
         connect_timeout: float = 30.0,
-        response_routes: FeishuResponseRouteStore | None = None,
+        response_checkpoint: FeishuResponseRouteCheckpoint | None = None,
+        response_clock_ms: Callable[[], int] | None = None,
     ) -> None:
         self._platform_factory = platform_factory or LarkOapiPlatform
         self._reconnect_initial_delay = reconnect_initial_delay
@@ -208,9 +220,11 @@ class FeishuDriver:
         self._secret: dict[str, str] | None = None
         self._config: dict[str, Any] = {}
         self._receive_ids: OrderedDict[str, _ReceiveTarget] = OrderedDict()
-        self._response_routes = response_routes or FeishuResponseRouteStore()
+        self._response_checkpoint = (
+            response_checkpoint or FeishuResponseRouteCheckpoint()
+        )
+        self._response_clock_ms = response_clock_ms
         self._delivery_targets: dict[str, dict[str, str]] = {}
-        self._response_deliveries: dict[str, set[str]] = {}
         self._connection_task: asyncio.Task[None] | None = None
         self._connection_ready = asyncio.Event()
         self._stop_event = asyncio.Event()
@@ -222,7 +236,7 @@ class FeishuDriver:
         """Bind one task-local Runner session."""
         self._peer = peer
         self._identity = identity
-        self._response_routes.bind(peer, identity)
+        self._response_checkpoint.bind(peer, identity)
 
     def create_lifecycle_controller(
         self,
@@ -242,9 +256,11 @@ class FeishuDriver:
             qwenpaw_version=identity.qwenpaw_version,
             send_handler=self.send,
             reaction_handler=self.reaction,
-            response_finish_handler=self.finish_response,
+            response_checkpoint_put=self._response_checkpoint.put,
+            response_checkpoint_delete=self._response_checkpoint.delete,
             secret_handle_consumer=secret_handle_consumer,
-            max_response_scopes=self._response_routes.max_entries,
+            max_response_routes=self._response_checkpoint.max_entries,
+            response_clock_ms=self._response_clock_ms,
         )
 
     def attach_lifecycle(self, controller: LifecycleController) -> None:
@@ -303,7 +319,8 @@ class FeishuDriver:
             await self._restore_receive_ids()
             lifecycle = self._require_lifecycle()
             if self._response_lifecycle_enabled():
-                await self._response_routes.restore(lifecycle)
+                snapshots = await self._response_checkpoint.load()
+                await lifecycle.restore_response_routes(snapshots)
             self._prepared = True
         except (PlatformAuthenticationError, ValueError):
             raise
@@ -325,7 +342,8 @@ class FeishuDriver:
             return
         lifecycle = self._require_lifecycle()
         if self._response_lifecycle_enabled():
-            await self._response_routes.gc_expired(lifecycle)
+            await lifecycle.gc_response_routes()
+            await lifecycle.resume_response_cleanups()
         self._stop_event.clear()
         self._connection_ready.clear()
         self._connection_task = asyncio.create_task(self._connection_loop())
@@ -454,20 +472,36 @@ class FeishuDriver:
     async def send(  # pylint: disable=too-many-return-statements
         self,
         params: SendParams,
-    ) -> dict[str, Any]:
+    ) -> dict[str, Any] | RunnerDeliveryResult:
         """Map one platform-neutral outbound operation to Feishu."""
         platform = self._require_platform()
         try:
             target = await self._resolve_receive_target(params.to_handle)
+            resource_ref = None
             if params.operation is OutboundOperation.MESSAGE_CREATE:
-                await self._create_delivery(platform, target, params)
+                resource_ref = await self._create_delivery(
+                    platform,
+                    target,
+                    params,
+                )
             elif params.operation is OutboundOperation.STREAM_START:
-                await self._start_delivery_stream(platform, target, params)
+                resource_ref = await self._start_delivery_stream(
+                    platform,
+                    target,
+                    params,
+                )
             else:
-                failure = await self._update_delivery_stream(platform, params)
-                if failure is not None:
-                    return failure
-            return self._acknowledged_result(params.delivery_id)
+                update = await self._update_delivery_stream(platform, params)
+                if isinstance(update, dict):
+                    return update
+                resource_ref = update
+            result = self._acknowledged_result(params.delivery_id)
+            if resource_ref is None:
+                return result
+            return RunnerDeliveryResult(
+                outbound_result=result,
+                resource_refs=(resource_ref,),
+            )
         except FeishuDeliveryError as exc:
             logger.warning(
                 "Feishu delivery failed: %s",
@@ -500,7 +534,7 @@ class FeishuDriver:
         platform: FeishuPlatform,
         target: _ReceiveTarget,
         params: SendParams,
-    ) -> None:
+    ) -> ResponseResourceRef | None:
         if params.approval is not None:
             message_id = await platform.send_approval(
                 target.receive_id_type,
@@ -515,17 +549,15 @@ class FeishuDriver:
                 params.content_parts,
                 reply_message_id=target.thread_message_id,
             )
-        self._delivery_targets[params.delivery_id] = {
-            "message_id": message_id,
-        }
-        self._remember_response_delivery(params)
+        delivery_target = {"message_id": message_id}
+        return self._store_delivery_target(params, delivery_target)
 
     async def _start_delivery_stream(
         self,
         platform: FeishuPlatform,
         target: _ReceiveTarget,
         params: SendParams,
-    ) -> None:
+    ) -> ResponseResourceRef | None:
         if target.thread_message_id:
             stream_target = {
                 "receive_id_type": target.receive_id_type,
@@ -538,16 +570,17 @@ class FeishuDriver:
                 target.receive_id,
                 self._stream_text(params),
             )
-        self._delivery_targets[params.delivery_id] = stream_target
-        self._remember_response_delivery(params)
+        return self._store_delivery_target(params, stream_target)
 
     async def _update_delivery_stream(
         self,
         platform: FeishuPlatform,
         params: SendParams,
-    ) -> dict[str, Any] | None:
-        stream_target = self._delivery_targets.get(
-            params.target_delivery_id or "",
+    ) -> dict[str, Any] | ResponseResourceRef | None:
+        target_delivery_id = params.target_delivery_id or ""
+        stream_target = await self._resolve_delivery_target(
+            params.to_handle,
+            target_delivery_id,
         )
         if stream_target is None:
             return self._failed_result(
@@ -570,7 +603,11 @@ class FeishuDriver:
                     reply_message_id=thread_message_id,
                 )
                 stream_target["message_id"] = message_id
-            return None
+            return self._updated_response_resource(
+                params.to_handle,
+                target_delivery_id,
+                stream_target,
+            )
         updated = await platform.update_stream(
             stream_target,
             self._stream_text(params),
@@ -578,7 +615,11 @@ class FeishuDriver:
             final=final,
         )
         if updated:
-            return None
+            return self._updated_response_resource(
+                params.to_handle,
+                target_delivery_id,
+                stream_target,
+            )
         return self._failed_result(
             params.delivery_id,
             "PLATFORM_SEND_FAILED",
@@ -586,7 +627,10 @@ class FeishuDriver:
 
     async def reaction(self, params: ReactionParams) -> dict[str, Any]:
         """Add the legacy DONE reaction to a sent platform message."""
-        target = self._delivery_targets.get(params.target_delivery_id)
+        target = await self._resolve_delivery_target(
+            params.to_handle,
+            params.target_delivery_id,
+        )
         message_id = target.get("message_id", "") if target else ""
         if not message_id:
             return self._failed_result(
@@ -609,16 +653,54 @@ class FeishuDriver:
                 "PLATFORM_RESULT_UNKNOWN",
             )
 
-    async def finish_response(self, params: ResponseFinishParams) -> None:
-        """Durably close one route and release Driver-owned targets."""
-        await self._response_routes.begin_finish(params)
-        delivery_ids = self._response_deliveries.pop(
-            params.response_handle,
-            set(),
+    def _store_delivery_target(
+        self,
+        params: SendParams,
+        target: Mapping[str, str],
+    ) -> ResponseResourceRef | None:
+        """Store legacy targets or return response-scoped evidence."""
+        value = dict(target)
+        if params.to_handle.startswith(RESPONSE_HANDLE_PREFIX):
+            return self._delivery_ref(params.delivery_id, value)
+        self._delivery_targets[params.delivery_id] = value
+        return None
+
+    async def _resolve_delivery_target(
+        self,
+        response_handle: str,
+        delivery_id: str,
+    ) -> dict[str, str] | None:
+        """Resolve a target from its single owning state component."""
+        if not response_handle.startswith(RESPONSE_HANDLE_PREFIX):
+            return self._delivery_targets.get(delivery_id)
+        resource_ref = await self._require_lifecycle().response_resource_ref(
+            response_handle,
+            delivery_id,
         )
-        for delivery_id in delivery_ids:
-            self._delivery_targets.pop(delivery_id, None)
-        await self._response_routes.complete_finish(params)
+        if resource_ref is None or resource_ref.kind != _DELIVERY_REF_KIND:
+            return None
+        return dict(resource_ref.attributes)
+
+    @staticmethod
+    def _updated_response_resource(
+        response_handle: str,
+        delivery_id: str,
+        target: Mapping[str, str],
+    ) -> ResponseResourceRef | None:
+        if not response_handle.startswith(RESPONSE_HANDLE_PREFIX):
+            return None
+        return FeishuDriver._delivery_ref(delivery_id, target)
+
+    @staticmethod
+    def _delivery_ref(
+        delivery_id: str,
+        target: Mapping[str, str],
+    ) -> ResponseResourceRef:
+        return ResponseResourceRef.create(
+            _DELIVERY_REF_KIND,
+            delivery_id,
+            target,
+        )
 
     async def _handle_platform_message(self, value: object) -> None:
         if not self._can_consume():
@@ -630,16 +712,11 @@ class FeishuDriver:
         if target is None:
             raise RuntimeError("Feishu message response route is unavailable")
         if response_handle is not None:
-            await self._response_routes.gc_expired(lifecycle)
-            await lifecycle.open_response_scope(response_handle)
-            try:
-                await self._response_routes.admit_active(
-                    response_handle,
-                    target,
-                )
-            except Exception:
-                await lifecycle.discard_response_scope(response_handle)
-                raise
+            await lifecycle.gc_response_routes()
+            await lifecycle.open_response_route(
+                response_handle,
+                (self._route_ref(target),),
+            )
         acknowledgement = await self._submit_event(event)
         delivered = (
             event.event_id in acknowledgement.accepted_event_ids
@@ -659,8 +736,7 @@ class FeishuDriver:
                 and rejected is not None
                 and not rejected.retryable
             ):
-                await self._response_routes.rollback_active(response_handle)
-                await lifecycle.discard_response_scope(response_handle)
+                await lifecycle.discard_response_route(response_handle)
             if rejected is not None:
                 logger.warning(
                     "Feishu event rejected reason=%s retryable=%s",
@@ -758,7 +834,7 @@ class FeishuDriver:
             content_parts=parts,
             metadata=metadata,
             response_handle=(
-                self._response_routes.response_handle(event_id)
+                self._response_checkpoint.response_handle(event_id)
                 if self._response_lifecycle_enabled()
                 else None
             ),
@@ -949,7 +1025,14 @@ class FeishuDriver:
     async def _resolve_receive_target(self, to_handle: str) -> _ReceiveTarget:
         value = to_handle.strip()
         if value.startswith(RESPONSE_HANDLE_PREFIX):
-            return await self._response_routes.resolve(value)
+            refs = await self._require_lifecycle().response_route_refs(value)
+            route_ref = next(
+                (item for item in refs if item.kind == _ROUTE_REF_KIND),
+                None,
+            )
+            if route_ref is None:
+                raise KeyError("Feishu response target is unavailable")
+            return self._target_from_resource_ref(route_ref)
         prefixes = {
             "feishu:chat_id:": "chat_id",
             "feishu:open_id:": "open_id",
@@ -984,6 +1067,27 @@ class FeishuDriver:
         if target.thread_message_id:
             value["thread_message_id"] = target.thread_message_id
         return value
+
+    @staticmethod
+    def _route_ref(target: _ReceiveTarget) -> ResponseResourceRef:
+        return ResponseResourceRef.create(
+            _ROUTE_REF_KIND,
+            "route",
+            FeishuDriver._target_value(target),
+        )
+
+    @staticmethod
+    def _target_from_resource_ref(
+        resource_ref: ResponseResourceRef,
+    ) -> _ReceiveTarget:
+        if resource_ref.kind != _ROUTE_REF_KIND:
+            raise KeyError("Feishu response target is unavailable")
+        target = FeishuDriver._target_from_value(
+            dict(resource_ref.attributes),
+        )
+        if target is None:
+            raise KeyError("Feishu response target is unavailable")
+        return target
 
     @staticmethod
     def _target_from_value(value: object) -> _ReceiveTarget | None:
@@ -1024,14 +1128,6 @@ class FeishuDriver:
         """Return whether the negotiated Runner capability is active."""
         lifecycle = self._require_lifecycle()
         return "response_lifecycle" in lifecycle.effective_capabilities
-
-    def _remember_response_delivery(self, params: SendParams) -> None:
-        if not params.to_handle.startswith(RESPONSE_HANDLE_PREFIX):
-            return
-        self._response_deliveries.setdefault(
-            params.to_handle,
-            set(),
-        ).add(params.delivery_id)
 
     @staticmethod
     def _mapping(value: object, label: str) -> Mapping[str, Any]:

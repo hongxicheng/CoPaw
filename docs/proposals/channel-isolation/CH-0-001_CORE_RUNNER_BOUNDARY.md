@@ -231,6 +231,34 @@ Checkpoint import/export is a Driver internal platform capability used during
 `channel.prepare` and `channel.quiesce`; durable checkpoint values use `host.state.*`. There is
 no separate `checkpoint` wire method.
 
+Request-scoped response execution uses one Runner-owned route/cleanup aggregate. The aggregate
+owns the active route or terminal finish receipt, execution-side closed fence, cleanup state,
+and immutable platform resource references. `LifecycleController` owns the sole admission lock
+and RPC orchestration; outbound delivery state owns attempts and publication settlement;
+ChannelDriver only maps platform resources and performs idempotent cleanup. `host.state.*` is
+only the persistence transport for versioned aggregate snapshots and cannot be read or mutated
+as an independent response state machine. Platform I/O and Host State RPC never run while the
+lifecycle lock is held. Existing response publication is the narrow exception: its prepare step
+holds the lifecycle lock until the transport accepts or rejects the complete response frame, so
+finish cannot pass an unsettled ACK publication.
+
+The 24-hour TTL is a protocol constant for cleanup-complete receipts and is not runtime
+configurable. After TTL GC, only `channel.response.finish` is guaranteed to report
+`RESPONSE_HANDLE_UNKNOWN`; send and reaction no longer have response classification state and
+must follow ordinary Driver target resolution without platform side effects for an unresolved
+target. Host State persistence tracks the latest desired full shard independently from the last
+confirmed durable shard. Unknown mutation settlement keeps the shard dirty, and every later
+same-shard mutation rewrites the complete desired projection so a lost response cannot regress a
+newer receipt or revive a deleted handle. A deterministically rejected provisional open restores
+the checkpoint shard to its exact pre-mutation state together with the aggregate rollback. The
+new aggregate Host State format starts at internal schema version 1; no migration layer is kept
+for the unreleased development-only route-store format.
+
+Internal response helper types and methods are not a compatibility surface during the
+pre-release isolation refactor. The wire method, closed DTO, error codes, capability and package
+root exports remain frozen; obsolete `ResponseScopeRegistry` and Driver route-state helpers are
+removed with their callers rather than retained as aliases.
+
 ### IsolatedChannelProxy（Core）
 
 | operation | proxy behavior |

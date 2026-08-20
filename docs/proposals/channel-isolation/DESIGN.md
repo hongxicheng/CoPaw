@@ -600,12 +600,13 @@ Agent 响应是否结束。声明 `response_lifecycle` capability 的 Runner 可
 解析其中的平台 message、thread 或 topic 身份。未协商该 capability 时 Runner 不得发送
 该字段，Core 也不得调用 `channel.response.finish`。
 
-ChannelDriver 在提交带 handle 的 `event.batch` 前，通过 Runner 内部的
-`open_response_scope()` 登记 active scope；该调用不是 RPC，也不产生平台副作用。事件获得
-accepted/duplicate ACK 后保留 scope；永久 rejected 时通过 `discard_response_scope()` 撤销
-尚无在途 delivery 的登记。恢复时 Driver 从自己的有界持久状态重新登记 active route，并
-把尚在 TTL 内的 closed tombstone 注入 lifecycle controller。Core 收到未协商 capability
-却携带 `response_handle` 的事件时，按事件返回不可重试的 `CAPABILITY_REQUIRED` rejection。
+ChannelDriver 在提交带 handle 的 `event.batch` 前，通过 Runner 内部的 response route
+aggregate 登记 active route 及平台 route refs；该调用不是 RPC，也不产生平台副作用。事件
+获得 accepted/duplicate ACK 后保留 route；永久 rejected 时撤销尚无在途 delivery 的登记。
+Runner 只维护这一份 route/cleanup aggregate，Host State 只保存和恢复该 aggregate 的版本化
+快照，不得成为另一套可独立解释的 response 状态。Driver 不得再维护 active/closed、outcome、
+cleanup 或 tombstone 判断。Core 收到未协商 capability 却携带 `response_handle` 的事件时，
+按事件返回不可重试的 `CAPABILITY_REQUIRED` rejection。
 
 `channel.response.finish` 是可靠、幂等的 Core -> Runner request，使用 closed DTO，包含
 共同 identity、`response_handle` 和 `outcome=completed|failed|cancelled`。它表示 Core
@@ -614,24 +615,70 @@ accepted/duplicate ACK 后保留 scope；永久 rejected 时通过 `discard_resp
 card）、`stream.end`、completed reaction 和 delivery `acknowledged` 都只描述各自操作，
 不得隐式关闭 response scope。成功但没有任何出站消息的 response 同样可以 finish。
 
-Runner 为每个 active response scope 保存有界状态，并由 ChannelDriver 的可选 finish
-handler 幂等释放平台 route、typing/card 等资源。关闭使用单调 tombstone，而不是无记录
-删除：同一 handle、同一 outcome 重复 finish 返回成功；冲突 outcome 返回
+Core 是 response 业务生命周期的唯一权威，Runner 不解释 Agent 的 completed、failed 或
+cancelled 结果。Runner 为每个 response 维护唯一、有界的 route/cleanup aggregate，并由
+ChannelDriver 的可选 finish handler 幂等释放平台 route、typing/card 等资源。aggregate 只有
+active route 或 terminal finish receipt 两种形态；terminal receipt 同时提供执行侧 closed
+fence，而不是第二套业务生命周期。关闭保持单调：同一 handle、同一 outcome 重复 finish
+返回成功；冲突 outcome 返回
 `RESPONSE_OUTCOME_CONFLICT`；未知 handle 返回 `RESPONSE_HANDLE_UNKNOWN`；closed handle 上
 的新 `channel.send` 或 `channel.reaction` 返回 `RESPONSE_CLOSED`，且不得调用平台 handler。
-Driver 的持久化清理失败时 scope 仍保持逻辑关闭，返回可重试的
-`RESPONSE_FINISH_FAILED`；相同 outcome 的重试再次执行幂等 handler。Runner 重启只恢复
-active route 和尚在 TTL 内的 closed tombstone，closed tombstone 不得恢复为 active；有界
-TTL GC 之后再次 finish 可以返回 unknown。
+Driver 的持久化或清理失败时 aggregate 仍保持 terminal + cleanup pending，返回可重试的
+`RESPONSE_FINISH_FAILED`；相同 outcome 的重试再次执行幂等 handler。cleanup pending 不受
+普通 TTL 影响，Runner 重启后必须恢复资源引用并重试。只有 cleanup complete receipt 从清理
+完成时开始保留 24 小时，TTL GC 后再次 finish 返回 `RESPONSE_HANDLE_UNKNOWN`；active route
+没有 TTL。pending、active 和未过期 complete receipt 均计入容量，容量耗尽使用既有稳定容量
+错误并提供诊断，不另建 cleanup queue。
 
-finish 与出站操作共享短生命周期临界区，但不得跨平台 handler await 持锁。若 send 或
-reaction 先完成准入，finish 返回可重试的 `RESPONSE_BUSY`，由 Core 在该 attempt 的
-publication settlement 后重试；若 finish 先原子关闭准入，后续操作返回
-`RESPONSE_CLOSED`。in-flight 状态必须持续到 response frame publication 成功或 attempt
-收敛为 failed/timeout/unknown，不能在平台 handler 返回时提前释放。finish handler 在锁外
-执行；同 outcome 的并发 finish 共享同一个幂等清理 attempt，request cancel 或 response
-丢失不会重新开放 scope。所有 open、finish、send 和 reaction 仍受 active state、lease、
-generation 和 identity fencing。
+`RESPONSE_HANDLE_UNKNOWN` 的 TTL 后保证仅属于 `channel.response.finish`。receipt GC 会删除
+Runner 对该 handle 的最后一份 response 分类事实；之后到达的 `channel.send` 或
+`channel.reaction` 不保证返回 response-specific 错误，也不得为此新增历史 handle fence。
+具体 Driver 仍须按普通 target 解析规则拒绝不可解析的 handle，并且不得产生平台副作用。
+同一 event 的重放识别属于 Core Inbox/dedup，不得通过延长 Runner receipt 分类来实现。
+
+Host State checkpoint 对每个 shard 区分最新 desired snapshot、最后确认 durable snapshot
+以及 dirty/settlement。mutation 必须先推进 desired；若远端已应用但 response 丢失、超时、
+取消或断联，checkpoint 保留最新 desired 并标记 unknown，后续同 shard mutation 重写完整
+desired shard，不能从旧 durable 重建。确定性拒绝标记为 rejected，但同样不得静默丢弃
+已被 aggregate 接受的单调状态；相同 snapshot 的后续 open/finish 可以重新 flush dirty
+shard。首次 provisional open 遭确定性拒绝时，aggregate 与 checkpoint desired 必须共同
+回滚到 mutation 前状态，后续同 shard 写入不得带回失败 handle。delete 遵循同一规则，未知
+delete 不得被后续 shard 写入复活。24 小时 receipt TTL 是协议常量，Runner、Controller 和
+Driver checkpoint 均不得提供运行时覆盖参数；测试只能注入时钟。Feishu route Host State
+使用内部 `RESPONSE_ROUTE_STATE_SCHEMA_VERSION=1` 作为新 aggregate 格式的首次正式版本；
+该原型未上线，不为开发期旧 route store 实现 v1→v2 迁移或兼容解析。
+
+response admission、outbound reservation、finish fence 和 in-flight 检查必须在 Runner
+lifecycle lock 的同一个线性化边界内完成；aggregate 和 outbound state 在锁内只执行同步、
+无 I/O 的状态转换。平台 handler 和 Host State RPC 均在锁外执行；response publication
+沿用既有 publication 边界，在 prepare 后持锁到完整 response frame 被 transport 接受，因而
+并发 finish 会等待该 settlement。若 send 或 reaction 已准入但尚未进入 publication 临界区，
+finish 返回可重试的 `RESPONSE_BUSY`；若 finish 先原子关闭准入，后续操作返回
+`RESPONSE_CLOSED`。in-flight 事实只属于 delivery/publication state，并持续到 response frame
+publication 成功或 attempt 收敛为 failed/timeout/unknown，aggregate 不重复保存 delivery
+in-flight set。
+
+平台副作用产生的 response cleanup resource refs 唯一属于 route/cleanup aggregate；delivery
+ledger 只保存 delivery result、attempt、unknown settlement、平台幂等和发送恢复事实，双方
+通过 `delivery_id` 关联，不重复保存同一份可变资源状态。平台 handler 成功后，Runner 必须先
+把 resource refs 写入单调版本的 aggregate snapshot，再允许 acknowledged response publication。
+snapshot 失败时 delivery 收敛为 `unknown`，不得发布 acknowledged。snapshot 成功但 ACK
+publication 失败时 refs 保持可恢复，delivery 仍收敛为 `unknown`。平台成功后、首次 snapshot
+写入前的进程崩溃是平台能力无法查询或按 `delivery_id` 幂等时不可消除的窗口；Runner 不得在
+此情况下声称 ACK 或 cleanup complete。
+
+finish handler 在锁外执行；同 outcome 的并发 finish 共享 Controller 中按 handle 有界的临时
+task，等待者使用 shield，单个等待者取消不得取消共享清理。task 不保存独立 outcome、closed
+或 cleanup 事实，并在成功、失败或取消后移除；重启只恢复 aggregate。finish close snapshot
+失败时当前进程仍保持 closed fence；cleanup 成功但 complete snapshot 失败时不得返回 finish
+成功，后续重试继续执行幂等清理并完成持久化。所有 open、finish、send 和 reaction 仍受
+active state、lease、generation 和 identity fencing。
+
+Core 必须在真实 outbound facade 中为同一 response handle 建立 happens-before：finish 只在
+此前 send/reaction 已完成 publication 或收敛为 unknown 后提交，且 finish 后不再提交新的执行
+请求。该 sequencer 必须覆盖并发、调用方取消、Core 重启、RPC 重连/重排和 unknown settlement；
+在该调用路径由 `IsolatedChannelProxy` 实现前，Runner 的 `RESPONSE_BUSY`、in-flight barrier 和
+closed fence 不得删除。
 
 出站 capability 绑定是协议事实来源：非文本 ContentPart 要求 `media`；所有 stream 操作
 和 `message.update` 要求 `streaming`；带 `approval` 的 `message.create` 要求
@@ -2115,5 +2162,5 @@ Core Channel、runner-process Channel 和 legacy Plugin Channel 混合运行、�
 | ADR-034 | 对需要入站媒体落盘的 Channel，Core 统一解析 `config.media_dir` → `workspace_dir/media` → `WORKING_DIR/media`；`from_env` 使用 `<CHANNEL>_MEDIA_DIR` → `WORKING_DIR/media`。最终目录平铺，不追加 Channel 子目录；各 Channel 保留现有下载、命名、覆盖和清理行为，不迁移既有文件 | 已确认；替代 ADR-032 |
 | ADR-035 | v1 标识使用带唯一 string escape 和 finite decimal 的受限 canonical JSON、domain separator + NUL、完整 SHA-256 和稳定前缀；逻辑 ID 与 `dir1_` 磁盘目录键分离，目录 manifest 保留并核对完整逻辑 ID；platform tag 必须属于版本化 release target registry | 已确认 |
 | ADR-036 | v1 descriptor 使用 closed object、显式空值和字段级 required/nullable/secret/condition 语义；Requirement 在 digest 前统一 canonicalize，重复折叠且拒绝 `extra` marker；condition domain 必须有限；`config_fields` 是支持 number 的 UI 投影，完整 value schema 仍由 Pydantic/JSON Schema 或 plugin artifact schema 负责；身份声明可引用 secret 字段但 secret value 仅在 Core 内比较；静态读取不得 import 平台模块；process mode 唯一派生驱动接口 | 已确认 |
-| ADR-037 | request-scoped response 的终止由 Core 通过可重试、幂等的 `channel.response.finish` 显式通知 Runner；不得由 message、stream 或 delivery ACK 推断。Runner 以有界 closed tombstone 保持关闭单调性，并在线性化边界上与在途出站操作排序 | 已确认 |
+| ADR-037 | request-scoped response 的终止由 Core 通过可重试、幂等的 `channel.response.finish` 显式通知 Runner；不得由 message、stream 或 delivery ACK 推断。Core 是业务生命周期唯一权威；Runner 以唯一 route/cleanup aggregate 维护执行侧 closed fence、delivery drain、可恢复资源清理和完成 receipt。cleanup pending 不做普通 TTL GC，只有 cleanup complete receipt 从完成时固定保留 24 小时且不可运行时覆盖；TTL GC 后仅 finish 保证 `RESPONSE_HANDLE_UNKNOWN`，不保留第二套历史 handle fence。Host State shard 的 unknown mutation 保留最新 desired 并由后续 mutation 完整重写；首次 provisional open 的确定性拒绝同时精确回滚 aggregate 和 checkpoint desired。Feishu 新 aggregate Host State 格式从内部 schema version 1 开始，不兼容未上线的开发期旧格式；平台资源引用必须在 acknowledged publication 前持久化。真实 Core per-handle sequencer 由 CH-2-005 `IsolatedChannelProxy` 提供 | 已确认 |
 | ADR-038 | Core 以有界 generation authority 同时持有一个 active 和一个 candidate，并通过 immutable snapshot、candidate epoch 与 operation token 统一 Host RPC 和 endpoint route authorization；只有 committed generation 的 `ready && !quiescing` endpoint 可接收正式流量。quiesce/stop 在 Runner RPC 前撤销，lease expiry 和 generation replacement 单调 fencing，迟到 control/endpoint 响应不得复活旧 generation | 已确认 |

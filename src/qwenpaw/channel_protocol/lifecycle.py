@@ -44,8 +44,15 @@ from .outbound import (
     OutboundAttempt,
     OutboundDeliveryState,
     OutboundStateError,
-    ResponseScopeRegistry,
+)
+from .response_lifecycle import (
+    ResponseCheckpointUnknownError,
+    ResponseCleanupState,
+    ResponseResourceRef,
+    ResponseRouteAggregate,
+    ResponseRouteSnapshot,
     ResponseStateError,
+    RunnerDeliveryResult,
 )
 from .rpc import RpcPeer, RpcResponsePublication, request_was_cancelled
 
@@ -103,7 +110,7 @@ class RunnerState(StrEnum):
     FAILED = "failed"
 
 
-class LifecycleController:
+class LifecycleController:  # pylint: disable=too-many-public-methods
     """Own one Runner generation's protocol-visible lifecycle."""
 
     def __init__(
@@ -120,16 +127,23 @@ class LifecycleController:
         qwenpaw_version: str = "",
         send_handler: Callable[[SendParams], Any] | None = None,
         reaction_handler: Callable[[ReactionParams], Any] | None = None,
-        response_finish_handler: Callable[[ResponseFinishParams], Any]
+        response_finish_handler: Callable[
+            [ResponseFinishParams, ResponseRouteSnapshot],
+            Any,
+        ]
         | None = None,
+        response_checkpoint_put: Callable[[ResponseRouteSnapshot, bool], Any]
+        | None = None,
+        response_checkpoint_delete: Callable[[str, int], Any] | None = None,
         secret_handle_consumer: Callable[[str, int], Any] | None = None,
         endpoint_handler: Callable[[str, EndpointParams | None], Any]
         | None = None,
         clock_ms: Callable[[], int] | None = None,
-        max_response_scopes: int = 1024,
+        max_response_routes: int = 1024,
+        response_clock_ms: Callable[[], int] | None = None,
     ) -> None:
-        if max_response_scopes <= 0:
-            raise ValueError("max_response_scopes must be positive")
+        if max_response_routes <= 0:
+            raise ValueError("max_response_routes must be positive")
         self.channel_key = channel_key
         self.instance_id = instance_id
         self.environment_spec_id = environment_spec_id
@@ -150,12 +164,17 @@ class LifecycleController:
         self._send_handler = send_handler
         self._reaction_handler = reaction_handler
         self._response_finish_handler = response_finish_handler
+        self._response_checkpoint_put = response_checkpoint_put
+        self._response_checkpoint_delete = response_checkpoint_delete
         self._secret_handle_consumer = secret_handle_consumer
         self._secret_handle_attempted = False
         self._outbound = OutboundDeliveryState()
-        self._response_scopes = ResponseScopeRegistry(
-            max_scopes=max_response_scopes,
+        self._response_routes = ResponseRouteAggregate(
+            max_entries=max_response_routes,
+            clock_ms=response_clock_ms,
         )
+        self._response_finish_tasks: dict[str, asyncio.Task[bool]] = {}
+        self._response_checkpoint_pending: set[str] = set()
         self._endpoint_handler = endpoint_handler
         self._clock_ms = clock_ms or (lambda: time.monotonic_ns() // 1_000_000)
         self._lock = asyncio.Lock()
@@ -492,8 +511,12 @@ class LifecycleController:
         """Return the generation status without side effects."""
         return await self.health(params)
 
-    async def open_response_scope(self, response_handle: str) -> None:
-        """Register one active response scope before submitting an event."""
+    async def open_response_route(
+        self,
+        response_handle: str,
+        route_refs: tuple[ResponseResourceRef, ...] = (),
+    ) -> None:
+        """Persist one active response route before event submission."""
         handle = validate_response_handle(response_handle)
         async with self._lock:
             self._check_response_capability()
@@ -501,20 +524,47 @@ class LifecycleController:
             await self._expire_lease_if_needed_async()
             if self.state != RunnerState.ACTIVE:
                 raise self._lifecycle_error("LEASE_EXPIRED")
+            if handle in self._response_checkpoint_pending:
+                raise self._response_error(
+                    "RESPONSE_BUSY",
+                    "response route checkpoint is pending",
+                    retryable=True,
+                )
             try:
-                self._response_scopes.open(handle)
+                snapshot, created = self._response_routes.open(
+                    handle,
+                    route_refs,
+                )
             except ResponseStateError as exc:
                 raise self._response_error_from_state(exc) from exc
+            self._response_checkpoint_pending.add(handle)
+        try:
+            await self._put_response_snapshot(snapshot, provisional=created)
+        except BaseException as exc:
+            settlement_unknown = isinstance(
+                exc,
+                (ResponseCheckpointUnknownError, asyncio.CancelledError),
+            )
+            if created and not settlement_unknown:
+                async with self._lock:
+                    self._response_checkpoint_pending.discard(handle)
+                    self._response_routes.rollback_open(
+                        handle,
+                        snapshot.version,
+                    )
+            else:
+                async with self._lock:
+                    self._response_checkpoint_pending.discard(handle)
+            raise
+        async with self._lock:
+            self._response_checkpoint_pending.discard(handle)
 
-    async def restore_response_scope(
+    async def restore_response_routes(
         self,
-        response_handle: str,
-        outcome: ResponseOutcome | None = None,
-        *,
-        cleanup_complete: bool = False,
+        snapshots: tuple[ResponseRouteSnapshot, ...],
     ) -> None:
-        """Restore Driver state with explicit cleanup completion evidence."""
-        handle = validate_response_handle(response_handle)
+        """Restore persisted aggregate snapshots before generation commit."""
+        expired: list[ResponseRouteSnapshot] = []
         async with self._lock:
             self._check_response_capability()
             self._ensure_state(
@@ -522,23 +572,141 @@ class LifecycleController:
                 RunnerState.STANDBY,
                 RunnerState.ACTIVE,
             )
+            for snapshot in snapshots:
+                try:
+                    restored = self._response_routes.restore(snapshot)
+                except ResponseStateError as exc:
+                    raise self._response_error_from_state(exc) from exc
+                if (
+                    not restored
+                    and self._response_routes.snapshot(
+                        snapshot.response_handle,
+                    )
+                    is None
+                ):
+                    expired.append(snapshot)
+        for snapshot in expired:
+            await self._delete_response_snapshot(
+                snapshot.response_handle,
+                snapshot.version,
+            )
+
+    async def discard_response_route(self, response_handle: str) -> None:
+        """Discard one permanently rejected active response route."""
+        handle = validate_response_handle(response_handle)
+        async with self._lock:
+            if handle in self._response_checkpoint_pending:
+                raise self._response_error(
+                    "RESPONSE_BUSY",
+                    "response route checkpoint is pending",
+                    retryable=True,
+                )
+            if self._outbound.has_inflight_response(handle):
+                raise self._response_error(
+                    "RESPONSE_BUSY",
+                    "response has an in-flight delivery",
+                    retryable=True,
+                )
             try:
-                self._response_scopes.restore(
+                snapshot = self._response_routes.discard_candidate(handle)
+            except ResponseStateError as exc:
+                raise self._response_error_from_state(exc) from exc
+            if snapshot is not None:
+                self._response_checkpoint_pending.add(handle)
+        if snapshot is None:
+            return
+        try:
+            await self._delete_response_snapshot(handle, snapshot.version)
+        except BaseException:
+            async with self._lock:
+                self._response_checkpoint_pending.discard(handle)
+            raise
+        async with self._lock:
+            self._response_routes.commit_discard(snapshot)
+            self._response_checkpoint_pending.discard(handle)
+
+    async def response_route_snapshot(
+        self,
+        response_handle: str,
+    ) -> ResponseRouteSnapshot | None:
+        """Return one immutable response snapshot for diagnostics."""
+        handle = validate_response_handle(response_handle)
+        async with self._lock:
+            return self._response_routes.snapshot(handle)
+
+    async def response_route_refs(
+        self,
+        response_handle: str,
+    ) -> tuple[ResponseResourceRef, ...]:
+        """Resolve active route refs without exposing aggregate mutation."""
+        handle = validate_response_handle(response_handle)
+        async with self._lock:
+            try:
+                return self._response_routes.active_route_refs(handle)
+            except ResponseStateError as exc:
+                raise self._response_error_from_state(exc) from exc
+
+    async def response_resource_ref(
+        self,
+        response_handle: str,
+        resource_id: str,
+    ) -> ResponseResourceRef | None:
+        """Resolve one active platform resource by delivery ID."""
+        handle = validate_response_handle(response_handle)
+        async with self._lock:
+            try:
+                return self._response_routes.resource_ref(
                     handle,
-                    outcome,
-                    cleanup_complete=cleanup_complete,
+                    resource_id,
                 )
             except ResponseStateError as exc:
                 raise self._response_error_from_state(exc) from exc
 
-    async def discard_response_scope(self, response_handle: str) -> None:
-        """Discard a rejected scope or a Driver-GC'd tombstone."""
-        handle = validate_response_handle(response_handle)
+    async def gc_response_routes(self) -> None:
+        """Delete only expired cleanup-complete response receipts."""
         async with self._lock:
+            expired = tuple(
+                snapshot
+                for snapshot in self._response_routes.expired_completed()
+                if snapshot.response_handle
+                not in self._response_checkpoint_pending
+            )
+            self._response_checkpoint_pending.update(
+                snapshot.response_handle for snapshot in expired
+            )
+        first_error: BaseException | None = None
+        for snapshot in expired:
             try:
-                self._response_scopes.discard(handle)
-            except ResponseStateError as exc:
-                raise self._response_error_from_state(exc) from exc
+                await self._delete_response_snapshot(
+                    snapshot.response_handle,
+                    snapshot.version,
+                )
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
+            else:
+                async with self._lock:
+                    self._response_routes.commit_gc(snapshot)
+            finally:
+                async with self._lock:
+                    self._response_checkpoint_pending.discard(
+                        snapshot.response_handle,
+                    )
+        if first_error is not None:
+            raise first_error
+
+    async def resume_response_cleanups(self) -> None:
+        """Retry cleanup-pending receipts after the generation is active."""
+        async with self._lock:
+            pending = self._response_routes.pending_cleanups()
+            tasks = [
+                self._response_finish_task_locked(item) for item in pending
+            ]
+        if tasks:
+            await asyncio.gather(
+                *(asyncio.shield(task) for task in tasks),
+                return_exceptions=True,
+            )
 
     async def response_finish(
         self,
@@ -552,28 +720,33 @@ class LifecycleController:
             if self.state != RunnerState.ACTIVE:
                 raise self._lifecycle_error("LEASE_EXPIRED")
             self._check_response_capability()
+            if self._outbound.has_inflight_response(
+                params.response_handle,
+            ):
+                raise self._response_error(
+                    "RESPONSE_BUSY",
+                    "response has an in-flight delivery",
+                    retryable=True,
+                )
+            if params.response_handle in self._response_checkpoint_pending:
+                raise self._response_error(
+                    "RESPONSE_BUSY",
+                    "response route checkpoint is pending",
+                    retryable=True,
+                )
             try:
-                scope = self._response_scopes.admit_finish(
+                snapshot = self._response_routes.begin_finish(
                     params.response_handle,
                     params.outcome,
                 )
             except ResponseStateError as exc:
                 raise self._response_error_from_state(exc) from exc
-            if self._response_scopes.cleanup_complete(scope):
+            if snapshot.cleanup_state is ResponseCleanupState.COMPLETE:
                 return ResponseFinishResult(
                     response_handle=params.response_handle,
                     outcome=params.outcome,
                 ).to_mapping()
-            task = self._response_scopes.finish_task(scope)
-            if task is None:
-                task = asyncio.create_task(
-                    self._run_response_finish(scope, params),
-                )
-                self._response_scopes.attach_finish_task(
-                    params.response_handle,
-                    scope,
-                    task,
-                )
+            task = self._response_finish_task_locked(snapshot)
         cleanup_complete = await asyncio.shield(task)
         if not cleanup_complete:
             raise self._response_error(
@@ -588,28 +761,96 @@ class LifecycleController:
 
     async def _run_response_finish(
         self,
-        scope_token: object,
         params: ResponseFinishParams,
     ) -> bool:
-        """Run one cleanup handler without holding the lifecycle lock."""
-        success = True
-        handler = self._response_finish_handler
+        """Persist close, clean resources, and persist completion."""
+        success = False
         try:
+            async with self._lock:
+                snapshot = self._response_routes.snapshot(
+                    params.response_handle,
+                )
+            if snapshot is None:
+                return False
+            await self._put_response_snapshot(snapshot)
+            handler = self._response_finish_handler
             if handler is not None:
-                result = handler(params)
+                result = handler(params, snapshot)
                 if hasattr(result, "__await__"):
                     await result
+            async with self._lock:
+                candidate = self._response_routes.cleanup_candidate(
+                    params.response_handle,
+                    params.outcome,
+                )
+            await self._put_response_snapshot(candidate)
+            async with self._lock:
+                self._response_routes.commit_cleanup(candidate)
+            success = True
         except asyncio.CancelledError:
-            success = False
+            pass
         except Exception:
-            success = False
-        async with self._lock:
-            self._response_scopes.settle_finish(
-                params.response_handle,
-                scope_token,
-                success,
-            )
+            pass
+        finally:
+            async with self._lock:
+                task = asyncio.current_task()
+                if (
+                    self._response_finish_tasks.get(
+                        params.response_handle,
+                    )
+                    is task
+                ):
+                    self._response_finish_tasks.pop(
+                        params.response_handle,
+                        None,
+                    )
         return success
+
+    def _response_finish_task_locked(
+        self,
+        snapshot: ResponseRouteSnapshot,
+    ) -> asyncio.Task[bool]:
+        """Return the one temporary cleanup task for a response handle."""
+        task = self._response_finish_tasks.get(snapshot.response_handle)
+        if task is not None:
+            return task
+        if snapshot.outcome is None:
+            raise RuntimeError("terminal response receipt requires an outcome")
+        params = ResponseFinishParams(
+            channel_key=self.channel_key,
+            instance_id=self.instance_id,
+            generation=self.generation,
+            response_handle=snapshot.response_handle,
+            outcome=snapshot.outcome,
+        )
+        task = asyncio.create_task(self._run_response_finish(params))
+        self._response_finish_tasks[snapshot.response_handle] = task
+        return task
+
+    async def _put_response_snapshot(
+        self,
+        snapshot: ResponseRouteSnapshot,
+        *,
+        provisional: bool = False,
+    ) -> None:
+        handler = self._response_checkpoint_put
+        if handler is None:
+            return
+        result = handler(snapshot, provisional)
+        if hasattr(result, "__await__"):
+            await result
+
+    async def _delete_response_snapshot(
+        self,
+        response_handle: str,
+        version: int,
+    ) -> None:
+        handler = self._response_checkpoint_delete
+        if handler is None:
+            return
+        result = handler(response_handle, version)
+        if hasattr(result, "__await__"):
+            await result
 
     def _check_response_capability(self) -> None:
         """Require the negotiated response lifecycle capability."""
@@ -629,7 +870,7 @@ class LifecycleController:
     ) -> bool:
         """Check one response-scoped outbound operation before admission."""
         try:
-            return self._response_scopes.admit_operation(response_handle)
+            return self._response_routes.admit_operation(response_handle)
         except ResponseStateError as exc:
             raise self._response_error_from_state(exc) from exc
 
@@ -695,6 +936,12 @@ class LifecycleController:
             response_scope = self._response_scope_for_operation_locked(
                 params.to_handle,
             )
+            if params.to_handle in self._response_checkpoint_pending:
+                raise self._response_error(
+                    "RESPONSE_BUSY",
+                    "response route checkpoint is pending",
+                    retryable=True,
+                )
             task = asyncio.current_task()
             if task is None:
                 raise RuntimeError("outbound attempt requires an asyncio task")
@@ -708,11 +955,6 @@ class LifecycleController:
                 )
             except OutboundStateError as exc:
                 raise self._outbound_error_from_state(exc) from exc
-            if response_scope:
-                self._response_scopes.add_inflight(
-                    params.to_handle,
-                    params.delivery_id,
-                )
             callback = self._send_handler
         try:
             if callback is not None:
@@ -724,9 +966,9 @@ class LifecycleController:
                     "delivery_id": params.delivery_id,
                     "state": DeliveryState.ACKNOWLEDGED.value,
                 }
-            result = self._outbound.parse_result(
+            result = await self._prepare_runner_delivery_result(
+                attempt,
                 raw_result,
-                params.delivery_id,
             )
             if request_was_cancelled():
                 raise asyncio.CancelledError
@@ -807,6 +1049,12 @@ class LifecycleController:
             response_scope = self._response_scope_for_operation_locked(
                 params.to_handle,
             )
+            if params.to_handle in self._response_checkpoint_pending:
+                raise self._response_error(
+                    "RESPONSE_BUSY",
+                    "response route checkpoint is pending",
+                    retryable=True,
+                )
             task = asyncio.current_task()
             if task is None:
                 raise RuntimeError("outbound attempt requires an asyncio task")
@@ -820,11 +1068,6 @@ class LifecycleController:
                 )
             except OutboundStateError as exc:
                 raise self._outbound_error_from_state(exc) from exc
-            if response_scope:
-                self._response_scopes.add_inflight(
-                    params.to_handle,
-                    params.delivery_id,
-                )
             callback = self._reaction_handler
         try:
             if callback is not None:
@@ -836,9 +1079,9 @@ class LifecycleController:
                     "delivery_id": params.delivery_id,
                     "state": DeliveryState.ACKNOWLEDGED.value,
                 }
-            result = self._outbound.parse_result(
+            result = await self._prepare_runner_delivery_result(
+                attempt,
                 raw_result,
-                params.delivery_id,
             )
             if request_was_cancelled():
                 raise asyncio.CancelledError
@@ -883,9 +1126,41 @@ class LifecycleController:
                 lifecycle_state=self.state.value,
                 now=asyncio.get_running_loop().time(),
             )
-            if not defer_completion:
-                self._unlink_response_attempt(attempt)
             return staged
+
+    async def _prepare_runner_delivery_result(
+        self,
+        attempt: OutboundAttempt,
+        raw_result: object,
+    ) -> OutboundResult:
+        """Persist response resources before an ACK can be published."""
+        internal = (
+            raw_result
+            if isinstance(raw_result, RunnerDeliveryResult)
+            else RunnerDeliveryResult(outbound_result=raw_result)
+        )
+        result = self._outbound.parse_result(
+            internal.outbound_result,
+            attempt.delivery_id,
+        )
+        if attempt.response_handle is None or not internal.resource_refs:
+            return result
+        async with self._lock:
+            try:
+                snapshot = self._response_routes.record_delivery(
+                    attempt.response_handle,
+                    internal.resource_refs,
+                )
+            except ResponseStateError as exc:
+                raise self._response_error_from_state(exc) from exc
+        try:
+            await self._put_response_snapshot(snapshot)
+        except Exception:
+            return self._outbound.unknown_result(
+                attempt.delivery_id,
+                "PLATFORM_RESULT_UNKNOWN",
+            )
+        return result
 
     def _outbound_response_publication(
         self,
@@ -955,9 +1230,7 @@ class LifecycleController:
         attempt: OutboundAttempt,
     ) -> None:
         """Expose one accepted result and its ordering effects atomically."""
-        published = self._outbound.publish(attempt)
-        if published:
-            self._unlink_response_attempt(attempt)
+        self._outbound.publish(attempt)
 
     def _defer_outbound_publication(
         self,
@@ -1000,8 +1273,7 @@ class LifecycleController:
     ) -> None:
         """Rollback one prepared publication while holding the state lock."""
         try:
-            if self._outbound.rollback_publication(attempt):
-                self._unlink_response_attempt(attempt)
+            self._outbound.rollback_publication(attempt)
         finally:
             self._release_outbound_publication_lock(attempt)
 
@@ -1038,8 +1310,7 @@ class LifecycleController:
     ) -> None:
         """Retain an attempted delivery ID after an uncertain outcome."""
         async with self._lock:
-            if self._outbound.finish_unknown(attempt, reason_code):
-                self._unlink_response_attempt(attempt)
+            self._outbound.finish_unknown(attempt, reason_code)
 
     async def _wait_for_outbound_attempts(
         self,
@@ -1068,12 +1339,11 @@ class LifecycleController:
         cancel: bool,
     ) -> None:
         """Fence one unfinished attempt without waiting for its handler."""
-        if self._outbound.force_unknown(
+        self._outbound.force_unknown(
             attempt,
             reason_code,
             cancel=cancel,
-        ):
-            self._unlink_response_attempt(attempt)
+        )
 
     @staticmethod
     def _expire_outbound_drain(attempt: OutboundAttempt) -> None:
@@ -1092,14 +1362,6 @@ class LifecycleController:
             exc.message,
             data={"reason_code": exc.reason_code},
         )
-
-    def _unlink_response_attempt(self, attempt: OutboundAttempt) -> None:
-        """Release the response-scope link after delivery settlement."""
-        if attempt.response_handle is not None:
-            self._response_scopes.discard_inflight(
-                attempt.response_handle,
-                attempt.delivery_id,
-            )
 
     async def endpoint_register(
         self,

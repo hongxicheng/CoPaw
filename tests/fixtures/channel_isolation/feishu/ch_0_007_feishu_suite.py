@@ -25,8 +25,13 @@ import pytest
 from qwenpaw.app.channels.feishu import driver as driver_module
 from qwenpaw.app.channels.feishu.driver import FeishuDriver
 from qwenpaw.app.channels.feishu.response_routes import (
-    FeishuResponseRouteStore,
-    RESPONSE_TOMBSTONE_TTL_MS,
+    FeishuResponseRouteCheckpoint,
+    RESPONSE_ROUTE_STATE_SCHEMA_VERSION,
+)
+from qwenpaw.channel_protocol.response_lifecycle import (
+    RESPONSE_RECEIPT_TTL_MS,
+    ResponseCheckpointUnknownError,
+    ResponseRouteAggregate,
 )
 from qwenpaw.app.channels.feishu import platform as platform_module
 from qwenpaw.app.channels.feishu.platform import (
@@ -42,7 +47,9 @@ from qwenpaw.channel_protocol import (
     PrepareParams,
     ProtocolValidationError,
     RpcError,
+    RpcLimits,
     RpcPeer,
+    RpcTimeoutError,
 )
 
 
@@ -345,6 +352,10 @@ class MockHost:
         self.reject_unmentioned_groups = False
         self.fail_state_put = False
         self.fail_response_route_put = False
+        self.lose_response_route_put = False
+        self.lose_response_route_delete = False
+        self.response_route_mutation_applied = asyncio.Event()
+        self.release_response_route_mutation = asyncio.Event()
         self.frames: list[str] = []
         self.transports: tuple[MemoryTransport, MemoryTransport] | None = None
         peer.register_method("runner.hello", self._runner_hello)
@@ -426,10 +437,20 @@ class MockHost:
             params.schema_version or 1,
             params.value,
         )
+        if self.lose_response_route_put and params.key.startswith(
+            "feishu.response_routes.",
+        ):
+            self.response_route_mutation_applied.set()
+            await self.release_response_route_mutation.wait()
         return {"status": "stored", "key": params.key}
 
     async def _state_delete(self, params: Any, _: object) -> dict[str, Any]:
         await self.state_store.delete(params.key)
+        if self.lose_response_route_delete and params.key.startswith(
+            "feishu.response_routes.",
+        ):
+            self.response_route_mutation_applied.set()
+            await self.release_response_route_mutation.wait()
         return {"status": "deleted", "key": params.key}
 
 
@@ -438,8 +459,12 @@ async def _run_driver_session(
     transport: MemoryTransport,
     identity: FixtureIdentity,
     consumer: FixtureSecretHandleConsumer,
+    request_timeout: float,
 ) -> None:
-    peer = RpcPeer(transport)
+    peer = RpcPeer(
+        transport,
+        limits=RpcLimits(request_timeout=request_timeout),
+    )
     driver.bind(peer, identity)
     controller = driver.create_lifecycle_controller(
         identity,
@@ -477,10 +502,15 @@ async def _start_session(
     *,
     state_store: HostStateStore | None = None,
     reconnect_initial_delay: float = 0.001,
-    response_routes: FeishuResponseRouteStore | None = None,
+    response_checkpoint: FeishuResponseRouteCheckpoint | None = None,
+    response_clock_ms: Callable[[], int] | None = None,
+    request_timeout: float = 30.0,
 ) -> tuple[RpcPeer, MockHost, FeishuDriver, asyncio.Task[None]]:
     core_transport, runner_transport = _transport_pair()
-    core = RpcPeer(core_transport)
+    core = RpcPeer(
+        core_transport,
+        limits=RpcLimits(request_timeout=request_timeout),
+    )
     host = MockHost(core, identity, state_store=state_store)
     host.transports = (core_transport, runner_transport)
     driver = FeishuDriver(
@@ -488,7 +518,8 @@ async def _start_session(
         reconnect_initial_delay=reconnect_initial_delay,
         reconnect_max_delay=0.005,
         connect_timeout=1.0,
-        response_routes=response_routes,
+        response_checkpoint=response_checkpoint,
+        response_clock_ms=response_clock_ms,
     )
     handle = f"secret-{identity.instance_id}"
     consumer = FixtureSecretHandleConsumer(
@@ -508,6 +539,7 @@ async def _start_session(
             runner_transport,
             identity,
             consumer,
+            request_timeout,
         ),
     )
     await asyncio.wait_for(host.hello.wait(), timeout=1.0)
@@ -624,6 +656,28 @@ def _message(
     }
 
 
+def _same_shard_event_ids(
+    driver: FeishuDriver,
+    prefix: str,
+) -> tuple[str, str]:
+    """Return two deterministic event IDs placed in one route shard."""
+    first_event = f"{prefix}-0"
+    first_handle = driver._response_checkpoint.response_handle(first_event)
+    first_shard = driver._response_checkpoint.shard_for_handle(first_handle)
+    candidate = 1
+    while True:
+        second_event = f"{prefix}-{candidate}"
+        second_handle = driver._response_checkpoint.response_handle(
+            second_event,
+        )
+        if (
+            driver._response_checkpoint.shard_for_handle(second_handle)
+            == first_shard
+        ):
+            return first_event, second_event
+        candidate += 1
+
+
 def test_driver_entrypoint_does_not_import_legacy_channel() -> None:
     """The production Runner entrypoint has no Core Channel dependency."""
     result = subprocess.run(
@@ -645,6 +699,33 @@ def test_driver_entrypoint_does_not_import_legacy_channel() -> None:
     )
     assert result.returncode == 0
     assert result.stdout.splitlines() == [b"FeishuDriver", b"False"]
+
+
+def test_response_receipt_ttl_is_not_runtime_configurable() -> None:
+    """The protocol-defined receipt TTL has no constructor override."""
+    assert (
+        "receipt_ttl_ms"
+        not in inspect.signature(
+            ResponseRouteAggregate,
+        ).parameters
+    )
+    assert (
+        "response_receipt_ttl_ms"
+        not in inspect.signature(
+            driver_module.LifecycleController,
+        ).parameters
+    )
+    assert (
+        "receipt_ttl_ms"
+        not in inspect.signature(
+            FeishuResponseRouteCheckpoint,
+        ).parameters
+    )
+
+
+def test_response_route_state_starts_at_schema_version_one() -> None:
+    """The unreleased aggregate format starts at internal version one."""
+    assert RESPONSE_ROUTE_STATE_SCHEMA_VERSION == 1
 
 
 @pytest.mark.asyncio
@@ -894,8 +975,8 @@ async def test_driver_topic_replies_keep_request_scoped_targets(
             content_parts=content_parts,
         )
         assert result["state"] == "acknowledged"
-        snapshot = await driver._response_routes.snapshot()
-        assert snapshot[handles[event_id]]["state"] == "active"
+        snapshot = await driver._response_checkpoint.snapshot()
+        assert snapshot[handles[event_id]]["kind"] == "active"
     replies = [item for item in platform.sent if item["kind"] == "message"]
     assert [item["reply_message_id"] for item in replies] == [
         f"msg-{event_id}" for event_id in reply_order
@@ -912,9 +993,9 @@ async def test_driver_topic_replies_keep_request_scoped_targets(
                 handles[event_id],
             )
         )["state"] == "closed"
-    snapshot = await driver._response_routes.snapshot()
+    snapshot = await driver._response_checkpoint.snapshot()
     assert all(
-        snapshot[handle]["state"] == "closed" for handle in handles.values()
+        snapshot[handle]["kind"] == "terminal" for handle in handles.values()
     )
     await _close_session(core, session, identity)
 
@@ -950,12 +1031,13 @@ async def test_driver_topic_reply_targets_survive_checkpoint_restart(
         for event_id in ("restart-a", "restart-b")
     }
     for event_id, handle in handles.items():
-        shard_key = driver._response_routes.state_key(
-            driver._response_routes.shard_for_handle(handle),
+        shard_key = driver._response_checkpoint.state_key(
+            driver._response_checkpoint.shard_for_handle(handle),
         )
         checkpoint = await state_store.get(shard_key)
         assert checkpoint is not None
-        assert checkpoint[1][handle]["thread_message_id"] == (
+        route_refs = checkpoint[1][handle]["route_refs"]
+        assert route_refs[0]["attributes"]["thread_message_id"] == (
             f"msg-{event_id}"
         )
     await _close_session(core, session, identity)
@@ -1102,8 +1184,8 @@ async def test_driver_unknown_reply_keeps_request_target_for_retry(
         content_parts=[{"type": "text", "text": "first"}],
     )
     assert unknown["state"] == "unknown"
-    assert (await driver._response_routes.snapshot())[handle][
-        "state"
+    assert (await driver._response_checkpoint.snapshot())[handle][
+        "kind"
     ] == "active"
     platform.send_error = None
     acknowledged = await _send_reply(
@@ -1178,9 +1260,9 @@ async def test_driver_thread_reply_and_stream_fallback_use_request_handles(
             "accumulated_text": "A",
         },
     )
-    assert (await driver._response_routes.snapshot())[
+    assert (await driver._response_checkpoint.snapshot())[
         host.reply_handle_for("thread-stream")
-    ]["state"] == "active"
+    ]["kind"] == "active"
     delta = await core.call(
         "channel.send",
         {
@@ -1272,8 +1354,8 @@ async def test_response_scope_keeps_approval_route_until_explicit_finish(
         },
     )
     assert approval["state"] == "acknowledged"
-    assert (await driver._response_routes.snapshot())[handle][
-        "state"
+    assert (await driver._response_checkpoint.snapshot())[handle][
+        "kind"
     ] == "active"
     final = await _send_reply(
         core,
@@ -1304,11 +1386,7 @@ async def test_response_scope_keeps_approval_route_until_explicit_finish(
         content_parts=[{"type": "text", "text": "explicit"}],
     )
     assert explicit["state"] == "acknowledged"
-    assert set(driver._delivery_targets) == {
-        "approval-card",
-        "approval-final",
-        "explicit-target",
-    }
+    assert set(driver._delivery_targets) == {"explicit-target"}
     assert (await _finish_response(core, identity, handle))["state"] == (
         "closed"
     )
@@ -1342,8 +1420,15 @@ async def test_response_scope_can_finish_without_outbound_delivery(
     assert (await _finish_response(core, identity, handle))["state"] == (
         "closed"
     )
-    assert (await driver._response_routes.snapshot())[handle]["state"] == (
-        "closed"
+    lifecycle_snapshot = (
+        await driver._require_lifecycle().response_route_snapshot(
+            handle,
+        )
+    )
+    assert lifecycle_snapshot is not None
+    assert lifecycle_snapshot.kind.value == "terminal"
+    assert (await driver._response_checkpoint.snapshot())[handle]["kind"] == (
+        "terminal"
     )
     await _close_session(core, session, identity)
 
@@ -1352,20 +1437,60 @@ async def test_response_scope_can_finish_without_outbound_delivery(
 async def test_response_route_admission_failure_does_not_submit_event(
     tmp_path: Path,
 ) -> None:
-    """A failed active-route checkpoint prevents Core event admission."""
+    """A rejected route write cannot survive a later shard mutation."""
+    state_store = HostStateStore()
     identity = _identity("response-admission-failure")
     platform = FakePlatform("response-admission-failure")
     core, host, driver, session = await _start_session(
         identity,
         platform,
         tmp_path,
+        state_store=state_store,
+    )
+    rejected_event, accepted_event = _same_shard_event_ids(
+        driver,
+        "response-admission-failure",
     )
     host.fail_response_route_put = True
     with pytest.raises(RpcError):
-        await platform.emit_message(_message("response-admission-failure"))
+        await platform.emit_message(_message(rejected_event))
     assert host.events == []
-    assert await driver._response_routes.snapshot() == {}
+    assert await driver._response_checkpoint.snapshot() == {}
+    rejected_handle = driver._response_checkpoint.response_handle(
+        rejected_event,
+    )
+    shard = driver._response_checkpoint.shard_for_handle(rejected_handle)
+    shard_state = driver._response_checkpoint._shards[shard]
+    assert shard_state.dirty is False
+    assert shard_state.settlement.value == "confirmed"
+    host.fail_response_route_put = False
+    await platform.emit_message(_message(accepted_event))
+    accepted_handle = host.reply_handle_for(accepted_event)
     await _close_session(core, session, identity)
+
+    restarted_identity = _identity(
+        "response-admission-failure",
+        generation=2,
+    )
+    (
+        restarted_core,
+        _,
+        restarted_driver,
+        restarted_session,
+    ) = await _start_session(
+        restarted_identity,
+        FakePlatform("response-admission-restarted"),
+        tmp_path,
+        state_store=state_store,
+    )
+    snapshot = await restarted_driver._response_checkpoint.snapshot()
+    assert rejected_handle not in snapshot
+    assert snapshot[accepted_handle]["kind"] == "active"
+    await _close_session(
+        restarted_core,
+        restarted_session,
+        restarted_identity,
+    )
 
 
 @pytest.mark.asyncio
@@ -1386,14 +1511,104 @@ async def test_response_finish_cleanup_failure_is_retryable_in_feishu_driver(
     with pytest.raises(RpcError) as failed:
         await _finish_response(core, identity, handle)
     assert failed.value.data["reason_code"] == "RESPONSE_FINISH_FAILED"
-    assert (await driver._response_routes.snapshot())[handle]["state"] == (
-        "active"
+    lifecycle_snapshot = (
+        await driver._require_lifecycle().response_route_snapshot(
+            handle,
+        )
+    )
+    assert lifecycle_snapshot is not None
+    assert lifecycle_snapshot.kind.value == "terminal"
+    assert (await driver._response_checkpoint.snapshot())[handle]["kind"] == (
+        "terminal"
     )
     host.fail_response_route_put = False
     assert (await _finish_response(core, identity, handle))["state"] == (
         "closed"
     )
     await _close_session(core, session, identity)
+
+
+@pytest.mark.asyncio
+async def test_rejected_open_restores_prior_unknown_shard_state(
+    tmp_path: Path,
+) -> None:
+    """A rejected open cannot erase an earlier unknown desired state."""
+    state_store = HostStateStore()
+    identity = _identity("response-rejected-after-unknown")
+    platform = FakePlatform("response-rejected-after-unknown")
+    core, host, driver, session = await _start_session(
+        identity,
+        platform,
+        tmp_path,
+        state_store=state_store,
+        request_timeout=0.02,
+    )
+    first_event, rejected_event = _same_shard_event_ids(
+        driver,
+        "response-rejected-after-unknown",
+    )
+    await platform.emit_message(_message(first_event))
+    first_handle = host.reply_handle_for(first_event)
+    host.lose_response_route_put = True
+    finish = asyncio.create_task(
+        _finish_response(core, identity, first_handle),
+    )
+    await asyncio.wait_for(
+        host.response_route_mutation_applied.wait(),
+        timeout=1.0,
+    )
+    with pytest.raises(RpcTimeoutError):
+        await finish
+    host.lose_response_route_put = False
+    host.release_response_route_mutation.set()
+
+    shard = driver._response_checkpoint.shard_for_handle(first_handle)
+    state_before = driver._response_checkpoint._shards[shard]
+    desired_before = state_before.desired.copy()
+    assert state_before.dirty is True
+    assert state_before.settlement.value == "unknown"
+
+    host.fail_response_route_put = True
+    with pytest.raises(RpcError):
+        await platform.emit_message(_message(rejected_event))
+    rejected_handle = driver._response_checkpoint.response_handle(
+        rejected_event,
+    )
+    state_after = driver._response_checkpoint._shards[shard]
+    assert state_after.desired == desired_before
+    assert state_after.dirty is True
+    assert state_after.settlement.value == "unknown"
+    assert rejected_handle not in await driver._response_checkpoint.snapshot()
+
+    host.fail_response_route_put = False
+    assert (await _finish_response(core, identity, first_handle))["state"] == (
+        "closed"
+    )
+    await _close_session(core, session, identity)
+
+    restarted_identity = _identity(
+        "response-rejected-after-unknown",
+        generation=2,
+    )
+    (
+        restarted_core,
+        _,
+        restarted_driver,
+        restarted_session,
+    ) = await _start_session(
+        restarted_identity,
+        FakePlatform("response-rejected-unknown-restarted"),
+        tmp_path,
+        state_store=state_store,
+    )
+    snapshot = await restarted_driver._response_checkpoint.snapshot()
+    assert snapshot[first_handle]["kind"] == "terminal"
+    assert rejected_handle not in snapshot
+    await _close_session(
+        restarted_core,
+        restarted_session,
+        restarted_identity,
+    )
 
 
 @pytest.mark.asyncio
@@ -1430,9 +1645,9 @@ async def test_closed_response_tombstone_restores_across_runner_restart(
         tmp_path,
         state_store=state_store,
     )
-    assert (await restarted_driver._response_routes.snapshot())[handle][
-        "state"
-    ] == "closed"
+    assert (await restarted_driver._response_checkpoint.snapshot())[handle][
+        "kind"
+    ] == "terminal"
     with pytest.raises(RpcError) as closed:
         await _send_reply(
             restarted_core,
@@ -1467,15 +1682,14 @@ async def test_completed_tombstone_gc_uses_persistent_wall_clock(
     state_store = HostStateStore()
     identity = _identity("response-ttl")
     platform = FakePlatform("response-ttl")
-    first_routes = FeishuResponseRouteStore(
-        clock_ms=lambda: now_ms[0],
-    )
+    first_routes = FeishuResponseRouteCheckpoint()
     core, host, _, session = await _start_session(
         identity,
         platform,
         tmp_path,
         state_store=state_store,
-        response_routes=first_routes,
+        response_checkpoint=first_routes,
+        response_clock_ms=lambda: now_ms[0],
     )
     await platform.emit_message(_message("response-ttl"))
     handle = host.reply_handle_for("response-ttl")
@@ -1484,11 +1698,9 @@ async def test_completed_tombstone_gc_uses_persistent_wall_clock(
     )
     await _close_session(core, session, identity)
 
-    now_ms[0] += RESPONSE_TOMBSTONE_TTL_MS + 1
+    now_ms[0] += RESPONSE_RECEIPT_TTL_MS + 1
     restarted_identity = _identity("response-ttl", generation=2)
-    restarted_routes = FeishuResponseRouteStore(
-        clock_ms=lambda: now_ms[0],
-    )
+    restarted_routes = FeishuResponseRouteCheckpoint()
     (
         restarted_core,
         _,
@@ -1499,11 +1711,43 @@ async def test_completed_tombstone_gc_uses_persistent_wall_clock(
         FakePlatform("response-ttl-restarted"),
         tmp_path,
         state_store=state_store,
-        response_routes=restarted_routes,
+        response_checkpoint=restarted_routes,
+        response_clock_ms=lambda: now_ms[0],
     )
-    assert await restarted_driver._response_routes.snapshot() == {}
+    assert await restarted_driver._response_checkpoint.snapshot() == {}
     shard = restarted_routes.shard_for_handle(handle)
     assert await state_store.get(restarted_routes.state_key(shard)) is None
+    with pytest.raises(RpcError) as unknown:
+        await _finish_response(
+            restarted_core,
+            restarted_identity,
+            handle,
+        )
+    assert unknown.value.data["reason_code"] == "RESPONSE_HANDLE_UNKNOWN"
+    sent_before = len(restarted_driver._require_platform().sent)
+    result = await _send_reply(
+        restarted_core,
+        restarted_identity,
+        delivery_id="expired-handle-send",
+        to_handle=handle,
+        content_parts=[{"type": "text", "text": "late"}],
+    )
+    assert result["state"] == "unknown"
+    assert len(restarted_driver._require_platform().sent) == sent_before
+    with pytest.raises(RpcError):
+        await restarted_core.call(
+            "channel.reaction",
+            {
+                "channel_key": "feishu",
+                "instance_id": restarted_identity.instance_id,
+                "generation": restarted_identity.generation,
+                "delivery_id": "expired-handle-reaction",
+                "to_handle": handle,
+                "target_delivery_id": "expired-handle-send",
+                "reaction": "completed",
+            },
+        )
+    assert len(restarted_driver._require_platform().sent) == sent_before
     await _close_session(
         restarted_core,
         restarted_session,
@@ -1528,8 +1772,8 @@ async def test_response_route_concurrent_same_shard_preserves_both_entries(
     candidate = 0
     while len(event_ids) < 2:
         event_id = f"response-concurrent-{candidate}"
-        handle = driver._response_routes.response_handle(event_id)
-        shard = driver._response_routes.shard_for_handle(handle)
+        handle = driver._response_checkpoint.response_handle(event_id)
+        shard = driver._response_checkpoint.shard_for_handle(handle)
         if first_shard is None:
             first_shard = shard
             event_ids.append(event_id)
@@ -1540,12 +1784,138 @@ async def test_response_route_concurrent_same_shard_preserves_both_entries(
         *(platform.emit_message(_message(event_id)) for event_id in event_ids),
     )
     handles = [host.reply_handle_for(event_id) for event_id in event_ids]
-    snapshot = await driver._response_routes.snapshot()
-    assert all(snapshot[handle]["state"] == "active" for handle in handles)
+    snapshot = await driver._response_checkpoint.snapshot()
+    assert all(snapshot[handle]["kind"] == "active" for handle in handles)
     await asyncio.gather(
         *(_finish_response(core, identity, handle) for handle in handles),
     )
     await _close_session(core, session, identity)
+
+
+@pytest.mark.asyncio
+async def test_unknown_shard_put_rewrites_latest_desired_state(
+    tmp_path: Path,
+) -> None:
+    """A lost put response cannot make a later same-shard write regress."""
+    state_store = HostStateStore()
+    identity = _identity("response-put-unknown")
+    platform = FakePlatform("response-put-unknown")
+    core, host, driver, session = await _start_session(
+        identity,
+        platform,
+        tmp_path,
+        state_store=state_store,
+        request_timeout=0.02,
+    )
+    event_ids = _same_shard_event_ids(driver, "put-unknown")
+    first_event, second_event = event_ids
+    await platform.emit_message(_message(first_event))
+    first_handle = host.reply_handle_for(first_event)
+    host.lose_response_route_put = True
+    finish = asyncio.create_task(
+        _finish_response(core, identity, first_handle),
+    )
+    await asyncio.wait_for(
+        host.response_route_mutation_applied.wait(),
+        timeout=1.0,
+    )
+    with pytest.raises(RpcTimeoutError):
+        await finish
+    shard = driver._response_checkpoint.shard_for_handle(first_handle)
+    shard_state = driver._response_checkpoint._shards[shard]
+    assert shard_state.dirty is True
+    assert shard_state.settlement.value == "unknown"
+    host.lose_response_route_put = False
+    host.release_response_route_mutation.set()
+    await platform.emit_message(_message(second_event))
+    second_handle = host.reply_handle_for(second_event)
+    await _close_session(core, session, identity)
+
+    restarted_identity = _identity("response-put-unknown", generation=2)
+    (
+        restarted_core,
+        _,
+        restarted_driver,
+        restarted_session,
+    ) = await _start_session(
+        restarted_identity,
+        FakePlatform("response-put-restarted"),
+        tmp_path,
+        state_store=state_store,
+    )
+    snapshot = await restarted_driver._response_checkpoint.snapshot()
+    assert snapshot[first_handle]["kind"] == "terminal"
+    assert snapshot[second_handle]["kind"] == "active"
+    await _close_session(
+        restarted_core,
+        restarted_session,
+        restarted_identity,
+    )
+
+
+@pytest.mark.asyncio
+async def test_unknown_shard_delete_does_not_revive_removed_receipt(
+    tmp_path: Path,
+) -> None:
+    """A lost delete response remains deleted after a later shard write."""
+    now_ms = [1_000_000]
+    state_store = HostStateStore()
+    identity = _identity("response-delete-unknown")
+    platform = FakePlatform("response-delete-unknown")
+    core, host, driver, session = await _start_session(
+        identity,
+        platform,
+        tmp_path,
+        state_store=state_store,
+        response_clock_ms=lambda: now_ms[0],
+        request_timeout=0.02,
+    )
+    first_event, second_event = _same_shard_event_ids(
+        driver,
+        "delete-unknown",
+    )
+    await platform.emit_message(_message(first_event))
+    first_handle = host.reply_handle_for(first_event)
+    await _finish_response(core, identity, first_handle)
+    now_ms[0] += RESPONSE_RECEIPT_TTL_MS + 1
+    host.lose_response_route_delete = True
+    with pytest.raises(ResponseCheckpointUnknownError):
+        await driver._require_lifecycle().gc_response_routes()
+    shard = driver._response_checkpoint.shard_for_handle(first_handle)
+    shard_state = driver._response_checkpoint._shards[shard]
+    assert shard_state.dirty is True
+    assert shard_state.settlement.value == "unknown"
+    await asyncio.wait_for(
+        host.response_route_mutation_applied.wait(),
+        timeout=1.0,
+    )
+    host.lose_response_route_delete = False
+    host.release_response_route_mutation.set()
+    await platform.emit_message(_message(second_event))
+    second_handle = host.reply_handle_for(second_event)
+    await _close_session(core, session, identity)
+
+    restarted_identity = _identity("response-delete-unknown", generation=2)
+    (
+        restarted_core,
+        _,
+        restarted_driver,
+        restarted_session,
+    ) = await _start_session(
+        restarted_identity,
+        FakePlatform("response-delete-restarted"),
+        tmp_path,
+        state_store=state_store,
+        response_clock_ms=lambda: now_ms[0],
+    )
+    snapshot = await restarted_driver._response_checkpoint.snapshot()
+    assert first_handle not in snapshot
+    assert snapshot[second_handle]["kind"] == "active"
+    await _close_session(
+        restarted_core,
+        restarted_session,
+        restarted_identity,
+    )
 
 
 @pytest.mark.asyncio
@@ -2475,7 +2845,13 @@ async def test_invalid_credentials_and_secret_snapshot_rejection(
     )
     await core.start()
     session = asyncio.create_task(
-        _run_driver_session(driver, runner_transport, identity, consumer),
+        _run_driver_session(
+            driver,
+            runner_transport,
+            identity,
+            consumer,
+            30.0,
+        ),
     )
     await asyncio.wait_for(host.hello.wait(), timeout=1.0)
     with pytest.raises(RpcError) as captured:
