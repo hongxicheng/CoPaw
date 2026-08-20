@@ -24,6 +24,10 @@ import pytest
 
 from qwenpaw.app.channels.feishu import driver as driver_module
 from qwenpaw.app.channels.feishu.driver import FeishuDriver
+from qwenpaw.app.channels.feishu.response_routes import (
+    FeishuResponseRouteStore,
+    RESPONSE_TOMBSTONE_TTL_MS,
+)
 from qwenpaw.app.channels.feishu import platform as platform_module
 from qwenpaw.app.channels.feishu.platform import (
     FeishuDeliveryError,
@@ -133,6 +137,7 @@ def _identity(instance_id: str, generation: int = 1) -> FixtureIdentity:
             "host_state",
             "media",
             "reaction",
+            "response_lifecycle",
             "streaming",
         ),
     )
@@ -339,6 +344,7 @@ class MockHost:
         self.hello = asyncio.Event()
         self.reject_unmentioned_groups = False
         self.fail_state_put = False
+        self.fail_response_route_put = False
         self.frames: list[str] = []
         self.transports: tuple[MemoryTransport, MemoryTransport] | None = None
         peer.register_method("runner.hello", self._runner_hello)
@@ -376,9 +382,8 @@ class MockHost:
                 )
                 continue
             self.events.append(event)
-            self.reply_handles[
-                event.event_id
-            ] = f"feishu:reply:{event.event_id}"
+            if event.response_handle is not None:
+                self.reply_handles[event.event_id] = event.response_handle
             accepted.append(event.event_id)
         return {
             "batch_id": params.batch_id,
@@ -404,7 +409,14 @@ class MockHost:
         }
 
     async def _state_put(self, params: Any, _: object) -> dict[str, Any]:
-        if self.fail_state_put:
+        if self.fail_state_put and params.key == "feishu.receive_ids":
+            raise ProtocolValidationError(
+                "fixture state write rejected",
+                reason_code="STATE_LIMIT_EXCEEDED",
+            )
+        if self.fail_response_route_put and params.key.startswith(
+            "feishu.response_routes.",
+        ):
             raise ProtocolValidationError(
                 "fixture state write rejected",
                 reason_code="STATE_LIMIT_EXCEEDED",
@@ -465,6 +477,7 @@ async def _start_session(
     *,
     state_store: HostStateStore | None = None,
     reconnect_initial_delay: float = 0.001,
+    response_routes: FeishuResponseRouteStore | None = None,
 ) -> tuple[RpcPeer, MockHost, FeishuDriver, asyncio.Task[None]]:
     core_transport, runner_transport = _transport_pair()
     core = RpcPeer(core_transport)
@@ -475,6 +488,7 @@ async def _start_session(
         reconnect_initial_delay=reconnect_initial_delay,
         reconnect_max_delay=0.005,
         connect_timeout=1.0,
+        response_routes=response_routes,
     )
     handle = f"secret-{identity.instance_id}"
     consumer = FixtureSecretHandleConsumer(
@@ -564,6 +578,26 @@ async def _send_reply(
             "to_handle": to_handle,
             "operation": "message.create",
             "content_parts": content_parts,
+        },
+    )
+
+
+async def _finish_response(
+    core: RpcPeer,
+    identity: FixtureIdentity,
+    response_handle: str,
+    *,
+    outcome: str = "completed",
+) -> dict[str, Any]:
+    """Finish one request-scoped response through the protocol."""
+    return await core.call(
+        "channel.response.finish",
+        {
+            "channel_key": "feishu",
+            "instance_id": identity.instance_id,
+            "generation": identity.generation,
+            "response_handle": response_handle,
+            "outcome": outcome,
         },
     )
 
@@ -860,22 +894,8 @@ async def test_driver_topic_replies_keep_request_scoped_targets(
             content_parts=content_parts,
         )
         assert result["state"] == "acknowledged"
-        assert (
-            await host.state_store.get(
-                driver._reply_state_key(event_id),
-            )
-            is None
-        )
-        pending = set(messages).difference(
-            reply_order[: reply_order.index(event_id) + 1],
-        )
-        for pending_event_id in pending:
-            assert (
-                await host.state_store.get(
-                    driver._reply_state_key(pending_event_id),
-                )
-                is not None
-            )
+        snapshot = await driver._response_routes.snapshot()
+        assert snapshot[handles[event_id]]["state"] == "active"
     replies = [item for item in platform.sent if item["kind"] == "message"]
     assert [item["reply_message_id"] for item in replies] == [
         f"msg-{event_id}" for event_id in reply_order
@@ -884,6 +904,18 @@ async def test_driver_topic_replies_keep_request_scoped_targets(
         "oc-shared-topic",
         "oc-shared-topic",
     ]
+    for event_id in reply_order:
+        assert (
+            await _finish_response(
+                core,
+                identity,
+                handles[event_id],
+            )
+        )["state"] == "closed"
+    snapshot = await driver._response_routes.snapshot()
+    assert all(
+        snapshot[handle]["state"] == "closed" for handle in handles.values()
+    )
     await _close_session(core, session, identity)
 
 
@@ -917,12 +949,15 @@ async def test_driver_topic_reply_targets_survive_checkpoint_restart(
         event_id: host.reply_handle_for(event_id)
         for event_id in ("restart-a", "restart-b")
     }
-    for event_id in handles:
-        checkpoint = await state_store.get(
-            driver._reply_state_key(event_id),
+    for event_id, handle in handles.items():
+        shard_key = driver._response_routes.state_key(
+            driver._response_routes.shard_for_handle(handle),
         )
+        checkpoint = await state_store.get(shard_key)
         assert checkpoint is not None
-        assert checkpoint[1]["thread_message_id"] == f"msg-{event_id}"
+        assert checkpoint[1][handle]["thread_message_id"] == (
+            f"msg-{event_id}"
+        )
     await _close_session(core, session, identity)
 
     restarted_identity = _identity("topic-restart", generation=2)
@@ -944,6 +979,13 @@ async def test_driver_topic_reply_targets_survive_checkpoint_restart(
             ],
         )
         assert result["state"] == "acknowledged"
+        assert (
+            await _finish_response(
+                restarted_core,
+                restarted_identity,
+                handles[event_id],
+            )
+        )["state"] == "closed"
     replies = [
         item for item in restarted_platform.sent if item["kind"] == "message"
     ]
@@ -1048,7 +1090,6 @@ async def test_driver_unknown_reply_keeps_request_target_for_retry(
         ),
     )
     handle = host.reply_handle_for("unknown-topic")
-    state_key = driver._reply_state_key("unknown-topic")
     platform.send_error = FeishuDeliveryError(
         "PLATFORM_RESULT_UNKNOWN",
         side_effect_possible=True,
@@ -1061,7 +1102,9 @@ async def test_driver_unknown_reply_keeps_request_target_for_retry(
         content_parts=[{"type": "text", "text": "first"}],
     )
     assert unknown["state"] == "unknown"
-    assert await host.state_store.get(state_key) is not None
+    assert (await driver._response_routes.snapshot())[handle][
+        "state"
+    ] == "active"
     platform.send_error = None
     acknowledged = await _send_reply(
         core,
@@ -1072,7 +1115,9 @@ async def test_driver_unknown_reply_keeps_request_target_for_retry(
     )
     assert acknowledged["state"] == "acknowledged"
     assert platform.sent[-1]["reply_message_id"] == "msg-unknown-topic"
-    assert await host.state_store.get(state_key) is None
+    assert (await _finish_response(core, identity, handle))[
+        "state"
+    ] == "closed"
     await _close_session(core, session, identity)
 
 
@@ -1133,12 +1178,9 @@ async def test_driver_thread_reply_and_stream_fallback_use_request_handles(
             "accumulated_text": "A",
         },
     )
-    assert (
-        await state_store.get(
-            driver._reply_state_key("thread-stream"),
-        )
-        is not None
-    )
+    assert (await driver._response_routes.snapshot())[
+        host.reply_handle_for("thread-stream")
+    ]["state"] == "active"
     delta = await core.call(
         "channel.send",
         {
@@ -1167,18 +1209,14 @@ async def test_driver_thread_reply_and_stream_fallback_use_request_handles(
     )
     for result in (created, started, delta, ended):
         assert result["state"] == "acknowledged"
-    assert (
-        await state_store.get(
-            driver._reply_state_key("thread-message"),
-        )
-        is None
-    )
-    assert (
-        await state_store.get(
-            driver._reply_state_key("thread-stream"),
-        )
-        is None
-    )
+    for event_id in ("thread-message", "thread-stream"):
+        assert (
+            await _finish_response(
+                core,
+                identity,
+                host.reply_handle_for(event_id),
+            )
+        )["state"] == "closed"
     messages = [item for item in platform.sent if item["kind"] == "message"]
     assert [item["reply_message_id"] for item in messages] == [
         "msg-thread-message",
@@ -1189,6 +1227,323 @@ async def test_driver_thread_reply_and_stream_fallback_use_request_handles(
     ]
     assert not any(
         item["kind"].startswith("stream.") for item in platform.sent
+    )
+    await _close_session(core, session, identity)
+
+
+@pytest.mark.asyncio
+async def test_response_scope_keeps_approval_route_until_explicit_finish(
+    tmp_path: Path,
+) -> None:
+    """Approval and final messages share one explicitly finished scope."""
+    identity = _identity("response-approval")
+    platform = FakePlatform("response-approval")
+    core, host, driver, session = await _start_session(
+        identity,
+        platform,
+        tmp_path,
+    )
+    await platform.emit_message(
+        _message(
+            "response-approval",
+            chat_id="oc-response-approval",
+            chat_type="group",
+            thread_id="omt-response-approval",
+        ),
+    )
+    handle = host.reply_handle_for("response-approval")
+    assert handle.startswith("feishu:reply:")
+    assert len(handle) == len("feishu:reply:") + 64
+    approval = await core.call(
+        "channel.send",
+        {
+            "channel_key": "feishu",
+            "instance_id": identity.instance_id,
+            "generation": identity.generation,
+            "delivery_id": "approval-card",
+            "to_handle": handle,
+            "operation": "message.create",
+            "content_parts": [{"type": "text", "text": "approve"}],
+            "approval": {
+                "request_id": "approval-1",
+                "tool_name": "shell",
+                "severity": "high",
+            },
+        },
+    )
+    assert approval["state"] == "acknowledged"
+    assert (await driver._response_routes.snapshot())[handle][
+        "state"
+    ] == "active"
+    final = await _send_reply(
+        core,
+        identity,
+        delivery_id="approval-final",
+        to_handle=handle,
+        content_parts=[{"type": "text", "text": "final"}],
+    )
+    assert final["state"] == "acknowledged"
+    reaction = await core.call(
+        "channel.reaction",
+        {
+            "channel_key": "feishu",
+            "instance_id": identity.instance_id,
+            "generation": identity.generation,
+            "delivery_id": "approval-reaction",
+            "to_handle": handle,
+            "target_delivery_id": "approval-final",
+            "reaction": "completed",
+        },
+    )
+    assert reaction["state"] == "acknowledged"
+    explicit = await _send_reply(
+        core,
+        identity,
+        delivery_id="explicit-target",
+        to_handle="feishu:chat_id:oc-explicit-target",
+        content_parts=[{"type": "text", "text": "explicit"}],
+    )
+    assert explicit["state"] == "acknowledged"
+    assert set(driver._delivery_targets) == {
+        "approval-card",
+        "approval-final",
+        "explicit-target",
+    }
+    assert (await _finish_response(core, identity, handle))["state"] == (
+        "closed"
+    )
+    assert set(driver._delivery_targets) == {"explicit-target"}
+    with pytest.raises(RpcError) as closed:
+        await _send_reply(
+            core,
+            identity,
+            delivery_id="approval-late",
+            to_handle=handle,
+            content_parts=[{"type": "text", "text": "late"}],
+        )
+    assert closed.value.data["reason_code"] == "RESPONSE_CLOSED"
+    await _close_session(core, session, identity)
+
+
+@pytest.mark.asyncio
+async def test_response_scope_can_finish_without_outbound_delivery(
+    tmp_path: Path,
+) -> None:
+    """A Core response with no platform output still closes explicitly."""
+    identity = _identity("response-empty")
+    platform = FakePlatform("response-empty")
+    core, host, driver, session = await _start_session(
+        identity,
+        platform,
+        tmp_path,
+    )
+    await platform.emit_message(_message("response-empty"))
+    handle = host.reply_handle_for("response-empty")
+    assert (await _finish_response(core, identity, handle))["state"] == (
+        "closed"
+    )
+    assert (await driver._response_routes.snapshot())[handle]["state"] == (
+        "closed"
+    )
+    await _close_session(core, session, identity)
+
+
+@pytest.mark.asyncio
+async def test_response_route_admission_failure_does_not_submit_event(
+    tmp_path: Path,
+) -> None:
+    """A failed active-route checkpoint prevents Core event admission."""
+    identity = _identity("response-admission-failure")
+    platform = FakePlatform("response-admission-failure")
+    core, host, driver, session = await _start_session(
+        identity,
+        platform,
+        tmp_path,
+    )
+    host.fail_response_route_put = True
+    with pytest.raises(RpcError):
+        await platform.emit_message(_message("response-admission-failure"))
+    assert host.events == []
+    assert await driver._response_routes.snapshot() == {}
+    await _close_session(core, session, identity)
+
+
+@pytest.mark.asyncio
+async def test_response_finish_cleanup_failure_is_retryable_in_feishu_driver(
+    tmp_path: Path,
+) -> None:
+    """Durable close failure preserves the route for a later retry."""
+    identity = _identity("response-finish-retry")
+    platform = FakePlatform("response-finish-retry")
+    core, host, driver, session = await _start_session(
+        identity,
+        platform,
+        tmp_path,
+    )
+    await platform.emit_message(_message("response-finish-retry"))
+    handle = host.reply_handle_for("response-finish-retry")
+    host.fail_response_route_put = True
+    with pytest.raises(RpcError) as failed:
+        await _finish_response(core, identity, handle)
+    assert failed.value.data["reason_code"] == "RESPONSE_FINISH_FAILED"
+    assert (await driver._response_routes.snapshot())[handle]["state"] == (
+        "active"
+    )
+    host.fail_response_route_put = False
+    assert (await _finish_response(core, identity, handle))["state"] == (
+        "closed"
+    )
+    await _close_session(core, session, identity)
+
+
+@pytest.mark.asyncio
+async def test_closed_response_tombstone_restores_across_runner_restart(
+    tmp_path: Path,
+) -> None:
+    """A closed response cannot be reopened by a new Runner generation."""
+    identity = _identity("response-closed-restart")
+    state_store = HostStateStore()
+    platform = FakePlatform("response-closed-restart")
+    core, host, _, session = await _start_session(
+        identity,
+        platform,
+        tmp_path,
+        state_store=state_store,
+    )
+    await platform.emit_message(_message("response-closed-restart"))
+    handle = host.reply_handle_for("response-closed-restart")
+    assert (await _finish_response(core, identity, handle))["state"] == (
+        "closed"
+    )
+    await _close_session(core, session, identity)
+
+    restarted_identity = _identity("response-closed-restart", generation=2)
+    restarted_platform = FakePlatform("response-closed-restart-2")
+    (
+        restarted_core,
+        restarted_host,
+        restarted_driver,
+        restarted_session,
+    ) = await _start_session(
+        restarted_identity,
+        restarted_platform,
+        tmp_path,
+        state_store=state_store,
+    )
+    assert (await restarted_driver._response_routes.snapshot())[handle][
+        "state"
+    ] == "closed"
+    with pytest.raises(RpcError) as closed:
+        await _send_reply(
+            restarted_core,
+            restarted_identity,
+            delivery_id="closed-restart-late",
+            to_handle=handle,
+            content_parts=[{"type": "text", "text": "late"}],
+        )
+    assert closed.value.data["reason_code"] == "RESPONSE_CLOSED"
+    assert not restarted_platform.sent
+    assert (
+        await _finish_response(
+            restarted_core,
+            restarted_identity,
+            handle,
+        )
+    )["state"] == "closed"
+    assert restarted_host.events == []
+    await _close_session(
+        restarted_core,
+        restarted_session,
+        restarted_identity,
+    )
+
+
+@pytest.mark.asyncio
+async def test_completed_tombstone_gc_uses_persistent_wall_clock(
+    tmp_path: Path,
+) -> None:
+    """Expired completed tombstones are removed after a later restart."""
+    now_ms = [1_000_000]
+    state_store = HostStateStore()
+    identity = _identity("response-ttl")
+    platform = FakePlatform("response-ttl")
+    first_routes = FeishuResponseRouteStore(
+        clock_ms=lambda: now_ms[0],
+    )
+    core, host, _, session = await _start_session(
+        identity,
+        platform,
+        tmp_path,
+        state_store=state_store,
+        response_routes=first_routes,
+    )
+    await platform.emit_message(_message("response-ttl"))
+    handle = host.reply_handle_for("response-ttl")
+    assert (await _finish_response(core, identity, handle))["state"] == (
+        "closed"
+    )
+    await _close_session(core, session, identity)
+
+    now_ms[0] += RESPONSE_TOMBSTONE_TTL_MS + 1
+    restarted_identity = _identity("response-ttl", generation=2)
+    restarted_routes = FeishuResponseRouteStore(
+        clock_ms=lambda: now_ms[0],
+    )
+    (
+        restarted_core,
+        _,
+        restarted_driver,
+        restarted_session,
+    ) = await _start_session(
+        restarted_identity,
+        FakePlatform("response-ttl-restarted"),
+        tmp_path,
+        state_store=state_store,
+        response_routes=restarted_routes,
+    )
+    assert await restarted_driver._response_routes.snapshot() == {}
+    shard = restarted_routes.shard_for_handle(handle)
+    assert await state_store.get(restarted_routes.state_key(shard)) is None
+    await _close_session(
+        restarted_core,
+        restarted_session,
+        restarted_identity,
+    )
+
+
+@pytest.mark.asyncio
+async def test_response_route_concurrent_same_shard_preserves_both_entries(
+    tmp_path: Path,
+) -> None:
+    """Concurrent admissions do not lose a same-shard route update."""
+    identity = _identity("response-concurrent")
+    platform = FakePlatform("response-concurrent")
+    core, host, driver, session = await _start_session(
+        identity,
+        platform,
+        tmp_path,
+    )
+    event_ids: list[str] = []
+    first_shard: int | None = None
+    candidate = 0
+    while len(event_ids) < 2:
+        event_id = f"response-concurrent-{candidate}"
+        handle = driver._response_routes.response_handle(event_id)
+        shard = driver._response_routes.shard_for_handle(handle)
+        if first_shard is None:
+            first_shard = shard
+            event_ids.append(event_id)
+        elif shard == first_shard:
+            event_ids.append(event_id)
+        candidate += 1
+    await asyncio.gather(
+        *(platform.emit_message(_message(event_id)) for event_id in event_ids),
+    )
+    handles = [host.reply_handle_for(event_id) for event_id in event_ids]
+    snapshot = await driver._response_routes.snapshot()
+    assert all(snapshot[handle]["state"] == "active" for handle in handles)
+    await asyncio.gather(
+        *(_finish_response(core, identity, handle) for handle in handles),
     )
     await _close_session(core, session, identity)
 

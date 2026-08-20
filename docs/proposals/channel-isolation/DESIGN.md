@@ -217,6 +217,17 @@ Channel 隔离执行层的所有进程、环境 lease、checkpoint、日志、ge
 - generation、lease、operation journal 和原子指针切换；
 - 操作进度、诊断、健康状态和跨平台进程树清理。
 
+request-scoped response 的协议语义（`response_handle`、显式
+`channel.response.finish`、outcome、幂等和关闭 fencing）由 Channel 协议统一定义；其
+Runner 实现不应由每个 Channel 各自复制。active route、closed tombstone、重启恢复、TTL、
+容量分片、Host State 布局、并发读改写和 publication fencing 属于可复用的 Runner 基础
+设施，应在 Phase 3 统一实现和验收。Channel 只负责将不透明 handle 映射到平台目标，以及
+清理该平台自有的 delivery、card、typing 或 stream 资源。
+
+Phase 0 的纵向原型可以在任务局部暂存 route store，以验证协议闭环和平台目标映射，但这
+种实现是过渡性代码：其分片数量、容量、TTL、checkpoint key 和本地索引不是跨 Channel
+规范。后续迁移不得复制该 Channel 局部实现；应先复用或抽取共享 Runner route store。
+
 以下能力保持 Channel 专属，不提前抽象成未知 Plugin 的通用语义：
 
 - `ChannelHostAdapter`、`ChannelDriver` 和 Channel descriptor；

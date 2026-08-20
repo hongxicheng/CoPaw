@@ -553,7 +553,8 @@ Linux、真实 Windows 和真实 frozen desktop 发布制品验收，这些限�
   和状态独立。
 - [x] 验证 Runner 崩溃、重连和 Core 回复。
 
-实现位于 `src/qwenpaw/app/channels/feishu/driver.py` 和 `platform.py`；旧
+实现位于 `src/qwenpaw/app/channels/feishu/driver.py`、`platform.py` 和
+`response_routes.py`；旧
 `FeishuChannel` 未改为消费新组件，`feishu/__init__.py` 仅以懒加载隔离 Runner 导入路径。
 任务局部 Runner 位于 `tests/fixtures/channel_isolation/feishu/runner.py`，没有修改正式
 bootstrap、Env/Process Manager、Registry、Catalog 或 Proxy。生产 adapter 直接覆盖
@@ -568,16 +569,20 @@ Phase 3 的 durable pending、ACK 丢失重投和 Runner 重启恢复投递仍�
 静默和半开 WebSocket 健康监控；为 SDK disconnect、线程清理和 Driver stop 设置内部有限
 边界；`channel.health` 在不扩展 CH-0-004 响应 Schema 的前提下执行有界本地平台探测。
 后续独立 Review 发现同群多个 topic 共用 session alias 时，后入站会覆盖先前在途请求的
-回复目标。修复后 mock Host 从已接收 `InboundEvent.event_id` 形成并保存不透明
-`feishu:reply:<event_id>` handle，Driver 以每个 event 独立的 Host State key 保存
-receive target；普通最终回复或 thread `stream.end` acknowledged 后清理，stream 进行中及
-failed/unknown 结果保留。该请求级路由不改变群聊 session 共享策略，也未扩展 CH-0-004
-closed Schema；主动发送和既有 `feishu:sw:*` session handle 继续兼容。
+回复目标。修复后 Driver 生成固定长度的不透明
+`feishu:reply:<sha256(event_id)>` handle，并由 mock Host 从 `InboundEvent.response_handle`
+原样保存和回传；`FeishuResponseRouteStore` 以确定性分片 Host State 保存 active route 和
+closed tombstone，在 Runner 重启时恢复 response scope。message、approval、stream、reaction
+和 delivery ACK 都不再清理 request route，只有显式 `channel.response.finish` 才关闭并回收
+该 response 的 delivery targets。该请求级路由不改变群聊 session 共享策略，也未扩展
+CH-0-004 closed Schema；主动发送和既有 `feishu:sw:*` session handle 继续兼容。跨
+`host.state.put` 与 `event.batch` 的崩溃原子性和 durable pending/replay 仍归 `CH-3-001`。
 
-实现侧验证：CH-0-007 隔离 suite `30 passed`，普通聚焦入口 `1 passed`；
-`tests/unit/channel_isolation`、旧飞书 unit 和 contract 组合回归
-`456 passed, 1 skipped`；目标文件 pre-commit 全部通过（包含 mypy、black、flake8 和
-pylint），`git diff --check` 通过。测试覆盖两个 Agent 共用同一 `environment_id` 时的独立
+实现侧验证：CH-0-007 隔离 suite `38 passed`，普通聚焦入口包含在该隔离命令中；
+`tests/unit/channel_isolation` 为 `332 passed`，旧飞书 unit/contract 为
+`184 passed, 1 skipped`，CH-0-004 response lifecycle/HostAdapter 为 `25 passed`；目标文件
+pre-commit 全部通过（包含 mypy、black、flake8 和 pylint），`git diff --check` 通过。测试覆盖
+两个 Agent 共用同一 `environment_id` 时的独立
 进程、配置、secret、checkpoint、路由和出站状态，Runner 崩溃后新 generation 从 Host
 State 恢复 Core reply，以及 thread reply/checkpoint 恢复、thread streaming fallback、
 同群 topic 顺序/反向完成、同一/不同发送者、多个在途请求 checkpoint 恢复、媒体目标、
@@ -585,6 +590,29 @@ State 恢复 Core reply，以及 thread reply/checkpoint 恢复、thread streami
 有界清理和断连期间 health 可观测性。当前未运行真实飞书
 外部收发、Linux、真实 Windows、frozen desktop 和全仓库测试；这些限制等待独立 Review、
 G0 或发布验证处理，本任务不得据此标记为 `[x]`。
+
+#### 原型限制与后续工作
+
+本任务中的 `response_routes.py` 是 CH-0-007 的局部原型，用于验证
+`response_handle` 从 Runner 入站、经 Core 原样传递、再精确解析为飞书回复目标的闭环。
+它不是最终的跨 Channel route 基础设施。当前实现中的确定性分片、单片容量、总条目上限、
+TTL、Host State key 布局、并发读改写和 Driver 本地 delivery 索引，均属于待替换的实现
+选择，不构成 Design、协议或其他 Channel 的约束。
+
+后续 Phase 3 应提供共享 Runner route store，统一 active route、closed tombstone、恢复、
+容量和并发语义，并让 Feishu 迁移到该共享实现。后续 Channel 不得复制
+`response_routes.py` 的完整实现；只应提供平台目标的编码/解码和平台资源清理回调。
+
+以下问题已明确留给后续阶段，不作为本原型的额外完成条件：
+
+- `host.state.put` 与 `event.batch` 之间不存在跨 RPC 原子性；可靠 pending、ACK 丢失重投和
+  Runner 重启后的事件重放属于 `CH-3-001`。
+- 出站 delivery ledger、unknown settlement、平台幂等和跨重启发送恢复属于
+  `CH-3-002`；CH-0-007 只验证 Driver 与现有生命周期接口的边界。
+- route store 的共享持久化、统一 tombstone GC、容量协调和崩溃一致性属于 Phase 3
+  共享基础设施任务（任务编号待后续 Plan 分配），不在本任务中新增正式通用组件。
+- 当前任务局部 fixture Runner 不代表正式 bootstrap、Proxy、Registry 或全局 Core 接入；
+  这些边界仍按本任务既有范围和后续 Phase 任务处理。
 
 验收：两个 Agent 使用不同飞书配置并行收发，无配置、session 或状态串用。
 
