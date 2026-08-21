@@ -174,6 +174,7 @@ class LifecycleController:  # pylint: disable=too-many-public-methods
             clock_ms=response_clock_ms,
         )
         self._response_finish_tasks: dict[str, asyncio.Task[bool]] = {}
+        self._response_discard_tasks: dict[str, asyncio.Task[None]] = {}
         self._response_checkpoint_pending: set[str] = set()
         self._endpoint_handler = endpoint_handler
         self._clock_ms = clock_ms or (lambda: time.monotonic_ns() // 1_000_000)
@@ -592,38 +593,87 @@ class LifecycleController:  # pylint: disable=too-many-public-methods
             )
 
     async def discard_response_route(self, response_handle: str) -> None:
-        """Discard one permanently rejected active response route."""
+        """Revoke and reconcile one permanently rejected response route."""
         handle = validate_response_handle(response_handle)
         async with self._lock:
-            if handle in self._response_checkpoint_pending:
+            task = self._response_discard_tasks.get(handle)
+            if task is None and (
+                handle in self._response_checkpoint_pending
+                or self._outbound.has_inflight_response(handle)
+            ):
                 raise self._response_error(
                     "RESPONSE_BUSY",
-                    "response route checkpoint is pending",
+                    "response route has an in-flight operation",
                     retryable=True,
                 )
-            if self._outbound.has_inflight_response(handle):
-                raise self._response_error(
-                    "RESPONSE_BUSY",
-                    "response has an in-flight delivery",
-                    retryable=True,
-                )
-            try:
-                snapshot = self._response_routes.discard_candidate(handle)
-            except ResponseStateError as exc:
-                raise self._response_error_from_state(exc) from exc
-            if snapshot is not None:
-                self._response_checkpoint_pending.add(handle)
-        if snapshot is None:
-            return
+            if task is None:
+                try:
+                    snapshot = self._response_routes.begin_revocation(handle)
+                except ResponseStateError as exc:
+                    raise self._response_error_from_state(exc) from exc
+                if snapshot is None:
+                    return
+                task = self._response_discard_task_locked(snapshot)
+        await asyncio.shield(task)
+
+    async def _run_response_discard(
+        self,
+        snapshot: ResponseRouteSnapshot,
+    ) -> None:
+        """Persist a revocation, delete its checkpoint, then remove it."""
         try:
-            await self._delete_response_snapshot(handle, snapshot.version)
-        except BaseException:
+            await self._put_response_snapshot(snapshot)
             async with self._lock:
-                self._response_checkpoint_pending.discard(handle)
-            raise
+                self._response_routes.commit_revocation(snapshot)
+            await self._delete_response_snapshot(
+                snapshot.response_handle,
+                snapshot.version,
+            )
+            async with self._lock:
+                self._response_routes.commit_discard(snapshot)
+        finally:
+            async with self._lock:
+                task = asyncio.current_task()
+                if (
+                    self._response_discard_tasks.get(
+                        snapshot.response_handle,
+                    )
+                    is task
+                ):
+                    self._response_discard_tasks.pop(
+                        snapshot.response_handle,
+                        None,
+                    )
+
+    def _response_discard_task_locked(
+        self,
+        snapshot: ResponseRouteSnapshot,
+    ) -> asyncio.Task[None]:
+        """Return the one temporary discard task for a response handle."""
+        task = self._response_discard_tasks.get(snapshot.response_handle)
+        if task is not None:
+            return task
+        task = asyncio.create_task(self._run_response_discard(snapshot))
+        self._response_discard_tasks[snapshot.response_handle] = task
+        return task
+
+    async def resume_response_cleanups(self) -> None:
+        """Retry both terminal cleanup and route revocation tasks."""
         async with self._lock:
-            self._response_routes.commit_discard(snapshot)
-            self._response_checkpoint_pending.discard(handle)
+            pending = self._response_routes.pending_cleanups()
+            finish_tasks = [
+                self._response_finish_task_locked(item) for item in pending
+            ]
+            revoked = self._response_routes.pending_revocations()
+            discard_tasks = [
+                self._response_discard_task_locked(item) for item in revoked
+            ]
+        tasks = [*finish_tasks, *discard_tasks]
+        if tasks:
+            await asyncio.gather(
+                *(asyncio.shield(task) for task in tasks),
+                return_exceptions=True,
+            )
 
     async def response_route_snapshot(
         self,
@@ -694,19 +744,6 @@ class LifecycleController:  # pylint: disable=too-many-public-methods
                     )
         if first_error is not None:
             raise first_error
-
-    async def resume_response_cleanups(self) -> None:
-        """Retry cleanup-pending receipts after the generation is active."""
-        async with self._lock:
-            pending = self._response_routes.pending_cleanups()
-            tasks = [
-                self._response_finish_task_locked(item) for item in pending
-            ]
-        if tasks:
-            await asyncio.gather(
-                *(asyncio.shield(task) for task in tasks),
-                return_exceptions=True,
-            )
 
     async def response_finish(
         self,
@@ -1145,14 +1182,16 @@ class LifecycleController:  # pylint: disable=too-many-public-methods
         )
         if attempt.response_handle is None or not internal.resource_refs:
             return result
+        response_handle = attempt.response_handle
         async with self._lock:
             try:
                 snapshot = self._response_routes.record_delivery(
-                    attempt.response_handle,
+                    response_handle,
                     internal.resource_refs,
                 )
             except ResponseStateError as exc:
                 raise self._response_error_from_state(exc) from exc
+            self._response_checkpoint_pending.add(response_handle)
         try:
             await self._put_response_snapshot(snapshot)
         except Exception:
@@ -1160,7 +1199,34 @@ class LifecycleController:  # pylint: disable=too-many-public-methods
                 attempt.delivery_id,
                 "PLATFORM_RESULT_UNKNOWN",
             )
+        finally:
+            await self._clear_response_checkpoint_pending_resilient(
+                response_handle,
+            )
         return result
+
+    async def _clear_response_checkpoint_pending_resilient(
+        self,
+        response_handle: str,
+    ) -> None:
+        """Clear checkpoint admission despite repeated cancellation."""
+        cleanup = asyncio.create_task(
+            self._clear_response_checkpoint_pending(response_handle),
+        )
+        while not cleanup.done():
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                continue
+        cleanup.result()
+
+    async def _clear_response_checkpoint_pending(
+        self,
+        response_handle: str,
+    ) -> None:
+        """Clear one response checkpoint admission marker."""
+        async with self._lock:
+            self._response_checkpoint_pending.discard(response_handle)
 
     def _outbound_response_publication(
         self,

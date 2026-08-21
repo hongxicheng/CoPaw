@@ -29,9 +29,10 @@ class ResponseStateError(Exception):
 
 
 class ResponseRouteKind(StrEnum):
-    """Identify the two durable aggregate states."""
+    """Identify the durable Runner route states."""
 
     ACTIVE = "active"
+    REVOKED = "revoked"
     TERMINAL = "terminal"
 
 
@@ -130,6 +131,8 @@ class ResponseRouteSnapshot:
             )
         if self.kind is ResponseRouteKind.ACTIVE:
             self._validate_active()
+        elif self.kind is ResponseRouteKind.REVOKED:
+            self._validate_revoked()
         else:
             self._validate_terminal()
 
@@ -143,6 +146,18 @@ class ResponseRouteSnapshot:
         )
         if any(value is not None for value in terminal_values):
             raise ValueError("active response route has terminal state")
+
+    def _validate_revoked(self) -> None:
+        """Validate an execution-side route revocation snapshot."""
+        revoked_values = (
+            self.outcome,
+            self.cleanup_state,
+            self.closed_at_ms,
+            self.cleanup_completed_at_ms,
+            self.expires_at_ms,
+        )
+        if any(value is not None for value in revoked_values):
+            raise ValueError("revoked response route has terminal state")
 
     def _validate_terminal(self) -> None:
         if (
@@ -310,7 +325,7 @@ class ResponseRouteAggregate:
         normalized = _normalize_refs(route_refs)
         existing = self._entries.get(handle)
         if existing is not None:
-            if existing.kind is ResponseRouteKind.TERMINAL:
+            if existing.kind is not ResponseRouteKind.ACTIVE:
                 raise ResponseStateError(
                     "RESPONSE_CLOSED",
                     "response route is closed",
@@ -337,6 +352,22 @@ class ResponseRouteAggregate:
             return False
         existing = self._entries.get(snapshot.response_handle)
         if existing is not None:
+            if (
+                existing.kind is ResponseRouteKind.TERMINAL
+                and snapshot.kind is not ResponseRouteKind.TERMINAL
+            ):
+                return False
+            if (
+                existing.kind is ResponseRouteKind.REVOKED
+                and snapshot.kind is not ResponseRouteKind.REVOKED
+            ):
+                return False
+            if (
+                snapshot.kind is ResponseRouteKind.REVOKED
+                and existing.kind is ResponseRouteKind.ACTIVE
+                and snapshot.version <= existing.version
+            ):
+                return False
             if existing.version >= snapshot.version:
                 if (
                     existing != snapshot
@@ -352,25 +383,53 @@ class ResponseRouteAggregate:
         self._entries[snapshot.response_handle] = snapshot
         return True
 
-    def discard_candidate(
+    def begin_revocation(
         self,
         response_handle: str,
     ) -> ResponseRouteSnapshot | None:
-        """Return one rejected active route without removing its fence."""
+        """Fence one active route before its durable deletion."""
         snapshot = self._entries.get(response_handle)
         if snapshot is None:
             return None
+        if snapshot.kind is ResponseRouteKind.REVOKED:
+            return snapshot
         if snapshot.kind is not ResponseRouteKind.ACTIVE:
             raise ResponseStateError(
                 "RESPONSE_CLOSED",
                 "terminal response receipt cannot be discarded",
             )
-        return snapshot
+        revoked = replace(
+            snapshot,
+            kind=ResponseRouteKind.REVOKED,
+            version=snapshot.version + 1,
+        )
+        self._entries[response_handle] = revoked
+        return revoked
 
-    def commit_discard(self, candidate: ResponseRouteSnapshot) -> None:
-        """Remove an active route after checkpoint deletion commits."""
-        if self._entries.get(candidate.response_handle) == candidate:
-            self._entries.pop(candidate.response_handle, None)
+    def commit_revocation(self, snapshot: ResponseRouteSnapshot) -> None:
+        """Confirm that the revoked snapshot is durable."""
+        current = self._entries.get(snapshot.response_handle)
+        if (
+            current != snapshot
+            or snapshot.kind is not ResponseRouteKind.REVOKED
+        ):
+            raise RuntimeError("response revocation snapshot is stale")
+
+    def pending_revocations(self) -> tuple[ResponseRouteSnapshot, ...]:
+        """Return revoked routes awaiting durable deletion."""
+        return tuple(
+            snapshot
+            for snapshot in self.snapshots()
+            if snapshot.kind is ResponseRouteKind.REVOKED
+        )
+
+    def commit_discard(self, snapshot: ResponseRouteSnapshot) -> None:
+        """Remove a revoked route after checkpoint deletion commits."""
+        if (
+            self._entries.get(snapshot.response_handle) == snapshot
+            and snapshot.kind is ResponseRouteKind.REVOKED
+        ):
+            self._entries.pop(snapshot.response_handle, None)
 
     def rollback_open(self, response_handle: str, version: int) -> None:
         """Rollback a failed first checkpoint without touching newer state."""
@@ -388,7 +447,7 @@ class ResponseRouteAggregate:
         snapshot = self._entries.get(response_handle)
         if snapshot is None:
             return False
-        if snapshot.kind is ResponseRouteKind.TERMINAL:
+        if snapshot.kind is not ResponseRouteKind.ACTIVE:
             raise ResponseStateError(
                 "RESPONSE_CLOSED",
                 "response route is closed",
@@ -424,6 +483,11 @@ class ResponseRouteAggregate:
             raise ResponseStateError(
                 "RESPONSE_HANDLE_UNKNOWN",
                 "response handle is unknown",
+            )
+        if snapshot.kind is ResponseRouteKind.REVOKED:
+            raise ResponseStateError(
+                "RESPONSE_CLOSED",
+                "response route is closed",
             )
         if snapshot.kind is ResponseRouteKind.TERMINAL:
             if snapshot.outcome is not outcome:
@@ -537,7 +601,7 @@ class ResponseRouteAggregate:
                 "RESPONSE_HANDLE_UNKNOWN",
                 "response handle is unknown",
             )
-        if snapshot.kind is ResponseRouteKind.TERMINAL:
+        if snapshot.kind is not ResponseRouteKind.ACTIVE:
             raise ResponseStateError(
                 "RESPONSE_CLOSED",
                 "response route is closed",

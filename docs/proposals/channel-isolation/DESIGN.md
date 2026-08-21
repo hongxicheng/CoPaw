@@ -618,8 +618,10 @@ card）、`stream.end`、completed reaction 和 delivery `acknowledged` 都只�
 Core 是 response 业务生命周期的唯一权威，Runner 不解释 Agent 的 completed、failed 或
 cancelled 结果。Runner 为每个 response 维护唯一、有界的 route/cleanup aggregate，并由
 ChannelDriver 的可选 finish handler 幂等释放平台 route、typing/card 等资源。aggregate 只有
-active route 或 terminal finish receipt 两种形态；terminal receipt 同时提供执行侧 closed
-fence，而不是第二套业务生命周期。关闭保持单调：同一 handle、同一 outcome 重复 finish
+active route、revoked route 或 terminal finish receipt 三种形态；revoked 是永久 rejected
+后的执行侧撤销意图，不是 Core 的 response outcome。revoked route 在其 snapshot 持久化确认
+前不得执行 Host State delete；delete 未确认前不得恢复 active，且不受 terminal receipt TTL
+GC 影响。terminal receipt 同时提供执行侧 closed fence，而不是第二套业务生命周期。关闭保持单调：同一 handle、同一 outcome 重复 finish
 返回成功；冲突 outcome 返回
 `RESPONSE_OUTCOME_CONFLICT`；未知 handle 返回 `RESPONSE_HANDLE_UNKNOWN`；closed handle 上
 的新 `channel.send` 或 `channel.reaction` 返回 `RESPONSE_CLOSED`，且不得调用平台 handler。
@@ -673,6 +675,14 @@ task，等待者使用 shield，单个等待者取消不得取消共享清理。
 失败时当前进程仍保持 closed fence；cleanup 成功但 complete snapshot 失败时不得返回 finish
 成功，后续重试继续执行幂等清理并完成持久化。所有 open、finish、send 和 reaction 仍受
 active state、lease、generation 和 identity fencing。
+
+永久 rejected route 的 discard 使用独立、有界的按 handle reconcile task。task 只协调
+`revoked snapshot → Host State delete → aggregate removal`，不保存第二份 revoked 或
+deleted 事实；并发 discard 共享同一 task，等待者使用 shield，单个调用取消不得取消
+实际 reconcile。revoked snapshot 持久化失败或结果未知时不得执行 delete；delete 失败、
+timeout、断连、取消或响应丢失时保留 revoked，后续 discard 或 Runner 恢复继续重试。
+已确认持久化的 revoked snapshot 在重启后只能恢复为 revoked 并继续 reconcile。若 revoked
+intent 从未被 Host State 接受且进程立即崩溃，系统不宣称能够凭空恢复该未持久化事实。
 
 Core 必须在真实 outbound facade 中为同一 response handle 建立 happens-before：finish 只在
 此前 send/reaction 已完成 publication 或收敛为 unknown 后提交，且 finish 后不再提交新的执行
@@ -2162,5 +2172,5 @@ Core Channel、runner-process Channel 和 legacy Plugin Channel 混合运行、�
 | ADR-034 | 对需要入站媒体落盘的 Channel，Core 统一解析 `config.media_dir` → `workspace_dir/media` → `WORKING_DIR/media`；`from_env` 使用 `<CHANNEL>_MEDIA_DIR` → `WORKING_DIR/media`。最终目录平铺，不追加 Channel 子目录；各 Channel 保留现有下载、命名、覆盖和清理行为，不迁移既有文件 | 已确认；替代 ADR-032 |
 | ADR-035 | v1 标识使用带唯一 string escape 和 finite decimal 的受限 canonical JSON、domain separator + NUL、完整 SHA-256 和稳定前缀；逻辑 ID 与 `dir1_` 磁盘目录键分离，目录 manifest 保留并核对完整逻辑 ID；platform tag 必须属于版本化 release target registry | 已确认 |
 | ADR-036 | v1 descriptor 使用 closed object、显式空值和字段级 required/nullable/secret/condition 语义；Requirement 在 digest 前统一 canonicalize，重复折叠且拒绝 `extra` marker；condition domain 必须有限；`config_fields` 是支持 number 的 UI 投影，完整 value schema 仍由 Pydantic/JSON Schema 或 plugin artifact schema 负责；身份声明可引用 secret 字段但 secret value 仅在 Core 内比较；静态读取不得 import 平台模块；process mode 唯一派生驱动接口 | 已确认 |
-| ADR-037 | request-scoped response 的终止由 Core 通过可重试、幂等的 `channel.response.finish` 显式通知 Runner；不得由 message、stream 或 delivery ACK 推断。Core 是业务生命周期唯一权威；Runner 以唯一 route/cleanup aggregate 维护执行侧 closed fence、delivery drain、可恢复资源清理和完成 receipt。cleanup pending 不做普通 TTL GC，只有 cleanup complete receipt 从完成时固定保留 24 小时且不可运行时覆盖；TTL GC 后仅 finish 保证 `RESPONSE_HANDLE_UNKNOWN`，不保留第二套历史 handle fence。Host State shard 的 unknown mutation 保留最新 desired 并由后续 mutation 完整重写；首次 provisional open 的确定性拒绝同时精确回滚 aggregate 和 checkpoint desired。Feishu 新 aggregate Host State 格式从内部 schema version 1 开始，不兼容未上线的开发期旧格式；平台资源引用必须在 acknowledged publication 前持久化。真实 Core per-handle sequencer 由 CH-2-005 `IsolatedChannelProxy` 提供 | 已确认 |
+| ADR-037 | request-scoped response 的终止由 Core 通过可重试、幂等的 `channel.response.finish` 显式通知 Runner；不得由 message、stream 或 delivery ACK 推断。Core 是业务生命周期唯一权威；Runner 以唯一 route/cleanup aggregate 维护执行侧 closed fence、delivery drain、可恢复资源清理和完成 receipt。永久 rejected route 先进入执行侧 `revoked`，只有 revoked snapshot 持久化确认后才执行 Host State delete；delete 未确认前不得复活或 TTL GC，重复 discard 共享可取消隔离的有界 reconcile task。cleanup pending 不做普通 TTL GC，只有 cleanup complete receipt 从完成时固定保留 24 小时且不可运行时覆盖；TTL GC 后仅 finish 保证 `RESPONSE_HANDLE_UNKNOWN`，不保留第二套历史 handle fence。Host State shard 的 unknown mutation 保留最新 desired 并由后续 mutation 完整重写；首次 provisional open 的确定性拒绝同时精确回滚 aggregate 和 checkpoint desired。Feishu 新 aggregate Host State 格式从内部 schema version 1 开始，不兼容未上线的开发期旧格式；平台资源引用必须在 acknowledged publication 前持久化。真实 Core per-handle sequencer 由 CH-2-005 `IsolatedChannelProxy` 提供 | 已确认 |
 | ADR-038 | Core 以有界 generation authority 同时持有一个 active 和一个 candidate，并通过 immutable snapshot、candidate epoch 与 operation token 统一 Host RPC 和 endpoint route authorization；只有 committed generation 的 `ready && !quiescing` endpoint 可接收正式流量。quiesce/stop 在 Runner RPC 前撤销，lease expiry 和 generation replacement 单调 fencing，迟到 control/endpoint 响应不得复活旧 generation | 已确认 |

@@ -27,7 +27,9 @@ from qwenpaw.channel_protocol import (
 )
 from qwenpaw.channel_protocol.response_lifecycle import (
     ResponseCleanupState,
+    ResponseCheckpointUnknownError,
     ResponseResourceRef,
+    ResponseRouteAggregate,
     ResponseRouteKind,
     ResponseRouteSnapshot,
     RunnerDeliveryResult,
@@ -327,6 +329,203 @@ async def test_receipt_gc_commits_after_checkpoint_delete() -> None:
 
 
 @pytest.mark.asyncio
+async def test_discard_persists_revoked_before_delete() -> None:
+    """A revoked route is persisted before its checkpoint is deleted."""
+    calls: list[str] = []
+
+    async def checkpoint_put(
+        snapshot: ResponseRouteSnapshot,
+        _: bool,
+    ) -> None:
+        calls.append(f"put:{snapshot.kind.value}")
+
+    async def checkpoint_delete(_: str, __: int) -> None:
+        calls.append("delete")
+
+    controller = _controller(Clock())
+    controller._response_checkpoint_put = checkpoint_put
+    controller._response_checkpoint_delete = checkpoint_delete
+    await _activate(controller)
+    await controller.open_response_route("revoked-order")
+    await controller.discard_response_route("revoked-order")
+    assert calls == ["put:active", "put:revoked", "delete"]
+    assert await controller.response_route_snapshot("revoked-order") is None
+
+
+@pytest.mark.asyncio
+async def test_revoked_put_failure_does_not_delete_or_reopen() -> None:
+    """A failed revoked checkpoint fences the route without deleting it."""
+    fail_revoked = True
+    deletes = 0
+
+    async def checkpoint_put(
+        snapshot: ResponseRouteSnapshot,
+        _: bool,
+    ) -> None:
+        if snapshot.kind is ResponseRouteKind.REVOKED and fail_revoked:
+            raise RuntimeError("checkpoint unavailable")
+
+    async def checkpoint_delete(_: str, __: int) -> None:
+        nonlocal deletes
+        deletes += 1
+
+    controller = _controller(Clock())
+    controller._response_checkpoint_put = checkpoint_put
+    controller._response_checkpoint_delete = checkpoint_delete
+    await _activate(controller)
+    await controller.open_response_route("revoked-failure")
+    with pytest.raises(RuntimeError):
+        await controller.discard_response_route("revoked-failure")
+    snapshot = await controller.response_route_snapshot("revoked-failure")
+    assert snapshot is not None
+    assert snapshot.kind is ResponseRouteKind.REVOKED
+    assert deletes == 0
+    with pytest.raises(RpcError) as closed:
+        await controller.response_finish(_finish("revoked-failure"))
+    assert closed.value.data["reason_code"] == "RESPONSE_CLOSED"
+    fail_revoked = False
+    await controller.discard_response_route("revoked-failure")
+    assert deletes == 1
+    assert await controller.response_route_snapshot("revoked-failure") is None
+
+
+@pytest.mark.asyncio
+async def test_revoked_put_unknown_does_not_delete_until_retry() -> None:
+    """An unknown revoked put settlement must be retried before delete."""
+    fail_unknown = True
+    deletes = 0
+
+    async def checkpoint_put(
+        snapshot: ResponseRouteSnapshot,
+        _: bool,
+    ) -> None:
+        if snapshot.kind is ResponseRouteKind.REVOKED and fail_unknown:
+            raise ResponseCheckpointUnknownError("put settlement unknown")
+
+    async def checkpoint_delete(_: str, __: int) -> None:
+        nonlocal deletes
+        deletes += 1
+
+    controller = _controller(Clock())
+    controller._response_checkpoint_put = checkpoint_put
+    controller._response_checkpoint_delete = checkpoint_delete
+    await _activate(controller)
+    await controller.open_response_route("revoked-unknown")
+    with pytest.raises(ResponseCheckpointUnknownError):
+        await controller.discard_response_route("revoked-unknown")
+    assert deletes == 0
+    fail_unknown = False
+    await controller.discard_response_route("revoked-unknown")
+    assert deletes == 1
+
+
+def test_revoked_snapshot_cannot_be_replaced_by_old_active() -> None:
+    """Restore never reopens a route after its revocation fence."""
+    aggregate = ResponseRouteAggregate(max_entries=2)
+    active, _ = aggregate.open("monotonic")
+    revoked = aggregate.begin_revocation("monotonic")
+    assert revoked is not None
+    assert revoked.version == active.version + 1
+    assert not aggregate.restore(active)
+    assert aggregate.snapshot("monotonic") == revoked
+
+
+@pytest.mark.asyncio
+async def test_duplicate_discard_shares_cancel_safe_task() -> None:
+    """Duplicate discard calls share a task and isolate waiter cancellation."""
+    started = asyncio.Event()
+    release = asyncio.Event()
+    deletes = 0
+
+    async def checkpoint_delete(_: str, __: int) -> None:
+        nonlocal deletes
+        started.set()
+        await release.wait()
+        deletes += 1
+
+    controller = _controller(Clock())
+    controller._response_checkpoint_delete = checkpoint_delete
+    await _activate(controller)
+    await controller.open_response_route("shared-discard")
+    first = asyncio.create_task(
+        controller.discard_response_route("shared-discard"),
+    )
+    second = asyncio.create_task(
+        controller.discard_response_route("shared-discard"),
+    )
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    release.set()
+    await second
+    assert deletes == 1
+    assert not controller._response_discard_tasks
+
+
+@pytest.mark.asyncio
+async def test_restored_revoked_route_reconciles_without_handler() -> None:
+    """A durable revoked snapshot remains fenced after Runner restart."""
+    durable: dict[str, ResponseRouteSnapshot] = {}
+    deletes = 0
+    platform_calls = 0
+    fail_delete = True
+
+    async def checkpoint_put(
+        snapshot: ResponseRouteSnapshot,
+        _: bool,
+    ) -> None:
+        durable[snapshot.response_handle] = snapshot
+
+    async def checkpoint_delete(_: str, __: int) -> None:
+        nonlocal deletes, fail_delete
+        if fail_delete:
+            raise RuntimeError("delete unavailable")
+        deletes += 1
+
+    async def send_handler(_: SendParams) -> dict[str, str]:
+        nonlocal platform_calls
+        platform_calls += 1
+        return {"delivery_id": "late", "state": "acknowledged"}
+
+    first = _controller(Clock())
+    first._response_checkpoint_put = checkpoint_put
+    first._response_checkpoint_delete = checkpoint_delete
+    await _activate(first)
+    await first.open_response_route("restart-revoked")
+    with pytest.raises(RuntimeError):
+        await first.discard_response_route("restart-revoked")
+    revoked = durable["restart-revoked"]
+    assert revoked.kind is ResponseRouteKind.REVOKED
+
+    restored = _controller(Clock())
+    restored._response_checkpoint_put = checkpoint_put
+    restored._response_checkpoint_delete = checkpoint_delete
+    restored._send_handler = send_handler
+    await _activate(restored)
+    await restored.restore_response_routes((revoked,))
+    with pytest.raises(RpcError) as closed:
+        await restored.send(
+            SendParams.from_mapping(
+                {
+                    **_identity(),
+                    "delivery_id": "late",
+                    "to_handle": "restart-revoked",
+                    "content_parts": [
+                        {"type": "text", "text": "late"},
+                    ],
+                },
+            ),
+        )
+    assert closed.value.data["reason_code"] == "RESPONSE_CLOSED"
+    fail_delete = False
+    await restored.resume_response_cleanups()
+    assert deletes == 1
+    assert platform_calls == 0
+    assert await restored.response_route_snapshot("restart-revoked") is None
+
+
+@pytest.mark.asyncio
 async def test_duplicate_open_rechecks_checkpoint() -> None:
     """A duplicate open can confirm the same desired checkpoint again."""
     started = asyncio.Event()
@@ -392,6 +591,157 @@ async def test_response_finish_is_busy_until_delivery_settles() -> None:
     assert (await controller.response_finish(_finish("busy-response")))[
         "state"
     ] == "closed"
+
+
+@pytest.mark.asyncio
+async def test_discard_is_busy_while_resource_snapshot_is_written() -> None:
+    """Discard cannot overtake an in-flight resource checkpoint mutation."""
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def checkpoint_put(
+        snapshot: ResponseRouteSnapshot,
+        _: bool,
+    ) -> None:
+        if snapshot.resource_refs:
+            started.set()
+            await release.wait()
+
+    async def send_handler(_: SendParams) -> RunnerDeliveryResult:
+        return RunnerDeliveryResult(
+            outbound_result={
+                "delivery_id": "snapshot-race",
+                "state": "acknowledged",
+            },
+            resource_refs=(
+                ResponseResourceRef.create(
+                    "feishu.delivery",
+                    "snapshot-race",
+                ),
+            ),
+        )
+
+    controller = _controller(Clock())
+    controller._response_checkpoint_put = checkpoint_put
+    controller._send_handler = send_handler
+    await _activate(controller)
+    await controller.open_response_route("snapshot-race-response")
+    send_task = asyncio.create_task(
+        controller.send(
+            SendParams.from_mapping(
+                {
+                    **_identity(),
+                    "delivery_id": "snapshot-race",
+                    "to_handle": "snapshot-race-response",
+                    "content_parts": [
+                        {"type": "text", "text": "race"},
+                    ],
+                },
+            ),
+        ),
+    )
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    with pytest.raises(RpcError) as busy:
+        await controller.discard_response_route("snapshot-race-response")
+    assert busy.value.data["reason_code"] == "RESPONSE_BUSY"
+    release.set()
+    await send_task
+    await controller.discard_response_route("snapshot-race-response")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recovery", ["send", "finish", "discard"])
+async def test_cancelled_resource_snapshot_clears_pending(
+    recovery: str,
+) -> None:
+    """Resource checkpoint cancellation cannot leave a permanent busy fence."""
+    started = asyncio.Event()
+    release = asyncio.Event()
+    block_snapshot = True
+
+    async def checkpoint_put(
+        snapshot: ResponseRouteSnapshot,
+        _: bool,
+    ) -> None:
+        if snapshot.resource_refs and block_snapshot:
+            started.set()
+            await release.wait()
+
+    async def send_handler(params: SendParams) -> RunnerDeliveryResult:
+        return RunnerDeliveryResult(
+            outbound_result={
+                "delivery_id": params.delivery_id,
+                "state": "acknowledged",
+            },
+            resource_refs=(
+                ResponseResourceRef.create(
+                    "feishu.delivery",
+                    params.delivery_id,
+                ),
+            ),
+        )
+
+    controller = _controller(Clock())
+    controller._response_checkpoint_put = checkpoint_put
+    controller._send_handler = send_handler
+    await _activate(controller)
+    handle = f"cancelled-{recovery}"
+    await controller.open_response_route(handle)
+    send_task = asyncio.create_task(
+        controller.send(
+            SendParams.from_mapping(
+                {
+                    **_identity(),
+                    "delivery_id": f"cancelled-resource-{recovery}",
+                    "to_handle": handle,
+                    "content_parts": [
+                        {"type": "text", "text": "cancel"},
+                    ],
+                },
+            ),
+        ),
+    )
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    await controller._lock.acquire()
+    try:
+        send_task.cancel()
+        await asyncio.sleep(0)
+        send_task.cancel()
+        await asyncio.sleep(0)
+    finally:
+        controller._lock.release()
+    with pytest.raises(asyncio.CancelledError):
+        await send_task
+    assert handle not in controller._response_checkpoint_pending
+    assert (
+        controller._outbound.delivery_state(
+            f"cancelled-resource-{recovery}",
+        ).value
+        == "unknown"
+    )
+
+    block_snapshot = False
+    if recovery == "send":
+        result = await controller.send(
+            SendParams.from_mapping(
+                {
+                    **_identity(),
+                    "delivery_id": "recovered-send",
+                    "to_handle": handle,
+                    "content_parts": [
+                        {"type": "text", "text": "continue"},
+                    ],
+                },
+            ),
+        )
+        assert result["state"] == "acknowledged"
+    elif recovery == "finish":
+        assert (await controller.response_finish(_finish(handle)))[
+            "state"
+        ] == "closed"
+    else:
+        await controller.discard_response_route(handle)
+        assert await controller.response_route_snapshot(handle) is None
 
 
 @pytest.mark.asyncio
@@ -694,6 +1044,14 @@ def test_snapshot_is_closed_and_deterministic() -> None:
     assert (
         ResponseRouteSnapshot.from_mapping(snapshot.to_mapping()) == snapshot
     )
+    revoked = ResponseRouteSnapshot(
+        response_handle="revoked-response",
+        kind=ResponseRouteKind.REVOKED,
+        version=3,
+        route_refs=(ref,),
+        resource_refs=(ref,),
+    )
+    assert ResponseRouteSnapshot.from_mapping(revoked.to_mapping()) == revoked
     with pytest.raises(ValueError):
         ResponseRouteSnapshot.from_mapping(
             {**snapshot.to_mapping(), "extra": 1},

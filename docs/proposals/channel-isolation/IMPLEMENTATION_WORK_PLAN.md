@@ -306,7 +306,7 @@ descriptor validator 和聚焦单测机械验证；ADR-035/036 已确认。独�
 
 ### CH-0-004：JSON-RPC 2.0、Schema 和生命周期
 
-- 状态：[x] 独立 Review 和最终验证通过
+- 状态：[x] 共享 response route discard 收敛修复完成，独立 Review 通过
 
 - [x] 用唯一 Runner route/cleanup aggregate 替换 lifecycle response scope、Driver route
   tombstone 和 Host State 散落状态；本项与 CH-0-007 飞书基础设施做一次垂直迁移。
@@ -327,17 +327,24 @@ descriptor validator 和聚焦单测机械验证；ADR-035/036 已确认。独�
 - [x] finish task 只作有界临时协调，等待者取消不取消共享清理，所有终态均清理 task。
 - [x] 删除未上线的 `ResponseScopeRegistry`、scope token、飞书 `_response_deliveries` 和
   Driver lifecycle/tombstone 判断，不保留兼容 alias。
-- [x] CH-0-004、完整 channel isolation、CH-0-007/飞书相邻测试、目标文件 pre-commit 和
-  `git diff --check` 通过。
+- [x] 既有 CH-0-004、完整 channel isolation、CH-0-007/飞书相邻测试基线保持通过；本轮
+  revoked discard 修复已通过当前验证矩阵和独立 Review。
 - [x] CH-0-004 冻结 Runner 执行侧 aggregate、drain barrier、closed fence 和协议语义；真实
   Core per-handle sequencer 作为 CH-2-005 的独立实现项继续验收，不阻塞本任务完成。
 
-本轮唯一当前验证证据：CH-0-004 聚焦矩阵 `139 passed`；完整
-`tests/unit/channel_isolation` 为 `338 passed`；CH-0-007 隔离 suite `42 passed`；旧飞书
-unit/contract 为 `184 passed, 1 skipped`。目标文件 pre-commit 全部通过（包含 mypy、black、
-flake8 和 pylint），`git diff --check` 通过。Runner/飞书垂直迁移已完成；真实 Core
-per-handle sequencer 仍由 CH-2-005 实现和验证，不属于 CH-0-004 的未完成项。本轮独立
-Review 和最终验证已通过（用户确认）。
+- [x] 永久 rejected route 进入 Runner 执行侧 `revoked`；先确认 revoked snapshot 持久化，
+  再执行 Host State delete，失败或 unknown 时保持 revoked 并可恢复重试；重复 discard
+  共享有界、shield 隔离的 reconcile task，不能由 terminal receipt TTL GC 清理。
+- [x] 补齐 revoked put/delete failure、恢复、重复 discard cancellation、资源快照并发和
+  同 shard 不复活回归测试；资源 snapshot 写入取消时以隔离清理保证 checkpoint pending
+  不会永久遗留，delivery 保持 unknown 且后续 send/finish/discard 可继续准入。
+- [x] 本轮 revoked discard 修复已通过独立 Review，CH-0-004 恢复完成状态。
+
+本轮当前验证证据：response lifecycle 聚焦矩阵 `24 passed`；CH-0-004 聚焦矩阵
+`149 passed`；完整 `tests/unit/channel_isolation` 为 `348 passed`；CH-0-007 与飞书
+unit/contract 相邻矩阵为 `185 passed, 1 skipped`。目标文件 pre-commit 和
+`git diff --check` 已通过；独立 Review 已通过（用户确认）。真实 Core per-handle
+sequencer 仍由 CH-2-005 实现和验证，不属于本轮修复范围；CH-0-004 状态为 `[x]`。
 
 - [x] 实现 JSON-RPC 2.0 request、response、notification、error 和 cancel。
 - [x] 实现 pending request 上限、request timeout、未知方法和重复 response 处理。
