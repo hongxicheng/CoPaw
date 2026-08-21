@@ -712,6 +712,7 @@ class FeishuDriver:
         if target is None:
             raise RuntimeError("Feishu message response route is unavailable")
         if response_handle is not None:
+            await lifecycle.resume_response_cleanups()
             await lifecycle.gc_response_routes()
             await lifecycle.open_response_route(
                 response_handle,

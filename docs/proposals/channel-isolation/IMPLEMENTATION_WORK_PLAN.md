@@ -629,7 +629,11 @@ State 恢复 Core reply，以及 thread reply/checkpoint 恢复、thread streami
 非 thread 群聊、私聊、显式主动发送及 session handle 兼容、半开连接恢复、disconnect/EOF
 有界清理和断连期间 health 可观测性。当前未运行真实飞书
 外部收发、Linux、真实 Windows、frozen desktop 和全仓库测试；这些限制保留给 G0 或发布
-验证，不阻塞本原型任务完成。独立 Review 和最终验证已通过（用户确认）。
+验证不在本轮范围内。后续复审发现的入站前 response route reconciliation 缺口已补齐，
+并增加 Feishu revoked route 的持久化、失败、响应丢失、重启恢复和容量释放回归测试。
+本轮验证：CH-0-007 隔离 suite `46 passed`，包装入口 `1 passed`，完整
+`tests/unit/channel_isolation` `348 passed`，Feishu unit/contract `184 passed, 1 skipped`；
+目标文件 pre-commit 和 `git diff --check` 通过。独立 Review 和最终验证已通过（用户确认）。
 
 #### 原型限制与后续工作
 

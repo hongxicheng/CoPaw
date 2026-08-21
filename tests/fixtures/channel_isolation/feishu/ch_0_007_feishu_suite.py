@@ -352,8 +352,12 @@ class MockHost:
         self.reject_unmentioned_groups = False
         self.fail_state_put = False
         self.fail_response_route_put = False
+        self.fail_revoked_response_route_put = False
         self.lose_response_route_put = False
+        self.fail_response_route_delete = False
         self.lose_response_route_delete = False
+        self.response_route_delete_calls = 0
+        self.response_route_put_kinds: list[set[str]] = []
         self.response_route_mutation_applied = asyncio.Event()
         self.release_response_route_mutation = asyncio.Event()
         self.frames: list[str] = []
@@ -432,6 +436,18 @@ class MockHost:
                 "fixture state write rejected",
                 reason_code="STATE_LIMIT_EXCEEDED",
             )
+        if params.key.startswith("feishu.response_routes."):
+            kinds = {
+                str(item.get("kind"))
+                for item in params.value.values()
+                if isinstance(item, Mapping)
+            }
+            self.response_route_put_kinds.append(kinds)
+            if self.fail_revoked_response_route_put and "revoked" in kinds:
+                raise ProtocolValidationError(
+                    "fixture revoked route write rejected",
+                    reason_code="STATE_LIMIT_EXCEEDED",
+                )
         await self.state_store.put(
             params.key,
             params.schema_version or 1,
@@ -445,6 +461,13 @@ class MockHost:
         return {"status": "stored", "key": params.key}
 
     async def _state_delete(self, params: Any, _: object) -> dict[str, Any]:
+        if params.key.startswith("feishu.response_routes."):
+            self.response_route_delete_calls += 1
+            if self.fail_response_route_delete:
+                raise ProtocolValidationError(
+                    "fixture response route delete rejected",
+                    reason_code="STATE_LIMIT_EXCEEDED",
+                )
         await self.state_store.delete(params.key)
         if self.lose_response_route_delete and params.key.startswith(
             "feishu.response_routes.",
@@ -796,6 +819,16 @@ async def test_driver_ingress_core_mention_gate_and_checkpoint_failure(
     checkpoint = driver._receive_state_value()
     assert "oc-rejected" not in checkpoint
     assert "ou-rejected" not in checkpoint
+    rejected_handle = driver._response_checkpoint.response_handle(
+        "group-no-mention",
+    )
+    assert rejected_handle not in await driver._response_checkpoint.snapshot()
+    assert (
+        await driver._require_lifecycle().response_route_snapshot(
+            rejected_handle,
+        )
+        is None
+    )
     await _close_session(core, session, identity)
 
 
@@ -1529,6 +1562,278 @@ async def test_response_finish_cleanup_failure_is_retryable_in_feishu_driver(
 
 
 @pytest.mark.asyncio
+async def test_rejected_route_reconciliation_releases_capacity_in_process(
+    tmp_path: Path,
+) -> None:
+    """A failed revoked delete is retried before the next route admission."""
+    identity = _identity("rejected-reconcile")
+    state_store = HostStateStore()
+    checkpoint = FeishuResponseRouteCheckpoint(max_entries=1)
+    platform = FakePlatform("rejected-reconcile")
+    core, host, driver, session = await _start_session(
+        identity,
+        platform,
+        tmp_path,
+        state_store=state_store,
+        response_checkpoint=checkpoint,
+    )
+    host.reject_unmentioned_groups = True
+    host.fail_response_route_delete = True
+    rejected_event = "rejected-reconcile-event"
+    with pytest.raises(RpcError):
+        await platform.emit_message(
+            _message(
+                rejected_event,
+                chat_id="oc-rejected-reconcile",
+                chat_type="group",
+            ),
+        )
+    rejected_handle = checkpoint.response_handle(rejected_event)
+    lifecycle_snapshot = (
+        await driver._require_lifecycle().response_route_snapshot(
+            rejected_handle,
+        )
+    )
+    assert lifecycle_snapshot is not None
+    assert lifecycle_snapshot.kind.value == "revoked"
+    shard = checkpoint.shard_for_handle(rejected_handle)
+    stored = await state_store.get(checkpoint.state_key(shard))
+    assert stored is not None
+    assert stored[1][rejected_handle]["kind"] == "revoked"
+    with pytest.raises(RpcError) as closed:
+        await _send_reply(
+            core,
+            identity,
+            delivery_id="rejected-late",
+            to_handle=rejected_handle,
+            content_parts=[{"type": "text", "text": "late"}],
+        )
+    assert closed.value.data["reason_code"] == "RESPONSE_CLOSED"
+    assert not platform.sent
+
+    host.fail_response_route_delete = False
+    accepted_event = "rejected-reconcile-accepted"
+    await platform.emit_message(
+        _message(
+            accepted_event,
+            chat_id="oc-rejected-reconcile",
+            chat_type="group",
+            mentioned=True,
+        ),
+    )
+    accepted_handle = host.reply_handle_for(accepted_event)
+    snapshot = await checkpoint.snapshot()
+    assert rejected_handle not in snapshot
+    assert snapshot[accepted_handle]["kind"] == "active"
+    assert host.response_route_delete_calls == 2
+    await _close_session(core, session, identity)
+
+
+@pytest.mark.asyncio
+async def test_rejected_route_delete_response_loss_keeps_fence_and_recovers(
+    tmp_path: Path,
+) -> None:
+    """A lost revoked delete response cannot reopen a route."""
+    identity = _identity("rejected-delete-lost")
+    state_store = HostStateStore()
+    checkpoint = FeishuResponseRouteCheckpoint(max_entries=1)
+    platform = FakePlatform("rejected-delete-lost")
+    core, host, driver, session = await _start_session(
+        identity,
+        platform,
+        tmp_path,
+        state_store=state_store,
+        response_checkpoint=checkpoint,
+        request_timeout=0.02,
+    )
+    host.reject_unmentioned_groups = True
+    host.lose_response_route_delete = True
+    rejected_event = "rejected-delete-lost-event"
+    with pytest.raises(ResponseCheckpointUnknownError):
+        await platform.emit_message(
+            _message(
+                rejected_event,
+                chat_id="oc-rejected-delete-lost",
+                chat_type="group",
+            ),
+        )
+    await asyncio.wait_for(
+        host.response_route_mutation_applied.wait(),
+        timeout=1.0,
+    )
+    host.lose_response_route_delete = False
+    host.release_response_route_mutation.set()
+    rejected_handle = checkpoint.response_handle(rejected_event)
+    lifecycle_snapshot = (
+        await driver._require_lifecycle().response_route_snapshot(
+            rejected_handle,
+        )
+    )
+    assert lifecycle_snapshot is not None
+    assert lifecycle_snapshot.kind.value == "revoked"
+    with pytest.raises(RpcError) as closed:
+        await _send_reply(
+            core,
+            identity,
+            delivery_id="rejected-delete-lost-late",
+            to_handle=rejected_handle,
+            content_parts=[{"type": "text", "text": "late"}],
+        )
+    assert closed.value.data["reason_code"] == "RESPONSE_CLOSED"
+    assert not platform.sent
+
+    accepted_event = "rejected-delete-lost-accepted"
+    await platform.emit_message(
+        _message(
+            accepted_event,
+            chat_id="oc-rejected-delete-lost",
+            chat_type="group",
+            mentioned=True,
+        ),
+    )
+    accepted_handle = host.reply_handle_for(accepted_event)
+    snapshot = await checkpoint.snapshot()
+    assert rejected_handle not in snapshot
+    assert snapshot[accepted_handle]["kind"] == "active"
+    await _close_session(core, session, identity)
+
+
+@pytest.mark.asyncio
+async def test_rejected_route_restarts_as_revoked_and_reconciles(
+    tmp_path: Path,
+) -> None:
+    """A durable revoked route is never restored as active."""
+    identity = _identity("rejected-restart")
+    state_store = HostStateStore()
+    checkpoint = FeishuResponseRouteCheckpoint(max_entries=1)
+    platform = FakePlatform("rejected-restart")
+    core, host, driver, session = await _start_session(
+        identity,
+        platform,
+        tmp_path,
+        state_store=state_store,
+        response_checkpoint=checkpoint,
+    )
+    host.reject_unmentioned_groups = True
+    host.fail_response_route_delete = True
+    rejected_event = "rejected-restart-event"
+    with pytest.raises(RpcError):
+        await platform.emit_message(
+            _message(
+                rejected_event,
+                chat_id="oc-rejected-restart",
+                chat_type="group",
+            ),
+        )
+    rejected_handle = checkpoint.response_handle(rejected_event)
+    lifecycle_snapshot = (
+        await driver._require_lifecycle().response_route_snapshot(
+            rejected_handle,
+        )
+    )
+    assert lifecycle_snapshot is not None
+    assert lifecycle_snapshot.kind.value == "revoked"
+    await _close_session(core, session, identity)
+
+    restarted_identity = _identity("rejected-restart", generation=2)
+    restarted_checkpoint = FeishuResponseRouteCheckpoint(max_entries=1)
+    restarted_platform = FakePlatform("rejected-restart-2")
+    (
+        restarted_core,
+        restarted_host,
+        _,
+        restarted_session,
+    ) = await _start_session(
+        restarted_identity,
+        restarted_platform,
+        tmp_path,
+        state_store=state_store,
+        response_checkpoint=restarted_checkpoint,
+    )
+    assert await restarted_checkpoint.snapshot() == {}
+    accepted_event = "rejected-restart-accepted"
+    await restarted_platform.emit_message(
+        _message(
+            accepted_event,
+            chat_id="oc-rejected-restart",
+            chat_type="group",
+            mentioned=True,
+        ),
+    )
+    accepted_handle = restarted_host.reply_handle_for(accepted_event)
+    assert (await restarted_checkpoint.snapshot())[accepted_handle][
+        "kind"
+    ] == "active"
+    await _close_session(
+        restarted_core,
+        restarted_session,
+        restarted_identity,
+    )
+
+
+@pytest.mark.asyncio
+async def test_rejected_route_persists_revoked_before_delete(
+    tmp_path: Path,
+) -> None:
+    """A revoked checkpoint is retried before its delete is attempted."""
+    identity = _identity("rejected-put-order")
+    state_store = HostStateStore()
+    checkpoint = FeishuResponseRouteCheckpoint(max_entries=1)
+    platform = FakePlatform("rejected-put-order")
+    core, host, _, session = await _start_session(
+        identity,
+        platform,
+        tmp_path,
+        state_store=state_store,
+        response_checkpoint=checkpoint,
+    )
+    host.reject_unmentioned_groups = True
+    host.fail_revoked_response_route_put = True
+    rejected_event = "rejected-put-order-event"
+    with pytest.raises(RpcError):
+        await platform.emit_message(
+            _message(
+                rejected_event,
+                chat_id="oc-rejected-put-order",
+                chat_type="group",
+            ),
+        )
+    rejected_handle = checkpoint.response_handle(rejected_event)
+    assert (await checkpoint.snapshot())[rejected_handle]["kind"] == (
+        "revoked"
+    )
+    assert host.response_route_delete_calls == 0
+    assert host.response_route_put_kinds[-1] == {"revoked"}
+    with pytest.raises(RpcError) as closed:
+        await _send_reply(
+            core,
+            identity,
+            delivery_id="rejected-put-order-late",
+            to_handle=rejected_handle,
+            content_parts=[{"type": "text", "text": "late"}],
+        )
+    assert closed.value.data["reason_code"] == "RESPONSE_CLOSED"
+
+    host.fail_revoked_response_route_put = False
+    accepted_event = "rejected-put-order-accepted"
+    await platform.emit_message(
+        _message(
+            accepted_event,
+            chat_id="oc-rejected-put-order",
+            chat_type="group",
+            mentioned=True,
+        ),
+    )
+    accepted_handle = host.reply_handle_for(accepted_event)
+    snapshot = await checkpoint.snapshot()
+    assert rejected_handle not in snapshot
+    assert snapshot[accepted_handle]["kind"] == "active"
+    assert host.response_route_delete_calls == 1
+    assert {"revoked"} in host.response_route_put_kinds
+    await _close_session(core, session, identity)
+
+
+@pytest.mark.asyncio
 async def test_rejected_open_restores_prior_unknown_shard_state(
     tmp_path: Path,
 ) -> None:
@@ -1577,7 +1882,7 @@ async def test_rejected_open_restores_prior_unknown_shard_state(
     state_after = driver._response_checkpoint._shards[shard]
     assert state_after.desired == desired_before
     assert state_after.dirty is True
-    assert state_after.settlement.value == "unknown"
+    assert state_after.settlement.value == "rejected"
     assert rejected_handle not in await driver._response_checkpoint.snapshot()
 
     host.fail_response_route_put = False
