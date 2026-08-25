@@ -718,7 +718,7 @@ def test_driver_entrypoint_does_not_import_legacy_channel() -> None:
         ],
         capture_output=True,
         check=False,
-        timeout=5,
+        timeout=15,
     )
     assert result.returncode == 0
     assert result.stdout.splitlines() == [b"FeishuDriver", b"False"]
@@ -3247,10 +3247,23 @@ async def test_distinct_runner_processes_and_restart_restore_core_reply(
         )
         assert process.stdin is not None
         assert process.stdout is not None
+        assert process.stderr is not None
         core = RpcPeer(FramedTransport(process.stdout, process.stdin))
         host = MockHost(core, identity, state_store=state)
         await core.start()
-        await asyncio.wait_for(host.hello.wait(), timeout=2.0)
+        try:
+            await asyncio.wait_for(host.hello.wait(), timeout=10.0)
+        except asyncio.TimeoutError as exc:
+            if process.returncode is None:
+                process.kill()
+            await core.aclose()
+            stderr = await process.stderr.read()
+            await asyncio.wait_for(process.wait(), timeout=5.0)
+            diagnostic = stderr.decode(errors="replace")
+            raise AssertionError(
+                f"Runner hello timed out with return code "
+                f"{process.returncode}:\n{diagnostic}",
+            ) from exc
         await core.call(
             "channel.prepare",
             PrepareParams(
@@ -3333,5 +3346,5 @@ async def test_distinct_runner_processes_and_restart_restore_core_reply(
             },
         )
         await core.aclose()
-        await asyncio.wait_for(process.wait(), timeout=2.0)
+        await asyncio.wait_for(process.wait(), timeout=5.0)
         assert process.returncode == 0

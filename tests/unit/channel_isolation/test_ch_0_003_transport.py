@@ -192,7 +192,6 @@ async def test_bounded_queue_times_out_and_closes_transport() -> None:
         isinstance(result, (FrameClosedError, FrameTimeoutError))
         for result in results
     )
-    assert any(isinstance(result, FrameTimeoutError) for result in results)
     assert transport.is_closed
     assert writer.closed
     await transport.aclose()

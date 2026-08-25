@@ -340,14 +340,13 @@ class OutboundDeliveryState:
         """Fence one unfinished attempt without waiting for its handler."""
         if self._attempts.get(attempt.delivery_id) is not attempt:
             return False
-        was_provisional = attempt.provisional
         attempt.forced_reason = reason_code
         attempt.provisional = False
         attempt.terminal_result = None
         attempt.send_params = None
         self._delivery_states[attempt.delivery_id] = DeliveryState.UNKNOWN
         self._complete(attempt)
-        if (cancel or was_provisional) and not attempt.task.done():
+        if cancel and not attempt.task.done():
             attempt.task.cancel()
         return True
 

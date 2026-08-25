@@ -467,7 +467,7 @@ def test_media_path_rules_and_configuration_gaps_are_source_derived() -> None:
     assert "Core cwd nor Runner cwd participates" in text
     assert "`~` is expanded before the absolute/relative" in text
     assert "PureWindowsPath" in Path(__file__).read_text(encoding="utf-8")
-    assert PurePosixPath("/srv/agent-a") / "attachments" == Path(
+    assert PurePosixPath("/srv/agent-a") / "attachments" == PurePosixPath(
         "/srv/agent-a/attachments",
     )
     assert str(PureWindowsPath("C:/QwenPaw") / "downloads") == (

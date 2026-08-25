@@ -690,12 +690,11 @@ class OneBotDriver:
         quoted_text = OneBotDriver._all_text(quoted)
         current_text = OneBotDriver._all_text(current)
         if quoted_text is not None and current_text is not None:
-            text = f"[Quoted message]\n{'\n'.join(quoted_text)}"
+            quoted_content = chr(10).join(quoted_text)
+            text = f"[Quoted message]\n{quoted_content}"
             if current_text:
-                text = (
-                    f"{text}\n\n[Current message]\n"
-                    f"{'\n'.join(current_text)}"
-                )
+                current_content = chr(10).join(current_text)
+                text = f"{text}\n\n[Current message]\n{current_content}"
             return [{"type": "text", "text": text}]
         merged: list[dict[str, Any]] = [
             {"type": "text", "text": "[Quoted message]"},

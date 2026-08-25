@@ -82,7 +82,7 @@ class DescendantDriver:
         child_code = (
             "import os, time; "
             "os.write(1, b'descendant-fd1\\n'); "
-            "os.close(1); os.close(2); time.sleep(1.5)"
+            "os.close(1); os.close(2); time.sleep(10)"
         )
         process = subprocess.Popen(  # pylint: disable=consider-using-with
             [sys.executable, "-I", "-c", child_code],

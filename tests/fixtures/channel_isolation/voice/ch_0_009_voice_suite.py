@@ -85,6 +85,7 @@ class FakeTunnel:
         self.stop_count = 0
         self.start_errors: list[BaseException] = []
         self.stop_started = asyncio.Event()
+        self.stop_attempts: asyncio.Queue[int] = asyncio.Queue()
         self.stop_gate: asyncio.Event | None = None
 
     async def start(self, local_port: int) -> TunnelInfo:
@@ -99,6 +100,7 @@ class FakeTunnel:
     async def stop(self) -> None:
         self.stop_count += 1
         self.stop_started.set()
+        self.stop_attempts.put_nowait(self.stop_count)
         if self.stop_gate is not None:
             await self.stop_gate.wait()
 
@@ -1412,15 +1414,20 @@ async def test_concurrent_stop_retries_expired_quiesce_cleanup() -> None:
     )
     stop_task: asyncio.Task[Any] | None = None
     try:
-        await asyncio.wait_for(
-            session.tunnel.stop_started.wait(),
+        first_attempt = await asyncio.wait_for(
+            session.tunnel.stop_attempts.get(),
             timeout=1.0,
         )
+        assert first_attempt == 1
         stop_task = asyncio.create_task(
             session.controller.stop(session.identity_params()),
         )
         await quiesce_task
-        await asyncio.sleep(0)
+        second_attempt = await asyncio.wait_for(
+            session.tunnel.stop_attempts.get(),
+            timeout=1.0,
+        )
+        assert second_attempt == 2
         assert not stop_task.done()
         assert session.tunnel.stop_count == 2
         assert platform._tunnel is session.tunnel

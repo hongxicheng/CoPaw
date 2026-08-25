@@ -158,17 +158,21 @@ async def test_pending_limit_timeout_and_cancel_notification() -> None:
     left_transport, right_transport = _transport_pair()
     core = RpcPeer(
         left_transport,
-        limits=RpcLimits(max_pending_requests=1, request_timeout=0.01),
+        limits=RpcLimits(max_pending_requests=1, request_timeout=0.5),
     )
     runner = RpcPeer(right_transport)
     cancellations: list[object] = []
+    cancellation_received = asyncio.Event()
+    request_started = asyncio.Event()
 
     async def remember_cancel(params: object, _: object) -> None:
         """Record cancellation notifications."""
         cancellations.append(params)
+        cancellation_received.set()
 
     async def never_respond(_: object, __: object) -> None:
         """Keep one request pending until the caller timeout."""
+        request_started.set()
         await asyncio.Future()
 
     runner.register_notification("request.cancel", remember_cancel)
@@ -176,12 +180,15 @@ async def test_pending_limit_timeout_and_cancel_notification() -> None:
     await asyncio.gather(core.start(), runner.start())
 
     pending = asyncio.create_task(core.call("never.respond"))
-    await asyncio.sleep(0.05)
-    with pytest.raises(RpcError):
+    await asyncio.wait_for(request_started.wait(), timeout=1.0)
+    with pytest.raises(RpcError) as limit_error:
         await core.call("second")
+    assert limit_error.value.data == {
+        "reason_code": "TEMPORARY_UNAVAILABLE",
+    }
     with pytest.raises(RpcTimeoutError):
         await pending
-    await asyncio.sleep(0)
+    await asyncio.wait_for(cancellation_received.wait(), timeout=1.0)
     assert cancellations
     await asyncio.gather(core.aclose(), runner.aclose())
 

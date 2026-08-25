@@ -1118,11 +1118,16 @@ async def test_framed_writer_rechecks_lease_before_visible_result() -> None:
     }
     request = asyncio.create_task(core.call("channel.send", payload))
 
-    while (
-        snapshot := controller._outbound.attempt_snapshot(
+    while True:
+        snapshot = controller._outbound.attempt_snapshot(
             "expired-before-write",
         )
-    ) is None or not snapshot.provisional:
+        if (
+            snapshot is not None
+            and snapshot.provisional
+            and not runner._transport._queue.empty()
+        ):
+            break
         await asyncio.sleep(0)
     clock.now = 1100
     right_writer.drain_release.set()

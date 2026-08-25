@@ -574,7 +574,7 @@ def test_descendant_inherits_fd1_but_not_private_protocol_handle(
         env=_environment(result_path),
         capture_output=True,
         check=False,
-        timeout=1.0,
+        timeout=5.0,
     )
     elapsed = time.monotonic() - start
 
@@ -583,7 +583,7 @@ def test_descendant_inherits_fd1_but_not_private_protocol_handle(
     payload = _read_result(result_path)
     assert isinstance(payload["descendant_pid"], int)
     assert b"descendant-fd1" in result.stderr
-    assert elapsed < 1.0
+    assert elapsed < 5.0
 
 
 def _copy_packaging_to_environment(
