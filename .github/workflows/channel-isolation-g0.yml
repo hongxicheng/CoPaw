@@ -1,0 +1,167 @@
+name: Channel Isolation G0 Gate
+
+on:
+  push:
+    branches:
+      - channel-isolation
+    paths:
+      - 'docs/proposals/channel-isolation/**'
+      - 'src/qwenpaw/channel_protocol/**'
+      - 'src/qwenpaw/app/channels/manager.py'
+      - 'src/qwenpaw/app/channels/feishu/**'
+      - 'src/qwenpaw/app/channels/onebot/**'
+      - 'src/qwenpaw/app/channels/voice/**'
+      - 'tests/fixtures/channel_isolation/**'
+      - 'tests/unit/channel_isolation/**'
+      - 'tests/unit/app/channels/test_manager_batch_acl.py'
+      - 'tests/unit/channels/test_feishu.py'
+      - 'tests/unit/channels/test_onebot_channel.py'
+      - 'tests/unit/channels/test_telegram.py'
+      - 'tests/unit/channels/test_voice.py'
+      - 'tests/unit/channels/test_wecom.py'
+      - 'tests/contract/channels/test_feishu_contract.py'
+      - 'tests/contract/channels/test_voice_contract.py'
+      - 'tests/integration/test_voice.py'
+      - 'pyproject.toml'
+      - '.github/workflows/channel-isolation-g0.yml'
+  pull_request:
+    branches:
+      - main
+      - master
+      - dev
+      - develop
+    paths:
+      - 'docs/proposals/channel-isolation/**'
+      - 'src/qwenpaw/channel_protocol/**'
+      - 'src/qwenpaw/app/channels/manager.py'
+      - 'src/qwenpaw/app/channels/feishu/**'
+      - 'src/qwenpaw/app/channels/onebot/**'
+      - 'src/qwenpaw/app/channels/voice/**'
+      - 'tests/fixtures/channel_isolation/**'
+      - 'tests/unit/channel_isolation/**'
+      - 'tests/unit/app/channels/test_manager_batch_acl.py'
+      - 'tests/unit/channels/test_feishu.py'
+      - 'tests/unit/channels/test_onebot_channel.py'
+      - 'tests/unit/channels/test_telegram.py'
+      - 'tests/unit/channels/test_voice.py'
+      - 'tests/unit/channels/test_wecom.py'
+      - 'tests/contract/channels/test_feishu_contract.py'
+      - 'tests/contract/channels/test_voice_contract.py'
+      - 'tests/integration/test_voice.py'
+      - 'pyproject.toml'
+      - '.github/workflows/channel-isolation-g0.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: channel-isolation-g0-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  g0-platform-tests:
+    name: G0 - ${{ matrix.evidence-key }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python-version: '3.11'
+            evidence-key: linux-py311
+          - os: ubuntu-latest
+            python-version: '3.13'
+            evidence-key: linux-py313
+          - os: macos-latest
+            python-version: '3.11'
+            evidence-key: macos-py311
+          - os: windows-latest
+            python-version: '3.11'
+            evidence-key: windows-py311
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install test dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,test,full]"
+
+      - name: Record runner evidence
+        shell: bash
+        run: |
+          mkdir -p test-results
+          python -c "import platform, sys; print(f'platform={platform.platform()}'); print(f'machine={platform.machine()}'); print(f'python={sys.version}')" \
+            | tee "test-results/environment-${{ matrix.evidence-key }}.txt"
+          echo "commit=${GITHUB_SHA}" \
+            >> "test-results/environment-${{ matrix.evidence-key }}.txt"
+
+      - name: Run G0 tests
+        shell: bash
+        run: |
+          pytest -q \
+            tests/unit/channel_isolation \
+            tests/unit/app/channels/test_manager_batch_acl.py \
+            tests/unit/channels/test_telegram.py \
+            tests/unit/channels/test_wecom.py \
+            tests/unit/channels/test_feishu.py \
+            tests/unit/channels/test_onebot_channel.py \
+            tests/unit/channels/test_voice.py \
+            tests/contract/channels/test_feishu_contract.py \
+            tests/contract/channels/test_voice_contract.py \
+            tests/integration/test_voice.py \
+            --junitxml="test-results/g0-${{ matrix.evidence-key }}.xml"
+
+      - name: Summarize matrix evidence
+        if: always()
+        shell: bash
+        run: |
+          echo "## Channel Isolation G0" >> "${GITHUB_STEP_SUMMARY}"
+          echo "" >> "${GITHUB_STEP_SUMMARY}"
+          echo "- Evidence key: ${{ matrix.evidence-key }}" \
+            >> "${GITHUB_STEP_SUMMARY}"
+          echo "- Requested runner: ${{ matrix.os }}" \
+            >> "${GITHUB_STEP_SUMMARY}"
+          echo "- Python: ${{ matrix.python-version }}" \
+            >> "${GITHUB_STEP_SUMMARY}"
+          echo "- Commit: ${GITHUB_SHA}" >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload G0 evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: channel-isolation-g0-${{ matrix.evidence-key }}
+          path: test-results/
+          if-no-files-found: warn
+          retention-days: 30
+
+  g0-gate:
+    name: G0 Gate Tests
+    if: always()
+    needs:
+      - g0-platform-tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every G0 matrix entry
+        env:
+          MATRIX_RESULT: ${{ needs.g0-platform-tests.result }}
+        run: |
+          echo "## G0 Gate test result" >> "${GITHUB_STEP_SUMMARY}"
+          echo "" >> "${GITHUB_STEP_SUMMARY}"
+          echo "- Matrix result: ${MATRIX_RESULT}" \
+            >> "${GITHUB_STEP_SUMMARY}"
+          echo "- Scope: source-level G0 tests; frozen release artifacts remain CH-6-004." \
+            >> "${GITHUB_STEP_SUMMARY}"
+          if [ "${MATRIX_RESULT}" != "success" ]; then
+            echo "One or more G0 matrix entries did not pass."
+            exit 1
+          fi
