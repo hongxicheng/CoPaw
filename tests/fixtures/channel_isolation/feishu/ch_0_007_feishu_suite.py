@@ -49,7 +49,6 @@ from qwenpaw.channel_protocol import (
     RpcError,
     RpcLimits,
     RpcPeer,
-    RpcTimeoutError,
 )
 
 
@@ -482,12 +481,8 @@ async def _run_driver_session(
     transport: MemoryTransport,
     identity: FixtureIdentity,
     consumer: FixtureSecretHandleConsumer,
-    request_timeout: float,
 ) -> None:
-    peer = RpcPeer(
-        transport,
-        limits=RpcLimits(request_timeout=request_timeout),
-    )
+    peer = RpcPeer(transport)
     driver.bind(peer, identity)
     controller = driver.create_lifecycle_controller(
         identity,
@@ -527,13 +522,10 @@ async def _start_session(
     reconnect_initial_delay: float = 0.001,
     response_checkpoint: FeishuResponseRouteCheckpoint | None = None,
     response_clock_ms: Callable[[], int] | None = None,
-    request_timeout: float = 30.0,
+    fault_request_timeout: float | None = None,
 ) -> tuple[RpcPeer, MockHost, FeishuDriver, asyncio.Task[None]]:
     core_transport, runner_transport = _transport_pair()
-    core = RpcPeer(
-        core_transport,
-        limits=RpcLimits(request_timeout=request_timeout),
-    )
+    core = RpcPeer(core_transport)
     host = MockHost(core, identity, state_store=state_store)
     host.transports = (core_transport, runner_transport)
     driver = FeishuDriver(
@@ -562,7 +554,6 @@ async def _start_session(
             runner_transport,
             identity,
             consumer,
-            request_timeout,
         ),
     )
     await asyncio.wait_for(host.hello.wait(), timeout=1.0)
@@ -594,6 +585,10 @@ async def _start_session(
     }
     await core.call("channel.activate", lease)
     await core.call("channel.commit", lease)
+    if fault_request_timeout is not None:
+        driver._peer._limits = RpcLimits(
+            request_timeout=fault_request_timeout,
+        )
     return core, host, driver, session
 
 
@@ -1644,7 +1639,7 @@ async def test_rejected_route_delete_response_loss_keeps_fence_and_recovers(
         tmp_path,
         state_store=state_store,
         response_checkpoint=checkpoint,
-        request_timeout=0.02,
+        fault_request_timeout=0.5,
     )
     host.reject_unmentioned_groups = True
     host.lose_response_route_delete = True
@@ -1846,7 +1841,7 @@ async def test_rejected_open_restores_prior_unknown_shard_state(
         platform,
         tmp_path,
         state_store=state_store,
-        request_timeout=0.02,
+        fault_request_timeout=0.5,
     )
     first_event, rejected_event = _same_shard_event_ids(
         driver,
@@ -1862,8 +1857,9 @@ async def test_rejected_open_restores_prior_unknown_shard_state(
         host.response_route_mutation_applied.wait(),
         timeout=1.0,
     )
-    with pytest.raises(RpcTimeoutError):
+    with pytest.raises(RpcError) as failed:
         await finish
+    assert failed.value.data["reason_code"] == "RESPONSE_FINISH_FAILED"
     host.lose_response_route_put = False
     host.release_response_route_mutation.set()
 
@@ -2110,7 +2106,7 @@ async def test_unknown_shard_put_rewrites_latest_desired_state(
         platform,
         tmp_path,
         state_store=state_store,
-        request_timeout=0.02,
+        fault_request_timeout=0.5,
     )
     event_ids = _same_shard_event_ids(driver, "put-unknown")
     first_event, second_event = event_ids
@@ -2124,8 +2120,9 @@ async def test_unknown_shard_put_rewrites_latest_desired_state(
         host.response_route_mutation_applied.wait(),
         timeout=1.0,
     )
-    with pytest.raises(RpcTimeoutError):
+    with pytest.raises(RpcError) as failed:
         await finish
+    assert failed.value.data["reason_code"] == "RESPONSE_FINISH_FAILED"
     shard = driver._response_checkpoint.shard_for_handle(first_handle)
     shard_state = driver._response_checkpoint._shards[shard]
     assert shard_state.dirty is True
@@ -2173,7 +2170,7 @@ async def test_unknown_shard_delete_does_not_revive_removed_receipt(
         tmp_path,
         state_store=state_store,
         response_clock_ms=lambda: now_ms[0],
-        request_timeout=0.02,
+        fault_request_timeout=0.5,
     )
     first_event, second_event = _same_shard_event_ids(
         driver,
@@ -3155,7 +3152,6 @@ async def test_invalid_credentials_and_secret_snapshot_rejection(
             runner_transport,
             identity,
             consumer,
-            30.0,
         ),
     )
     await asyncio.wait_for(host.hello.wait(), timeout=1.0)

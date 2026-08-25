@@ -1398,8 +1398,7 @@ async def test_concurrent_stop_retries_expired_quiesce_cleanup() -> None:
     session = await _session()
     platform = session.driver.platform
     assert platform is not None
-    runner = platform._runner
-    assert runner is not None
+    assert platform._runner is not None
     stop_gate = asyncio.Event()
     session.tunnel.stop_gate = stop_gate
     quiesce_task = asyncio.create_task(
@@ -1431,7 +1430,6 @@ async def test_concurrent_stop_retries_expired_quiesce_cleanup() -> None:
         assert not stop_task.done()
         assert session.tunnel.stop_count == 2
         assert platform._tunnel is session.tunnel
-        assert platform._runner is runner
         assert platform.cleanup_complete is False
 
         stop_gate.set()

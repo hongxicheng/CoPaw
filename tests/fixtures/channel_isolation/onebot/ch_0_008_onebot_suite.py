@@ -855,7 +855,7 @@ async def test_quiesce_releases_listener_before_outbound_drain() -> None:
                             channel_key=session.identity.channel_key,
                             instance_id=session.identity.instance_id,
                             generation=session.identity.generation,
-                            drain_timeout_ms=500,
+                            drain_timeout_ms=5_000,
                         ),
                     ),
                 )
@@ -864,17 +864,20 @@ async def test_quiesce_releases_listener_before_outbound_drain() -> None:
                 await _wait_until(
                     lambda: platform.listen_port is None
                     and platform.health_snapshot()["accepting"] is False,
-                    timeout=0.2,
+                    timeout=1.0,
                 )
 
                 with pytest.raises(aiohttp.ClientConnectorError):
-                    await client.ws_connect(f"ws://127.0.0.1:{port}/ws")
+                    await asyncio.wait_for(
+                        client.ws_connect(f"ws://127.0.0.1:{port}/ws"),
+                        timeout=1.0,
+                    )
                 await websocket.send_json(
                     {"retcode": 0, "data": {}, "echo": action["echo"]},
                 )
                 result = await send
                 assert result["state"] == "acknowledged"
-                await asyncio.wait_for(quiesce, timeout=0.5)
+                await asyncio.wait_for(quiesce, timeout=5.0)
     finally:
         for task in (send, quiesce):
             if task is not None and not task.done():

@@ -568,21 +568,27 @@ def test_descendant_inherits_fd1_but_not_private_protocol_handle(
     _set_entrypoint(code_root, qualname="DescendantDriver")
     manifest = _write_manifest(tmp_path, code_root=code_root)
     result_path = tmp_path / "result.json"
+    stderr_path = tmp_path / "stderr.log"
     start = time.monotonic()
-    result = subprocess.run(
-        _command(code_root=code_root, manifest=manifest),
-        env=_environment(result_path),
-        capture_output=True,
-        check=False,
-        timeout=5.0,
-    )
+    with stderr_path.open("wb") as stderr_file:
+        with subprocess.Popen(
+            _command(code_root=code_root, manifest=manifest),
+            env=_environment(result_path),
+            stdout=subprocess.PIPE,
+            stderr=stderr_file,
+        ) as process:
+            stdout, _ = process.communicate(timeout=5.0)
     elapsed = time.monotonic() - start
 
-    assert result.returncode == 0
-    assert result.stdout == b""
+    assert process.returncode == 0
+    assert stdout == b""
     payload = _read_result(result_path)
     assert isinstance(payload["descendant_pid"], int)
-    assert b"descendant-fd1" in result.stderr
+    deadline = time.monotonic() + 2.0
+    while b"descendant-fd1" not in stderr_path.read_bytes():
+        if time.monotonic() >= deadline:
+            pytest.fail("descendant FD 1 output was not written to stderr")
+        time.sleep(0.01)
     assert elapsed < 5.0
 
 
