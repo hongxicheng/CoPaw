@@ -2,7 +2,7 @@
 
 ## 1. 文档信息
 
-- 状态：待开始（已按 main 2026-08-11 代码复核）
+- 状态：实施中（Phase 0/G0 已完成，Phase 1 待开始）
 - 对应设计：`DESIGN.md`
 - 目标：按设计完成 Channel 的环境隔离、进程隔离、stdio IPC、可靠投递和迁移
 - 当前产品约束：每个 Agent 每种 `channel_key` 保持一个用户可见实例
@@ -110,7 +110,7 @@
 
 | 阶段 | 内容 | 状态 | Gate |
 | --- | --- | --- | --- |
-| Phase 0 | 边界、协议和纵向原型 | 未开始 | G0 |
+| Phase 0 | 边界、协议和纵向原型 | 已完成 | G0（已通过） |
 | Phase 1 | Lock、环境和 Runner bootstrap | 未开始 | G1 |
 | Phase 2 | 进程监督、Core 适配和 Catalog | 未开始 | G2 |
 | Phase 3 | 可靠投递、媒体和切换恢复 | 未开始 | G3 |
@@ -766,12 +766,24 @@ Voice unit/contract/integration 当前 `58 passed`；目标文件 pre-commit 全
 
 ### G0 Gate
 
-- [ ] 职责、descriptor、stdio framing、JSON-RPC、可靠投递、媒体和 Runner-owned Voice
+- 状态：[x] Gate 通过，允许进入 Phase 1
+
+- [x] 职责、descriptor、stdio framing、JSON-RPC、可靠投递、媒体和 Runner-owned Voice
   ingress 边界冻结；如需 Core-owned 兼容入口，必须有独立 ADR。
-- [ ] CH-0-002 的 canonical encoder、ID/目录键模型和 descriptor v1 validator 已通过聚焦
+- [x] CH-0-002 的 canonical encoder、ID/目录键模型和 descriptor v1 validator 已通过聚焦
   单测与独立 Review；目标平台运行同一固定 hash 向量得到一致结果。
-- [ ] 飞书、OneBot、Voice/Twilio 三条纵向原型分别通过。
-- [ ] 无阻塞当前 Phase 的 P0/P1。
+- [x] 飞书、OneBot、Voice/Twilio 三条纵向原型分别通过。
+- [x] 无阻塞当前 Phase 的 P0/P1。
+
+验收证据：`8ad95d75` 的 GitHub Actions `Channel Isolation G0 Gate` 运行
+[`32863688912`](https://github.com/hongxicheng/QwenPaw/actions/runs/32863688912)
+已通过；Linux Python 3.11、Linux Python 3.13、macOS Python 3.11 和 Windows Python
+3.11 四个矩阵项分别为 `871 passed, 1 skipped`，最终 `G0 Gate Tests` 为 success。
+本地同范围测试为 `871 passed, 1 skipped`，目标文件 pre-commit 和
+`git diff --check` 通过。独立 Gate 验收未发现阻塞 Phase 0 的 P0/P1，跨平台 CI 补证后
+全部强制项证据充分。G0 只验收源码级原型和协议边界；Desktop bundled Python、完整安装
+形态以及 OS/Python ABI/架构发布矩阵仍分别由 `CH-6-004`、`CH-6-005` 验收，不在本 Gate
+提前标记完成。
 
 ## 7. Phase 1：Lock、Environment 和 Bootstrap
 
