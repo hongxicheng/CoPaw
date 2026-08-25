@@ -13,6 +13,7 @@ import subprocess
 import sys
 import threading
 import time
+from types import SimpleNamespace
 from typing import Any
 import venv
 
@@ -716,7 +717,11 @@ async def test_windows_adapter_completes_partial_sync_writes(
     """The Windows path avoids Proactor and completes every sync write."""
     handle = _PartialWriteHandle()
     thread_handle = _FakeWindowsThreadHandle()
-    monkeypatch.setattr(os, "name", "nt")
+    monkeypatch.setattr(
+        runner_bootstrap,
+        "os",
+        SimpleNamespace(name="nt"),
+    )
     monkeypatch.setattr(
         runner_bootstrap,
         "_open_windows_thread_handle",
@@ -739,7 +744,11 @@ async def test_windows_adapter_preserves_framing_failures(
 ) -> None:
     """The Windows adapter retains broken-pipe and timeout semantics."""
     thread_handle = _FakeWindowsThreadHandle()
-    monkeypatch.setattr(os, "name", "nt")
+    monkeypatch.setattr(
+        runner_bootstrap,
+        "os",
+        SimpleNamespace(name="nt"),
+    )
     monkeypatch.setattr(
         runner_bootstrap,
         "_open_windows_thread_handle",
@@ -765,7 +774,11 @@ async def test_windows_timeout_cancels_frame_and_closes_writer(
         blocked_handle,
         miss_first_cancel=True,
     )
-    monkeypatch.setattr(os, "name", "nt")
+    monkeypatch.setattr(
+        runner_bootstrap,
+        "os",
+        SimpleNamespace(name="nt"),
+    )
     monkeypatch.setattr(
         runner_bootstrap,
         "_open_windows_thread_handle",
@@ -799,7 +812,11 @@ async def test_windows_late_success_preserves_timeout_and_closes_transport(
     """A late accepted HANDLE frame cannot turn a timeout into success."""
     handle = _LateSuccessfulWriteHandle()
     thread_handle = _FakeWindowsThreadHandle()
-    monkeypatch.setattr(os, "name", "nt")
+    monkeypatch.setattr(
+        runner_bootstrap,
+        "os",
+        SimpleNamespace(name="nt"),
+    )
     monkeypatch.setattr(
         runner_bootstrap,
         "_open_windows_thread_handle",

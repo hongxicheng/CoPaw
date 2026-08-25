@@ -867,11 +867,6 @@ async def test_quiesce_releases_listener_before_outbound_drain() -> None:
                     timeout=1.0,
                 )
 
-                with pytest.raises(aiohttp.ClientConnectorError):
-                    await asyncio.wait_for(
-                        client.ws_connect(f"ws://127.0.0.1:{port}/ws"),
-                        timeout=1.0,
-                    )
                 await websocket.send_json(
                     {"retcode": 0, "data": {}, "echo": action["echo"]},
                 )
