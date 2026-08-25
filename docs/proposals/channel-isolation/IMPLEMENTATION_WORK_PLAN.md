@@ -704,32 +704,62 @@ backpressure 测试通过。
 
 ### CH-0-009：Voice/Twilio Runner-owned ingress 原型
 
-- [ ] 先记录当前基线：Voice 入口**完全由 Core 持有**（`routers/voice.py` 的三条路由挂载
+- 状态：[x] 独立 Review 和最终验证通过
+
+- [x] 先记录当前基线：Voice 入口**完全由 Core 持有**（`routers/voice.py` 的三条路由挂载
   在 Core app 上、Core 直接 import `twilio.request_validator`、Core `accept()` 后把 FastAPI
   `WebSocket` 对象交给 Channel、一次性 token 在 Core 进程内存 mint/validate、Cloudflare
   Tunnel 由 Channel 启动但指向 Core 端口）。本任务是新建 Runner-owned 入口，不是搬迁。
-- [ ] 验证 Runner 自有 Webhook、签名校验、TwiML、一次性 WebSocket token 和
+- [x] 验证 Runner 自有 Webhook、签名校验、TwiML、一次性 WebSocket token 和
   ConversationRelay WebSocket；Core 不接收原始 HTTP/WebSocket 帧。token 的 mint 与
   validate 必须一起迁入 Runner。
-- [ ] 使用 mock Host 和预构建 fixture environment；Twilio SDK、Tunnel 和入口库只在
+- [x] 使用 mock Host 和预构建 fixture environment；Twilio SDK、Tunnel 和入口库只在
   Runner environment 中导入。若继续以 FastAPI 语义实现 ConversationRelay，`fastapi`
   必须成为该 Channel lock 的显式依赖（当前它只是传递依赖）。
-- [ ] 验证 Runner 动态/显式端口绑定，通过 `ingress.endpoint.register` 报告 endpoint、
+- [x] 验证 Runner 动态/显式端口绑定，通过 `ingress.endpoint.register` 报告 endpoint、
   readiness 和 generation；Core 或受信任代理只路由 committed active generation。
-- [ ] `twilio_auth_token` 通过 Core secret store 的受控 handle 注入 Runner，不进入 JSON；
+- [x] `twilio_auth_token` 通过 Core secret store 的受控 handle 注入 Runner，不进入 JSON；
   standby 不得修改 Twilio webhook/status callback。
-- [ ] Runner 解析 `setup`、`prompt`、`interrupt`、`dtmf`、status callback，并通过
+- [x] Runner 解析 `setup`、`prompt`、`interrupt`、`dtmf`、status callback，并通过
   `event.batch` 提交 `call.started`、`message.query`、`call.interrupted`、`dtmf`、
   `call.closed` 等稳定事件。
-- [ ] 验证 `event.batch ACK -> Core direct_session` 和 `channel.send -> Runner ->
+- [x] 验证 `event.batch ACK -> Core direct_session` 和 `channel.send -> Runner ->
   ConversationRelay text/end` 闭环；入站 ACK 不等待 Agent 执行，出站携带
   `delivery_id` 并记录未知结果。
-- [ ] 验证 `CallSid -> connection_id -> generation` binding、token TTL、原子单次消费、
+- [x] 验证 `CallSid -> connection_id -> generation` binding、token TTL、原子单次消费、
   逐连接顺序、有界背压、过载关闭、断线、半关闭和旧 generation fencing。
-- [ ] 验证 quiesce 时停止新连接、排空已有通话并通过 endpoint unregister/update 完成
+- [x] 验证 quiesce 时停止新连接、排空已有通话并通过 endpoint unregister/update 完成
   切换；当前不实现音频 pipe。
-- [ ] 若 Runner-owned 原型因部署边界无法成立，单独记录 ADR 和最小 Core-owned 兼容方案，
+- [x] Runner-owned 原型在本地动态/显式端口、真实 HTTP/WebSocket 和 framed subprocess
+  验证中成立，不需要启用 Core-owned 兼容方案。若后续部署边界出现相反证据，仍须单独
+  记录 ADR 和最小 Core-owned 兼容方案，
   不把兼容桥接混入默认 Voice 协议。
+
+实现位于 `src/qwenpaw/app/channels/voice/driver.py`、`platform.py` 和 Runner 专用的
+`runner_twilio_manager.py`；后者负责 webhook 精确快照、应用和有界 settlement，供 commit
+响应未发布时按所有权补偿。旧 `VoiceChannel`、legacy `twilio_manager.py` 和 Core 的三条
+Voice 路由保持不变，`voice/__init__.py` 仅改为懒加载，避免 Runner 导入路径加载 Core
+Channel。任务局部 mock Host、fake Tunnel/Twilio、真实本地 HTTP/WebSocket 和 framed
+subprocess fixture 位于
+`tests/fixtures/channel_isolation/voice/`。
+
+当前验证覆盖 standby 无监听/外部副作用和只读 Twilio 鉴权探测、动态和显式端口、签名/
+TwiML、无 forwarded host 时的非默认端口 authority、token TTL 与原子单次消费、重复 CallSid、
+五类稳定事件及逐连接 sequence、ACK 后异步 direct-session 回复、`channel.send` text/end、
+Runner/Core 两层背压、真实 RpcPeer pending limit 重试、半关闭、unknown delivery、旧
+generation fencing、token/握手期间的并发 quiesce fencing、全局连接上限和容量恢复、
+quiesce absolute deadline、超时后 stop 重试资源清理、endpoint unregister，以及 commit 响应
+失败时的 webhook 所有权检查、回滚失败诊断和本地 ingress 清理。cleanup 重试同时覆盖
+quiesce 返回后的顺序 stop，以及 stop 与短 deadline cleanup 重叠时的原子交接。CH-0-009
+直接 suite 当前 `25 passed`；完整 `tests/unit/channel_isolation` 当前 `350 passed`（包含隔离包装入口），legacy
+Voice unit/contract/integration 当前 `58 passed`；目标文件 pre-commit 全部通过，
+`git diff --check` 通过。
+
+当前未运行真实 Twilio/Cloudflare 外部收发、Linux、真实 Windows、frozen desktop 和全仓
+测试。正式 Channel lock、Env/Process Manager、Proxy、Registry、Catalog 和默认路径切换属于
+后续阶段；`aiohttp` 的显式 Channel lock 依赖由 `CH-1-001` 处理，删除 legacy Core Voice
+路由及默认 Core `twilio` 依赖属于 `CH-4-003`。当前不实现音频 pipe、durable pending/replay
+或跨重启 delivery 恢复。
 
 验收：Voice 完成 Runner-owned Webhook、实时 WebSocket、Core query/reply、endpoint
 注册、切换和 shutdown 故障矩阵；兼容方案仅在有独立 ADR 时验收。
