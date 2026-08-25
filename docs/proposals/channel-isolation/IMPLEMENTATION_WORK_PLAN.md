@@ -663,20 +663,41 @@ State 恢复 Core reply，以及 thread reply/checkpoint 恢复、thread streami
 
 ### CH-0-008：OneBot ingress 原型
 
-- [ ] 将 OneBot WebSocket ingress 和平台消息解析放入 Runner。当前 OneBot 已在 Channel
+- 状态：[x] 独立 Review 和最终验证通过
+
+- [x] 将 OneBot WebSocket ingress 和平台消息解析放入 Runner。当前 OneBot 已在 Channel
   模块内用 aiohttp 自持监听 socket，是唯一已具备 Runner-owned ingress 形态的 Channel，
   按生产路径复用而非重写。
-- [ ] 使用 mock Host 和预构建 fixture environment，不实现正式 Env/Process Manager。
-- [ ] 验证显式端口、动态端口发现、反向连接和平台消息上报。
-- [ ] 明确平台 ingress 端口不用于 Core↔Runner stdio IPC。
-- [ ] 保持 loopback 默认绑定与派生鉴权不变量：非 loopback 绑定强制要求 access token，
+- [x] 使用 mock Host 和预构建 fixture environment，不实现正式 Env/Process Manager。
+- [x] 验证显式端口、动态端口发现、反向连接和平台消息上报。
+- [x] 明确平台 ingress 端口不用于 Core↔Runner stdio IPC。
+- [x] 保持 loopback 默认绑定与派生鉴权不变量：非 loopback 绑定强制要求 access token，
   未配置 token 时拒绝连接；endpoint DTO 上报绑定暴露面与鉴权状态。
-- [ ] 端口冲突自愈重新绑定后必须触发 `ingress.endpoint.update`，Core 记录与实际监听
+- [x] 端口冲突自愈重新绑定后必须触发 `ingress.endpoint.update`，Core 记录与实际监听
   一致。
-- [ ] 区分 Runner 内部事件并发上限与 Core↔Runner 批次背压两层机制，分别给出诊断计数。
-- [ ] 验证引用消息展开的反向平台调用（按 message id 拉取被引用消息及文件 URL）不阻塞
+- [x] 区分 Runner 内部事件并发上限与 Core↔Runner 批次背压两层机制，分别给出诊断计数。
+- [x] 验证引用消息展开的反向平台调用（按 message id 拉取被引用消息及文件 URL）不阻塞
   ingress 读循环，且 `event.batch` 超时参数容纳该往返延迟。
-- [ ] 验证 candidate 在 commit 前不监听或消费正式入口，Core 回复和 shutdown 可恢复。
+- [x] 验证 candidate 在 commit 前不监听或消费正式入口，Core 回复和 shutdown 可恢复。
+
+实现位于 `src/qwenpaw/app/channels/onebot/driver.py` 和 `platform.py`；旧
+`OneBotChannel` 保持不变，`onebot/__init__.py` 仅以懒加载隔离 Runner 导入路径。任务局部
+mock Host、fixture Runner 和真实子进程 framed stdio 验证位于
+`tests/fixtures/channel_isolation/onebot/`，没有实现正式 bootstrap、Env/Process Manager、
+Proxy、Registry 或 Catalog。当前验证：CH-0-008 直接 suite `18 passed`，隔离包装入口
+`1 passed`，完整 `tests/unit/channel_isolation` `349 passed`，legacy OneBot 单测
+`98 passed`；目标文件 pre-commit 和 `git diff --check` 通过。
+
+本轮按独立审查故障注入结论收敛 quiesce、endpoint reconciliation、shutdown 和动态端口：
+旧 generation 在 outbound drain 前即停止新连接并释放 listener，既有 WebSocket 仍可完成
+echo；endpoint update 在应用前失败或响应丢失后持续重试，ready 未确认前不恢复准入；多个
+不响应连接共享单一 absolute deadline，外层取消不跳过强制 transport 和 pending future
+清理；`hostname + port 0` 只绑定并上报一个确定的实际地址。新增测试覆盖上述故障及
+`localhost`、`127.0.0.1`、可用时的 `::1`。独立 Review 和最终验证已通过（用户确认）。
+
+当前未运行真实 OneBot 外部收发、Linux、真实 Windows、frozen desktop 和全仓测试；正式
+environment/进程接入以及既有 OneBot 配置与完整发送行为兼容回归属于 `CH-4-002`，durable
+pending/replay 和出站 delivery 恢复属于 Phase 3，不在本原型中提前实现。
 
 验收：OneBot 外部连接不经过基础 Core↔Runner 协议，端口交接、断线、鉴权不变量和
 backpressure 测试通过。
