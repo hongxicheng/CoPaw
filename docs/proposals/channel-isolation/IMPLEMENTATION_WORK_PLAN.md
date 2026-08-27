@@ -3,7 +3,7 @@
 ## 1. 文档信息
 
 - 状态：实施中（Phase 0 原 G0 已通过；独立 Channel artifact 架构增量
-  `CH-0-010` 待实施和复验，Phase 1 尚未开始）
+  `CH-0-010` 待跨平台最终验证，Phase 1 尚未开始）
 - 对应设计：`DESIGN.md`
 - 目标：按设计完成 Channel 的环境隔离、进程隔离、stdio IPC、可靠投递和迁移
 - 当前产品约束：每个 Agent 每种 `channel_key` 保持一个用户可见实例
@@ -842,29 +842,44 @@ Voice unit/contract/integration 当前 `58 passed`；目标文件 pre-commit 全
 
 ### CH-0-010：独立 Channel artifact 协议增量
 
-- 状态：[ ] 未开始
+- 状态：[-] 独立 Review 已通过，等待跨平台最终验证
 
 本任务只修订独立 Channel artifact 对已完成 CH-0-004/CH-0-006 原型造成的协议和启动
 边界变化。直接依赖为 `CH-0-002`、修复并重新 Review 后的 `CH-0-004`、`CH-0-006`；
 对应 Design §6.1、§6.4、§7.3、§10.3、§13.4 和 ADR-039 至 ADR-041。本任务提供 artifact
 架构变化的唯一增量实现和 Review 记录，不承载 ADR-042 至 ADR-044 的协议修复。
 
-- [ ] 在 closed `runner.hello` DTO 中增加必填 `source_revision`；Core controller 保存
+- [x] 在 closed `runner.hello` DTO 中增加必填 `source_revision`；Core controller 保存
   RunnerSpec/artifact manifest 的预期值并在任何 prepare/activate 前校验，不匹配返回
   `SOURCE_REVISION_MISMATCH`。Runner 侧字段只能由可信 bootstrap/protocol host 从已验证
   manifest 构造，`ChannelDriver` 不得传入或覆盖。
-- [ ] 保持 CH-0-002 的 descriptor digest、`environment_spec_id`、`environment_id` 和目录键
+- [x] 保持 CH-0-002 的 descriptor digest、`environment_spec_id`、`environment_id` 和目录键
   算法不变；`source_revision` 不进入 environment identity。
-- [ ] 将 CH-0-006 bootstrap fixture 拆成 QwenPaw 可信 Runner support artifact 与独立
+- [x] 将 CH-0-006 bootstrap fixture 拆成 QwenPaw 可信 Runner support artifact 与独立
   Channel `code_root`；Protocol SDK 只从 support artifact 加载，descriptor/entrypoint 只从
   已校验 `code_root` 加载。
-- [ ] 拒绝 Channel `code_root` 提供或覆盖 `qwenpaw.channel_protocol`，并验证 dependency
+- [x] 拒绝 Channel `code_root` 提供或覆盖 `qwenpaw.channel_protocol`，并验证 dependency
   environment 无需安装 QwenPaw 或 Channel 源码。
-- [ ] 更新 CH-0-004/CH-0-006 聚焦 fixture 和测试，覆盖 hello 缺字段/摘要格式/预期值不匹配、
+- [x] 更新 CH-0-004/CH-0-006 聚焦 fixture 和测试，覆盖 hello 缺字段/摘要格式/预期值不匹配、
   support/code root 分离、Protocol SDK shadowing、source/editable 显式根和现有 stdout、
   stderr、FD/handle 行为无回归。
-- [ ] 运行 CH-0-004、CH-0-006、完整 `tests/unit/channel_isolation`、目标文件 pre-commit 和
-  `git diff --check`；初始实现完成后状态保持 `[-]`，等待独立 Review。
+- [x] 运行 CH-0-004、CH-0-006、完整 `tests/unit/channel_isolation`、目标文件 pre-commit 和
+  `git diff --check`；独立 Review 通过后仍保持 `[-]`，等待跨平台最终验证。
+
+本轮本地实施与 P1 修复证据：真实 bootstrap 子进程从已验证 manifest 取得实际
+`code_root` 摘要 A，在加载 Driver 前冻结 hello；外部 launch identity 与 Driver 提供的
+不可变 lifecycle spec 均不含 `source_revision`，controller 由可信 host 注入 A 后构造。
+Core 预期 B 时在 prepare 前返回 `SOURCE_REVISION_MISMATCH`，fixture 记录证明 prepare 未
+发生；Core 预期 A 时同一子进程完成 hello、prepare 和 stop。bootstrap 还在导入 Driver 前
+要求 launch identity 的 `channel_key`、`capabilities` 与已验证 descriptor 完全一致，并将
+后续 hello 和 lifecycle 使用的这两个字段绑定到 descriptor；两个负向 subprocess 向量均以
+`LAUNCH_IDENTITY_MISMATCH` 退出，协议 stdout 为空且未构造 Driver 或进入 prepare。
+Feishu、OneBot、Voice 三条相邻原型均改为构建包含实际 Driver 代码的临时 Channel artifact
+并复用该 bootstrap 路径，不再拥有手写 stdio transport、手工 hello 或独立摘要常量。
+CH-0-004 与 CH-0-006 聚焦矩阵 `200 passed`；完整 `tests/unit/channel_isolation` 为
+`400 passed`；三条相邻 wrapper `3 passed`；目标文件 pre-commit 和 `git diff --check`
+通过。独立 Review 已通过（用户确认）；当前仅完成 macOS 本地验证，Linux/Windows 增量测试
+和 G0 复验仍待执行，因此任务保持 `[-]`。
 
 验收：Runner 只能以 QwenPaw 可信 bootstrap/Protocol SDK 启动已验证的独立 Channel
 `code_root`；Core 能在 hello 阶段证明实际 `source_revision` 与候选 artifact 一致，且代码
@@ -886,7 +901,7 @@ environment installer、Console 弹窗或正式 Channel 打包。
 - [~] CH-0-005 的不可变 Delivery 状态转换已通过独立 Review；Linux、macOS、Windows
   增量矩阵待执行。
 - [ ] CH-0-010 的 hello source identity、Runner support artifact/Channel `code_root` 分离
-  已通过独立 Review 及 Linux、macOS、Windows 增量测试。
+  已通过独立 Review；Linux/Windows 增量测试和 G0 复验待完成。
 - [ ] 协议修复和架构增量无阻塞当前 Phase 的 P0/P1。
 
 验收证据：`8ad95d75` 的 GitHub Actions `Channel Isolation G0 Gate` 运行

@@ -11,8 +11,8 @@ import inspect
 import json
 from pathlib import Path
 import re
+from runpy import run_path
 import socket
-import sys
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
@@ -50,10 +50,16 @@ from qwenpaw.channel_protocol import (
     RpcError,
     RpcLimits,
     RpcPeer,
+    RunnerProtocolHost,
     RunnerState,
     SendParams,
 )
 from qwenpaw.channel_protocol.rpc import RpcResponsePublication
+
+
+build_runner_artifact = run_path(
+    str(Path(__file__).parents[1] / "runner_artifact.py"),
+)["build_runner_artifact"]
 
 
 PROCESS_FIXTURE = Path(__file__).with_name("runner.py")
@@ -67,6 +73,7 @@ class FixtureIdentity:
 
     channel_key: str = "voice"
     instance_id: str = "chinst1_fixture-voice"
+    source_revision: str = "4" * 64
     environment_spec_id: str = "ches1_fixture-voice"
     environment_id: str = "chenv1_fixture-voice"
     generation: int = 1
@@ -335,23 +342,14 @@ async def _session(
         },
         driver.consume_secret,
     )
-    controller = driver.create_lifecycle_controller(
+    protocol_host = RunnerProtocolHost(identity.source_revision)
+    lifecycle_spec = driver.create_lifecycle_spec(
         identity,
         secret_handle_consumer=consumer,
     )
+    controller = protocol_host.create_lifecycle_controller(lifecycle_spec)
     driver.attach_lifecycle(controller)
-    hello = HelloParams(
-        protocol_version=1,
-        qwenpaw_version=identity.qwenpaw_version,
-        channel_key=identity.channel_key,
-        instance_id=identity.instance_id,
-        environment_spec_id=identity.environment_spec_id,
-        environment_id=identity.environment_id,
-        lock_sha256=identity.lock_sha256,
-        python_abi=identity.python_abi,
-        platform_tag=identity.platform_tag,
-        capabilities=identity.capabilities,
-    )
+    hello = protocol_host.create_hello(identity)
     controller.accept_hello(hello)
     await controller.prepare(
         PrepareParams(
@@ -1450,8 +1448,13 @@ async def test_concurrent_stop_retries_expired_quiesce_cleanup() -> None:
 class ProcessHost:
     """Provide Core-side handlers for the subprocess Runner proof."""
 
-    def __init__(self, peer: RpcPeer) -> None:
+    def __init__(
+        self,
+        peer: RpcPeer,
+        source_revision: str | None = None,
+    ) -> None:
         self.peer = peer
+        self.source_revision = source_revision
         self.events: list[Any] = []
         self.endpoint: EndpointParams | None = None
         self.endpoint_ready = asyncio.Event()
@@ -1476,6 +1479,8 @@ class ProcessHost:
         request: Any,
     ) -> dict[str, Any]:
         _ = request
+        if self.source_revision is not None:
+            assert params.source_revision == self.source_revision
         return {
             "protocol_version": 1,
             "capabilities": list(params.capabilities),
@@ -1539,14 +1544,25 @@ def _identity_mapping(identity: FixtureIdentity) -> dict[str, Any]:
 
 
 @pytest.mark.asyncio
-async def test_subprocess_separates_stdio_from_voice_ingress() -> None:
+async def test_subprocess_separates_stdio_from_voice_ingress(
+    tmp_path: Path,
+) -> None:
     """Native HTTP/WS frames never traverse the framed stdio pipe."""
-    identity = FixtureIdentity(instance_id="chinst1_process-voice")
+    prototype = FixtureIdentity(instance_id="chinst1_artifact-voice")
+    artifact = build_runner_artifact(
+        tmp_path,
+        channel_key="voice",
+        runner_source=PROCESS_FIXTURE,
+        entrypoint="FixtureVoiceDriver",
+        capabilities=prototype.capabilities,
+        ingress_owner="runner_owned",
+    )
+    identity = FixtureIdentity(
+        instance_id="chinst1_process-voice",
+        source_revision=artifact.source_revision,
+    )
     process = await asyncio.create_subprocess_exec(
-        sys.executable,
-        "-I",
-        str(PROCESS_FIXTURE),
-        json.dumps(_identity_mapping(identity), separators=(",", ":")),
+        *artifact.command(_identity_mapping(identity)),
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
@@ -1555,7 +1571,7 @@ async def test_subprocess_separates_stdio_from_voice_ingress() -> None:
     assert process.stdout is not None
     transport = FramedTransport(process.stdout, process.stdin)
     peer = RpcPeer(transport)
-    host = ProcessHost(peer)
+    host = ProcessHost(peer, artifact.source_revision)
     await peer.start()
     try:
         await peer.call(

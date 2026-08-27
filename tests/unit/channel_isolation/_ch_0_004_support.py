@@ -439,9 +439,10 @@ def _hello() -> HelloParams:
 
 
 def _hello_expectation() -> dict[str, str]:
-    """Return the Core-owned expected Runner environment fields."""
+    """Return the Core-owned expected Runner identity fields."""
     return {
         "qwenpaw_version": "0.1",
+        "source_revision": "4" * 64,
         "lock_sha256": "0" * 64,
         "python_abi": "cp313-cp313",
         "platform_tag": "macosx_11_0_arm64",

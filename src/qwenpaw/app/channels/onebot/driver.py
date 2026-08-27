@@ -27,6 +27,7 @@ from ....channel_protocol import (
     events_for_retry,
 )
 from ....channel_protocol.lifecycle import LifecycleController, RunnerState
+from ....channel_protocol.runner_host import RunnerLifecycleSpec
 from .platform import (
     OneBotEndpoint,
     OneBotPlatform,
@@ -145,28 +146,31 @@ class OneBotDriver:
         self._peer = peer
         self._identity = identity
 
-    def create_lifecycle_controller(
+    def create_lifecycle_spec(
         self,
         identity: Any,
         *,
         secret_handle_consumer: Any | None,
-    ) -> LifecycleController:
-        """Create the protocol lifecycle controller for this Driver."""
-        return _OneBotLifecycleController(
-            self,
-            channel_key=identity.channel_key,
-            instance_id=identity.instance_id,
-            environment_spec_id=identity.environment_spec_id,
-            environment_id=identity.environment_id,
-            qwenpaw_version=identity.qwenpaw_version,
-            lock_sha256=identity.lock_sha256,
-            python_abi=identity.python_abi,
-            platform_tag=identity.platform_tag,
-            generation=identity.generation,
-            capabilities=identity.capabilities,
-            send_handler=self.send,
-            secret_handle_consumer=secret_handle_consumer,
-            endpoint_handler=self._publish_endpoint,
+    ) -> RunnerLifecycleSpec:
+        """Describe lifecycle hooks without carrying source identity."""
+        return RunnerLifecycleSpec(
+            controller_class=_OneBotLifecycleController,
+            args=(self,),
+            kwargs={
+                "channel_key": identity.channel_key,
+                "instance_id": identity.instance_id,
+                "environment_spec_id": identity.environment_spec_id,
+                "environment_id": identity.environment_id,
+                "qwenpaw_version": identity.qwenpaw_version,
+                "lock_sha256": identity.lock_sha256,
+                "python_abi": identity.python_abi,
+                "platform_tag": identity.platform_tag,
+                "generation": identity.generation,
+                "capabilities": identity.capabilities,
+                "send_handler": self.send,
+                "secret_handle_consumer": secret_handle_consumer,
+                "endpoint_handler": self._publish_endpoint,
+            },
         )
 
     def attach_lifecycle(self, controller: LifecycleController) -> None:

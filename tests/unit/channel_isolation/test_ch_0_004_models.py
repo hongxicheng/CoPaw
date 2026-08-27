@@ -97,10 +97,11 @@ def test_rpc_parse_error_allows_only_error_response_null_id() -> None:
     assert invalid_success.value.reason_code == "SCHEMA_MISMATCH"
 
 
-def test_hello_requires_one_closed_protocol_version() -> None:
-    """Hello v1 rejects ranges, missing versions, and unknown fields."""
+def test_hello_requires_closed_protocol_and_source_identity() -> None:
+    """Hello v1 requires one version and one exact source revision."""
     mapping = _hello().to_mapping()
     assert mapping["protocol_version"] == PROTOCOL_VERSION == 1
+    assert mapping["source_revision"] == "4" * 64
     assert "protocol_min" not in mapping
     assert "protocol_max" not in mapping
 
@@ -118,6 +119,17 @@ def test_hello_requires_one_closed_protocol_version() -> None:
     with pytest.raises(ProtocolValidationError) as ranged:
         HelloParams.from_mapping(legacy)
     assert ranged.value.reason_code == "SCHEMA_MISMATCH"
+
+    missing_source = dict(mapping)
+    missing_source.pop("source_revision")
+    with pytest.raises(ProtocolValidationError) as absent_source:
+        HelloParams.from_mapping(missing_source)
+    assert absent_source.value.reason_code == "SCHEMA_MISMATCH"
+
+    for invalid_source in ("4" * 63, "A" * 64):
+        invalid = {**mapping, "source_revision": invalid_source}
+        with pytest.raises(ProtocolValidationError):
+            HelloParams.from_mapping(invalid)
 
 
 def test_host_context_requires_cross_platform_absolute_media_path() -> None:

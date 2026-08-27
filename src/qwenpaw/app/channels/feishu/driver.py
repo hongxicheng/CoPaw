@@ -26,6 +26,7 @@ from ....channel_protocol import (
     SendParams,
 )
 from ....channel_protocol.lifecycle import LifecycleController, RunnerState
+from ....channel_protocol.runner_host import RunnerLifecycleSpec
 from ....channel_protocol.response_lifecycle import (
     ResponseResourceRef,
     RunnerDeliveryResult,
@@ -238,32 +239,37 @@ class FeishuDriver:
         self._identity = identity
         self._response_checkpoint.bind(peer, identity)
 
-    def create_lifecycle_controller(
+    def create_lifecycle_spec(
         self,
         identity: Any,
         *,
         secret_handle_consumer: Any | None,
-    ) -> LifecycleController:
-        """Create the protocol lifecycle controller for this Driver."""
-        return _FeishuLifecycleController(
-            self,
-            channel_key=identity.channel_key,
-            instance_id=identity.instance_id,
-            environment_spec_id=identity.environment_spec_id,
-            environment_id=identity.environment_id,
-            qwenpaw_version=identity.qwenpaw_version,
-            lock_sha256=identity.lock_sha256,
-            python_abi=identity.python_abi,
-            platform_tag=identity.platform_tag,
-            generation=identity.generation,
-            capabilities=identity.capabilities,
-            send_handler=self.send,
-            reaction_handler=self.reaction,
-            response_checkpoint_put=self._response_checkpoint.put,
-            response_checkpoint_delete=self._response_checkpoint.delete,
-            secret_handle_consumer=secret_handle_consumer,
-            max_response_routes=self._response_checkpoint.max_entries,
-            response_clock_ms=self._response_clock_ms,
+    ) -> RunnerLifecycleSpec:
+        """Describe lifecycle hooks without carrying source identity."""
+        return RunnerLifecycleSpec(
+            controller_class=_FeishuLifecycleController,
+            args=(self,),
+            kwargs={
+                "channel_key": identity.channel_key,
+                "instance_id": identity.instance_id,
+                "environment_spec_id": identity.environment_spec_id,
+                "environment_id": identity.environment_id,
+                "qwenpaw_version": identity.qwenpaw_version,
+                "lock_sha256": identity.lock_sha256,
+                "python_abi": identity.python_abi,
+                "platform_tag": identity.platform_tag,
+                "generation": identity.generation,
+                "capabilities": identity.capabilities,
+                "send_handler": self.send,
+                "reaction_handler": self.reaction,
+                "response_checkpoint_put": self._response_checkpoint.put,
+                "response_checkpoint_delete": (
+                    self._response_checkpoint.delete
+                ),
+                "secret_handle_consumer": secret_handle_consumer,
+                "max_response_routes": self._response_checkpoint.max_entries,
+                "response_clock_ms": self._response_clock_ms,
+            },
         )
 
     def attach_lifecycle(self, controller: LifecycleController) -> None:

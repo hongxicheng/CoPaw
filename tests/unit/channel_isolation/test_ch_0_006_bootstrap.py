@@ -21,18 +21,29 @@ import packaging
 import pytest
 
 from qwenpaw.channel_protocol import (
+    EnvironmentIdentity,
+    EnvironmentSpecIdentity,
     FrameClosedError,
     FrameLimitError,
     FrameTimeoutError,
     FrameWriteError,
     FramedTransport,
     FramingLimits,
+    InstallationIdentity,
+    LifecycleController,
+    HostContext,
+    IdentityParams,
+    ProtocolValidationError,
+    PrepareParams,
+    RpcError,
+    RpcPeer,
+    RunnerLaunchIdentity,
+    RunnerLifecycleSpec,
+    RunnerProtocolHost,
     encode_frame,
     runner_bootstrap,
 )
-from qwenpaw.channel_protocol.runner_bootstrap import (
-    _open_protocol_transport,
-)
+from qwenpaw.channel_protocol.runner_bootstrap import _open_protocol_transport
 
 
 BOOTSTRAP = (
@@ -58,18 +69,25 @@ ALLOWED_PLATFORM_TAGS = [
 
 
 def _copy_code_root(directory: Path) -> Path:
-    """Build one explicit trusted source root for the Runner fixture."""
+    """Build one explicit Channel artifact root without Protocol code."""
     code_root = directory / "code-root"
     ignore = shutil.ignore_patterns("__pycache__", "*.pyc")
     shutil.copytree(FIXTURE_SOURCE_ROOT, code_root, ignore=ignore)
-    protocol_target = code_root / "qwenpaw" / "channel_protocol"
+    return code_root.resolve()
+
+
+def _copy_runner_support(directory: Path) -> Path:
+    """Build a standalone trusted bootstrap and Protocol SDK artifact."""
+    support_root = directory / "runner-support"
+    protocol_target = support_root / "qwenpaw" / "channel_protocol"
     protocol_target.parent.mkdir(parents=True)
+    ignore = shutil.ignore_patterns("__pycache__", "*.pyc")
     shutil.copytree(
         PROTOCOL_SOURCE_ROOT,
         protocol_target,
         ignore=ignore,
     )
-    return code_root.resolve()
+    return support_root.resolve()
 
 
 def _hash_code_root(code_root: Path) -> str:
@@ -116,7 +134,7 @@ def _write_manifest(
     descriptor_path = code_root / "channel.json"
     manifest: dict[str, Any] = {
         "schema_version": 1,
-        "code_root_sha256": _hash_code_root(code_root),
+        "source_revision": _hash_code_root(code_root),
         "descriptor_path": str(descriptor_path.resolve()),
         "descriptor_sha256": hashlib.sha256(
             descriptor_path.read_bytes(),
@@ -129,9 +147,14 @@ def _write_manifest(
     return path.resolve()
 
 
-def _command(*, code_root: Path, manifest: Path) -> list[str]:
+def _command(
+    *,
+    code_root: Path,
+    manifest: Path,
+    launch_identity: Path | None = None,
+) -> list[str]:
     """Return the required absolute isolated bootstrap command."""
-    return [
+    command = [
         sys.executable,
         "-I",
         str(BOOTSTRAP),
@@ -140,6 +163,30 @@ def _command(*, code_root: Path, manifest: Path) -> list[str]:
         "--manifest",
         str(manifest.resolve()),
     ]
+    if launch_identity is not None:
+        command.extend(
+            ["--launch-identity", str(launch_identity.resolve())],
+        )
+    return command
+
+
+def _write_launch_identity(directory: Path) -> tuple[Path, dict[str, Any]]:
+    """Write the closed non-source identity supplied by RunnerSpec args."""
+    identity = {
+        "qwenpaw_version": "0.1",
+        "channel_key": "feishu",
+        "instance_id": "chinst1_source-binding",
+        "environment_spec_id": f"ches1_{'1' * 64}",
+        "environment_id": f"ches1_{'1' * 64}.install1_{'2' * 32}",
+        "lock_sha256": "3" * 64,
+        "python_abi": "cp313-cp313",
+        "platform_tag": "macosx_11_0_arm64",
+        "generation": 1,
+        "capabilities": [],
+    }
+    path = directory / "launch-identity.json"
+    path.write_text(json.dumps(identity), encoding="utf-8")
+    return path.resolve(), identity
 
 
 def _environment(result_path: Path) -> dict[str, str]:
@@ -269,6 +316,17 @@ class _LateSuccessfulWriteHandle:
         self.closed = True
 
 
+class _ChunkReadHandle:
+    """Return one prepared stdin chunk followed by EOF."""
+
+    def __init__(self, data: bytes) -> None:
+        self._chunks = [data, b""]
+
+    def read1(self, _: int) -> bytes:
+        """Return the next prepared input chunk."""
+        return self._chunks.pop(0)
+
+
 class _FakeWindowsThreadHandle:
     """Cancel one fake synchronous write and record resource closure."""
 
@@ -337,7 +395,8 @@ def test_rejects_non_isolated_python_before_channel_import(
     ("manifest_value", "reason"),
     [
         ({"schema_version": 2}, "MANIFEST_INVALID"),
-        ({"code_root_sha256": "0" * 64}, "CODE_ROOT_MISMATCH"),
+        ({"source_revision": None}, "MANIFEST_INVALID"),
+        ({"source_revision": "0" * 64}, "SOURCE_REVISION_MISMATCH"),
         ({"descriptor_sha256": "0" * 64}, "DESCRIPTOR_MISMATCH"),
     ],
 )
@@ -365,6 +424,252 @@ def test_rejects_invalid_integrity_manifest_before_channel_import(
     assert result.stdout == b""
     assert f'"error":"{reason}"'.encode() in result.stderr
     assert b"feishu-sdk" not in result.stderr
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        Path("qwenpaw/channel_protocol/__init__.py"),
+        Path("qwenpaw/channel_protocol.py"),
+    ],
+)
+def test_rejects_channel_protocol_sdk_shadowing_before_import(
+    tmp_path: Path,
+    relative_path: Path,
+) -> None:
+    """Channel code cannot provide a package or module for Protocol SDK."""
+    code_root = _copy_code_root(tmp_path)
+    shadow = code_root / relative_path
+    shadow.parent.mkdir(parents=True, exist_ok=True)
+    shadow.write_text(
+        "raise RuntimeError('shadow loaded')\n",
+        encoding="utf-8",
+    )
+    manifest = _write_manifest(tmp_path, code_root=code_root)
+
+    result = subprocess.run(
+        _command(code_root=code_root, manifest=manifest),
+        env=_environment(tmp_path / "result.json"),
+        capture_output=True,
+        check=False,
+        timeout=5,
+    )
+
+    assert result.returncode == 2
+    assert result.stdout == b""
+    assert b'"error":"PROTOCOL_SDK_SHADOWED"' in result.stderr
+    assert b"shadow loaded" not in result.stderr
+    assert b"feishu-sdk" not in result.stderr
+
+
+def test_source_revision_changes_without_changing_environment_identity(
+    tmp_path: Path,
+) -> None:
+    """Channel source changes are independent of dependency identity."""
+    code_root = _copy_code_root(tmp_path)
+    environment = EnvironmentSpecIdentity.create(
+        channel_key="feishu",
+        lock_sha256="0" * 64,
+        python_abi="cp313-cp313",
+        platform_tag="macosx_11_0_arm64",
+        condition_set={},
+        allowed_platform_tags=ALLOWED_PLATFORM_TAGS,
+    )
+    installation = InstallationIdentity.parse(f"install1_{'1' * 32}")
+    environment_install = EnvironmentIdentity.create(
+        environment_spec_id=environment.environment_spec_id,
+        installation=installation,
+    )
+    original_revision = _hash_code_root(code_root)
+    entrypoint = code_root / "runner_entrypoint.py"
+    entrypoint.write_text(
+        f"{entrypoint.read_text(encoding='utf-8')}\n# source edit\n",
+        encoding="utf-8",
+    )
+    edited_revision = _hash_code_root(code_root)
+    unchanged_environment = EnvironmentSpecIdentity.create(
+        channel_key="feishu",
+        lock_sha256="0" * 64,
+        python_abi="cp313-cp313",
+        platform_tag="macosx_11_0_arm64",
+        condition_set={},
+        allowed_platform_tags=ALLOWED_PLATFORM_TAGS,
+    )
+    unchanged_install = EnvironmentIdentity.create(
+        environment_spec_id=unchanged_environment.environment_spec_id,
+        installation=installation,
+    )
+
+    assert edited_revision != original_revision
+    assert unchanged_environment == environment
+    assert unchanged_install == environment_install
+
+
+def test_driver_launch_inputs_have_no_source_authority(
+    tmp_path: Path,
+) -> None:
+    """Launch identity and Driver lifecycle spec cannot carry source."""
+    _, identity_mapping = _write_launch_identity(tmp_path)
+    identity = RunnerLaunchIdentity.from_mapping(identity_mapping)
+    unexpected_revision = "0" * 64
+
+    assert not hasattr(identity, "source_revision")
+    with pytest.raises(ProtocolValidationError):
+        RunnerLaunchIdentity.from_mapping(
+            {
+                **identity_mapping,
+                "source_revision": unexpected_revision,
+            },
+        )
+    with pytest.raises(TypeError, match="owned by RunnerProtocolHost"):
+        RunnerLifecycleSpec(
+            controller_class=LifecycleController,
+            args=(),
+            kwargs={"source_revision": unexpected_revision},
+        )
+    host = RunnerProtocolHost("1" * 64)
+    with pytest.raises(AttributeError):
+        setattr(host, "_source_revision", unexpected_revision)
+
+
+@pytest.mark.parametrize(
+    ("field", "mismatched_value"),
+    [
+        ("channel_key", "onebot"),
+        ("capabilities", ["media"]),
+    ],
+)
+def test_rejects_launch_identity_descriptor_mismatch_before_import(
+    tmp_path: Path,
+    field: str,
+    mismatched_value: object,
+) -> None:
+    """Descriptor-owned launch claims must match before Driver import."""
+    code_root = _copy_code_root(tmp_path)
+    _set_entrypoint(code_root, qualname="LifecycleFixtureDriver")
+    manifest_path = _write_manifest(tmp_path, code_root=code_root)
+    launch_path, identity = _write_launch_identity(tmp_path)
+    identity[field] = mismatched_value
+    launch_path.write_text(json.dumps(identity), encoding="utf-8")
+    result_path = tmp_path / "result.json"
+
+    result = subprocess.run(
+        _command(
+            code_root=code_root,
+            manifest=manifest_path,
+            launch_identity=launch_path,
+        ),
+        env=_environment(result_path),
+        capture_output=True,
+        check=False,
+        timeout=5,
+    )
+
+    assert result.returncode == 2
+    assert result.stdout == b""
+    assert b'"error":"LAUNCH_IDENTITY_MISMATCH"' in result.stderr
+    assert b"feishu-sdk" not in result.stderr
+    assert not result_path.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source_matches", [False, True])
+async def test_real_bootstrap_binds_manifest_source_before_prepare(
+    tmp_path: Path,
+    source_matches: bool,
+) -> None:
+    """The subprocess hello uses manifest source before prepare is allowed."""
+    code_root = _copy_code_root(tmp_path)
+    _set_entrypoint(code_root, qualname="LifecycleFixtureDriver")
+    manifest_path = _write_manifest(tmp_path, code_root=code_root)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    source_revision = manifest["source_revision"]
+    launch_path, identity_mapping = _write_launch_identity(tmp_path)
+    expected_revision = "0" * 64
+    identity = RunnerLaunchIdentity.from_mapping(identity_mapping)
+
+    core_controller = LifecycleController(
+        channel_key=identity.channel_key,
+        instance_id=identity.instance_id,
+        source_revision=(
+            source_revision if source_matches else expected_revision
+        ),
+        environment_spec_id=identity.environment_spec_id,
+        environment_id=identity.environment_id,
+        qwenpaw_version=identity.qwenpaw_version,
+        lock_sha256=identity.lock_sha256,
+        python_abi=identity.python_abi,
+        platform_tag=identity.platform_tag,
+        generation=identity.generation,
+    )
+    result_path = tmp_path / "result.json"
+    process = await asyncio.create_subprocess_exec(
+        *_command(
+            code_root=code_root,
+            manifest=manifest_path,
+            launch_identity=launch_path,
+        ),
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env=_environment(result_path),
+    )
+    assert process.stdin is not None
+    assert process.stdout is not None
+    assert process.stderr is not None
+    peer = RpcPeer(FramedTransport(process.stdout, process.stdin))
+    hello_received = asyncio.Event()
+    hello_sources: list[str] = []
+    mismatch_reasons: list[str] = []
+
+    async def accept_hello(params: Any, _: object) -> dict[str, Any]:
+        hello_sources.append(params.source_revision)
+        hello_received.set()
+        try:
+            return core_controller.accept_hello(params)
+        except RpcError as exc:
+            mismatch_reasons.append(exc.data["reason_code"])
+            raise
+
+    peer.register_method("runner.hello", accept_hello)
+    await peer.start()
+    await asyncio.wait_for(hello_received.wait(), timeout=5.0)
+    if source_matches:
+        await peer.call(
+            "channel.prepare",
+            PrepareParams(
+                channel_key=identity.channel_key,
+                instance_id=identity.instance_id,
+                generation=identity.generation,
+                host_context=HostContext(config_snapshot={}),
+                capabilities=(),
+            ).to_mapping(),
+        )
+        await peer.call(
+            "channel.stop",
+            IdentityParams(
+                channel_key=identity.channel_key,
+                instance_id=identity.instance_id,
+                generation=identity.generation,
+            ).to_mapping(),
+        )
+    else:
+        await asyncio.wait_for(process.wait(), timeout=5.0)
+    await peer.aclose()
+    if source_matches:
+        await asyncio.wait_for(process.wait(), timeout=5.0)
+    payload = _read_result(result_path)
+
+    assert hello_sources == [source_revision]
+    assert (payload.get("prepare_called") is True) is source_matches
+    if source_matches:
+        assert core_controller.hello is not None
+        assert process.returncode == 0
+    else:
+        assert mismatch_reasons == ["SOURCE_REVISION_MISMATCH"]
+        assert core_controller.hello is None
+        assert core_controller.state.value == "created"
+        assert process.returncode != 0
 
 
 @pytest.mark.parametrize("mode", ["invalid_scope", "core_process"])
@@ -460,11 +765,11 @@ def test_descriptor_constructs_driver_and_controls_environment(
         code_root / "runner_entrypoint.py"
     )
     assert Path(payload["descriptor_file"]) == (
-        code_root / "qwenpaw" / "channel_protocol" / "descriptor.py"
+        PROTOCOL_SOURCE_ROOT / "descriptor.py"
     )
     assert payload["sys_path"][0] == str(code_root)
+    assert payload["sys_path"][1] == str(BOOTSTRAP.parents[2])
     assert str(ambient_root) not in payload["sys_path"]
-    assert str(BOOTSTRAP.parents[2]) not in payload["sys_path"]
     assert b"feishu-sdk-print" in result.stderr
     assert b"feishu-sdk-fd1" in result.stderr
     assert b"runner-print" in result.stderr
@@ -610,14 +915,15 @@ def _copy_packaging_to_environment(
     shutil.copytree(source, Path(purelib) / "packaging")
 
 
-def test_frozen_style_bootstrap_artifact_needs_no_installed_qwenpaw(
+def test_frozen_style_support_needs_no_installed_qwenpaw_or_channel(
     tmp_path: Path,
 ) -> None:
-    """A copied bootstrap loads QwenPaw only from explicit code_root."""
+    """A copied support artifact is independent of Channel and environment."""
     code_root = _copy_code_root(tmp_path)
-    bootstrap_copy = tmp_path / "application" / "runner_bootstrap.py"
-    bootstrap_copy.parent.mkdir()
-    shutil.copy2(BOOTSTRAP, bootstrap_copy)
+    support_root = _copy_runner_support(tmp_path)
+    bootstrap_copy = (
+        support_root / "qwenpaw" / "channel_protocol" / "runner_bootstrap.py"
+    )
     bootstrap_copy.chmod(0o444)
     manifest = _write_manifest(tmp_path, code_root=code_root)
     environment_root = tmp_path / "dependency-environment"
@@ -628,8 +934,9 @@ def test_frozen_style_bootstrap_artifact_needs_no_installed_qwenpaw(
     _copy_packaging_to_environment(interpreter)
     probe_code = (
         "import importlib.util; "
-        "found = importlib.util.find_spec('qwenpaw'); "
-        "raise SystemExit(found is not None)"
+        "qwenpaw = importlib.util.find_spec('qwenpaw'); "
+        "channel = importlib.util.find_spec('runner_entrypoint'); "
+        "raise SystemExit(qwenpaw is not None or channel is not None)"
     )
     probe = subprocess.run(
         [
@@ -684,7 +991,7 @@ def test_frozen_style_bootstrap_artifact_needs_no_installed_qwenpaw(
     payload = _read_result(result_path)
     assert payload["driver_constructed"] is True
     assert Path(payload["descriptor_file"]) == (
-        code_root / "qwenpaw" / "channel_protocol" / "descriptor.py"
+        support_root / "qwenpaw" / "channel_protocol" / "descriptor.py"
     )
     assert b"Traceback" not in result.stderr
 
@@ -735,6 +1042,36 @@ async def test_windows_adapter_completes_partial_sync_writes(
 
     assert bytes(handle.data) == encode_frame(message)
     assert handle.closed
+    assert thread_handle.closed
+
+
+@pytest.mark.asyncio
+async def test_windows_adapter_reads_runner_stdin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Windows thread reader feeds the trusted framed transport."""
+    output = _PartialWriteHandle()
+    thread_handle = _FakeWindowsThreadHandle()
+    message = '{"platform":"windows-input"}'
+    monkeypatch.setattr(
+        runner_bootstrap,
+        "os",
+        SimpleNamespace(name="nt"),
+    )
+    monkeypatch.setattr(
+        runner_bootstrap,
+        "_open_windows_thread_handle",
+        lambda: thread_handle,
+    )
+    transport = await _open_protocol_transport(
+        FramedTransport,
+        output,
+        input_handle=_ChunkReadHandle(encode_frame(message)),
+    )
+
+    assert await transport.receive() == message
+    await transport.aclose()
+    assert output.closed
     assert thread_handle.closed
 
 

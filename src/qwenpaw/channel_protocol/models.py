@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, Mapping
 
-from .errors import ProtocolValidationError
+from .errors import DescriptorValidationError, ProtocolValidationError
 from .identifiers import validate_channel_key, validate_digest
 
 JSONRPC_VERSION = "2.0"
@@ -432,6 +432,7 @@ class HelloParams:
     qwenpaw_version: str
     channel_key: str
     instance_id: str
+    source_revision: str
     environment_spec_id: str
     environment_id: str
     lock_sha256: str
@@ -446,6 +447,7 @@ class HelloParams:
             "qwenpaw_version": self.qwenpaw_version,
             "channel_key": self.channel_key,
             "instance_id": self.instance_id,
+            "source_revision": self.source_revision,
             "environment_spec_id": self.environment_spec_id,
             "environment_id": self.environment_id,
             "lock_sha256": self.lock_sha256,
@@ -463,6 +465,7 @@ class HelloParams:
             "qwenpaw_version",
             "channel_key",
             "instance_id",
+            "source_revision",
             "environment_spec_id",
             "environment_id",
             "lock_sha256",
@@ -484,6 +487,20 @@ class HelloParams:
             _string(data.get("channel_key"), "channel_key"),
         )
         instance_id = _string(data.get("instance_id"), "instance_id")
+        source_value = _string(
+            _required(data, "source_revision"),
+            "source_revision",
+        )
+        try:
+            source_revision = validate_digest(
+                source_value,
+                name="Source revision",
+            )
+        except DescriptorValidationError as exc:
+            raise _error(
+                str(exc),
+                path=("source_revision",),
+            ) from exc
         environment_spec_id = _string(
             data.get("environment_spec_id"),
             "environment_spec_id",
@@ -501,6 +518,7 @@ class HelloParams:
             qwenpaw_version=qwenpaw_version,
             channel_key=channel_key,
             instance_id=instance_id,
+            source_revision=source_revision,
             environment_spec_id=environment_spec_id,
             environment_id=environment_id,
             lock_sha256=lock_sha256,

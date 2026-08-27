@@ -99,6 +99,11 @@ from .reliability import (
     delivery_updates,
     events_for_retry,
 )
+from .runner_host import (
+    RunnerLaunchIdentity,
+    RunnerLifecycleSpec,
+    RunnerProtocolHost,
+)
 from .identifiers import (
     DirectoryIdentity,
     EnvironmentIdentity,
@@ -193,6 +198,9 @@ __all__ = [
     "ResponseFinishResult",
     "ResponseOutcome",
     "RunnerState",
+    "RunnerLaunchIdentity",
+    "RunnerLifecycleSpec",
+    "RunnerProtocolHost",
     "SendParams",
     "StreamType",
     "VoiceEvent",

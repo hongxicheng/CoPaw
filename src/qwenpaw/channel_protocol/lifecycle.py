@@ -119,6 +119,7 @@ class LifecycleController:  # pylint: disable=too-many-public-methods
         *,
         channel_key: str,
         instance_id: str,
+        source_revision: str,
         environment_spec_id: str,
         environment_id: str,
         qwenpaw_version: str,
@@ -149,6 +150,7 @@ class LifecycleController:  # pylint: disable=too-many-public-methods
             raise ValueError("max_response_routes must be positive")
         self.channel_key = channel_key
         self.instance_id = instance_id
+        self.source_revision = source_revision
         self.environment_spec_id = environment_spec_id
         self.environment_id = environment_id
         self.qwenpaw_version = qwenpaw_version
@@ -287,6 +289,11 @@ class LifecycleController:  # pylint: disable=too-many-public-methods
                 params.qwenpaw_version,
                 self.qwenpaw_version,
                 "QWENPAW_VERSION_MISMATCH",
+            ),
+            (
+                params.source_revision,
+                self.source_revision,
+                "SOURCE_REVISION_MISMATCH",
             ),
             (
                 params.environment_spec_id,

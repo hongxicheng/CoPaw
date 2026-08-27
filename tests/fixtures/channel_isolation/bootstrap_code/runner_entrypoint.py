@@ -12,6 +12,7 @@ import sys
 from typing import Any
 
 import fake_feishu_sdk
+from qwenpaw.channel_protocol import LifecycleController, RunnerLifecycleSpec
 
 
 def _write_result(value: dict[str, Any]) -> None:
@@ -60,6 +61,62 @@ class FixtureDriver:
                 "sys_path": list(sys.path),
             },
         )
+
+
+class _FixtureLifecycleController(LifecycleController):
+    """Record that prepare crossed the real bootstrap protocol path."""
+
+    async def prepare(self, params: Any) -> dict[str, Any]:
+        result = await super().prepare(params)
+        result_path = os.environ.get("QWENPAW_FIXTURE_RESULT")
+        if result_path is None:
+            raise RuntimeError("QWENPAW_FIXTURE_RESULT is required")
+        path = Path(result_path)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["prepare_called"] = True
+        _write_result(payload)
+        return result
+
+
+class LifecycleFixtureDriver(FixtureDriver):
+    """Expose the Phase 0 lifecycle contract to the real bootstrap."""
+
+    source_revision = "f" * 64
+
+    def bind(self, peer: Any, identity: Any) -> None:
+        """Retain the trusted session inputs supplied by bootstrap."""
+        self.peer = peer
+        self.identity = identity
+
+    def create_lifecycle_spec(
+        self,
+        identity: Any,
+        *,
+        secret_handle_consumer: Any | None,
+    ) -> RunnerLifecycleSpec:
+        """Describe a controller without carrying protocol source."""
+        if secret_handle_consumer is not None:
+            raise RuntimeError("fixture does not accept a secret consumer")
+        return RunnerLifecycleSpec(
+            controller_class=_FixtureLifecycleController,
+            args=(),
+            kwargs={
+                "channel_key": identity.channel_key,
+                "instance_id": identity.instance_id,
+                "environment_spec_id": identity.environment_spec_id,
+                "environment_id": identity.environment_id,
+                "qwenpaw_version": identity.qwenpaw_version,
+                "lock_sha256": identity.lock_sha256,
+                "python_abi": identity.python_abi,
+                "platform_tag": identity.platform_tag,
+                "generation": identity.generation,
+                "capabilities": identity.capabilities,
+            },
+        )
+
+    def attach_lifecycle(self, controller: LifecycleController) -> None:
+        """Retain the controller used by the bootstrap session."""
+        self.controller = controller
 
 
 class NoisyDriver:

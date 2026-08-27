@@ -12,6 +12,7 @@ import io
 import json
 import logging
 from pathlib import Path
+from runpy import run_path
 import subprocess
 import sys
 import threading
@@ -41,7 +42,6 @@ from qwenpaw.app.channels.feishu.platform import (
 from qwenpaw.channel_protocol import (
     FixtureSecretHandleConsumer,
     FramedTransport,
-    HelloParams,
     HostContext,
     HostStateStore,
     PrepareParams,
@@ -49,7 +49,13 @@ from qwenpaw.channel_protocol import (
     RpcError,
     RpcLimits,
     RpcPeer,
+    RunnerProtocolHost,
 )
+
+
+build_runner_artifact = run_path(
+    str(Path(__file__).parents[1] / "runner_artifact.py"),
+)["build_runner_artifact"]
 
 
 PROCESS_FIXTURE = Path(__file__).with_name("runner.py")
@@ -116,6 +122,7 @@ class FixtureIdentity:
 
     channel_key: str
     instance_id: str
+    source_revision: str
     environment_spec_id: str
     environment_id: str
     generation: int
@@ -126,11 +133,17 @@ class FixtureIdentity:
     capabilities: tuple[str, ...]
 
 
-def _identity(instance_id: str, generation: int = 1) -> FixtureIdentity:
+def _identity(
+    instance_id: str,
+    generation: int = 1,
+    *,
+    source_revision: str = "4" * 64,
+) -> FixtureIdentity:
     environment_spec_id = f"ches1_{'1' * 64}"
     return FixtureIdentity(
         channel_key="feishu",
         instance_id=instance_id,
+        source_revision=source_revision,
         environment_spec_id=environment_spec_id,
         environment_id=f"{environment_spec_id}.install1_{'2' * 32}",
         generation=generation,
@@ -369,6 +382,7 @@ class MockHost:
 
     async def _runner_hello(self, params: Any, _: object) -> dict[str, Any]:
         assert params.instance_id == self.identity.instance_id
+        assert params.source_revision == self.identity.source_revision
         self.hello.set()
         return {
             "protocol_version": 1,
@@ -484,28 +498,17 @@ async def _run_driver_session(
 ) -> None:
     peer = RpcPeer(transport)
     driver.bind(peer, identity)
-    controller = driver.create_lifecycle_controller(
+    protocol_host = RunnerProtocolHost(identity.source_revision)
+    lifecycle_spec = driver.create_lifecycle_spec(
         identity,
         secret_handle_consumer=consumer,
     )
+    controller = protocol_host.create_lifecycle_controller(lifecycle_spec)
     controller.register_rpc_methods(peer)
     driver.attach_lifecycle(controller)
     await peer.start()
     try:
-        hello = HelloParams(
-            protocol_version=1,
-            qwenpaw_version=identity.qwenpaw_version,
-            channel_key=identity.channel_key,
-            instance_id=identity.instance_id,
-            environment_spec_id=identity.environment_spec_id,
-            environment_id=identity.environment_id,
-            lock_sha256=identity.lock_sha256,
-            python_abi=identity.python_abi,
-            platform_tag=identity.platform_tag,
-            capabilities=identity.capabilities,
-        )
-        controller.accept_hello(hello)
-        await peer.call("runner.hello", hello.to_mapping())
+        await protocol_host.exchange_hello(peer, controller, identity)
         await peer.wait_closed()
     finally:
         await driver.stop()
@@ -3221,8 +3224,23 @@ async def test_distinct_runner_processes_and_restart_restore_core_reply(
     tmp_path: Path,
 ) -> None:
     """Two fixture processes isolate state and restart restores routing."""
-    identity_a = _identity("process-a")
-    identity_b = _identity("process-b")
+    prototype = _identity("artifact")
+    artifact = build_runner_artifact(
+        tmp_path,
+        channel_key="feishu",
+        runner_source=PROCESS_FIXTURE,
+        entrypoint="FixtureFeishuDriver",
+        capabilities=prototype.capabilities,
+        ingress_owner="none",
+    )
+    identity_a = _identity(
+        "process-a",
+        source_revision=artifact.source_revision,
+    )
+    identity_b = _identity(
+        "process-b",
+        source_revision=artifact.source_revision,
+    )
     state_a = HostStateStore()
     state_b = HostStateStore()
 
@@ -3232,10 +3250,7 @@ async def test_distinct_runner_processes_and_restart_restore_core_reply(
         state: HostStateStore,
     ) -> tuple[asyncio.subprocess.Process, RpcPeer, MockHost]:
         process = await asyncio.create_subprocess_exec(
-            sys.executable,
-            "-I",
-            str(PROCESS_FIXTURE),
-            json.dumps(_identity_mapping(identity), separators=(",", ":")),
+            *artifact.command(_identity_mapping(identity)),
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -3309,7 +3324,11 @@ async def test_distinct_runner_processes_and_restart_restore_core_reply(
     await asyncio.wait_for(process_a.wait(), timeout=2.0)
     await core_a.aclose()
     reply_handle = host_a.reply_handle_for("process-a")
-    restarted_identity = _identity("process-a", generation=2)
+    restarted_identity = _identity(
+        "process-a",
+        generation=2,
+        source_revision=artifact.source_revision,
+    )
     restarted, restarted_core, _ = await start_process(
         restarted_identity,
         {},

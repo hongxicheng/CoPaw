@@ -618,6 +618,7 @@ async def test_protocol_mismatch_returns_rpc_error_envelope() -> None:
         "qwenpaw_version": "0.1",
         "channel_key": "voice",
         "instance_id": "instance-1",
+        "source_revision": "4" * 64,
         "environment_spec_id": "ches1_" + "1" * 64,
         "environment_id": "ches1_" + "1" * 64 + ".install1_" + "2" * 32,
         "lock_sha256": "0" * 64,

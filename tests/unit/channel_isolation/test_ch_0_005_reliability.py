@@ -102,6 +102,7 @@ async def _active_rpc_pair(
     controller = LifecycleController(
         channel_key="voice",
         instance_id="instance-1",
+        source_revision="4" * 64,
         environment_spec_id=_ENVIRONMENT_SPEC_ID,
         environment_id=_ENVIRONMENT_ID,
         qwenpaw_version="0.1",
@@ -126,6 +127,7 @@ async def _active_rpc_pair(
                 "qwenpaw_version": "0.1",
                 "channel_key": "voice",
                 "instance_id": "instance-1",
+                "source_revision": "4" * 64,
                 "environment_spec_id": _ENVIRONMENT_SPEC_ID,
                 "environment_id": _ENVIRONMENT_ID,
                 "lock_sha256": "0" * 64,

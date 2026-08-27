@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import ctypes
 from ctypes import wintypes
+from dataclasses import replace
 import hashlib
 import importlib
 import json
@@ -21,7 +22,7 @@ from typing import Any
 _MANIFEST_FIELDS = frozenset(
     {
         "schema_version",
-        "code_root_sha256",
+        "source_revision",
         "descriptor_path",
         "descriptor_sha256",
         "allowed_platform_tags",
@@ -57,13 +58,30 @@ class BootstrapError(RuntimeError):
 class _RunnerProcess:
     """Own the validated driver instance and protocol transport."""
 
-    def __init__(self, descriptor: Any, transport: Any) -> None:
+    def __init__(
+        self,
+        descriptor: Any,
+        transport: Any,
+        source_revision: str,
+        identity: Any | None,
+        protocol_host_class: Any,
+        rpc_peer_class: Any,
+    ) -> None:
         self._descriptor = descriptor
         self._transport = transport
+        self._identity = identity
+        self._protocol_host = protocol_host_class(source_revision)
+        self._rpc_peer_class = rpc_peer_class
         self._driver: Any | None = None
 
-    def start(self, expected_source: Path) -> None:
-        """Load and construct only the descriptor-declared driver class."""
+    async def start(self, expected_source: Path) -> None:
+        """Load the Driver and run its trusted protocol session."""
+        identity = self._identity
+        hello = (
+            self._protocol_host.create_hello(identity)
+            if identity is not None
+            else None
+        )
         driver_class = _load_driver_class(
             self._descriptor.entrypoint,
             expected_source,
@@ -74,6 +92,95 @@ class _RunnerProcess:
                 "Runner entrypoint must be a ChannelDriver class",
             )
         self._driver = driver_class()
+        if identity is None:
+            if callable(
+                getattr(self._driver, "create_lifecycle_spec", None),
+            ):
+                raise _fail(
+                    "LAUNCH_IDENTITY_REQUIRED",
+                    "ChannelDriver requires a launch identity",
+                )
+            return
+        required = (
+            "bind",
+            "create_lifecycle_spec",
+            "attach_lifecycle",
+        )
+        if any(
+            not callable(getattr(self._driver, name, None))
+            for name in required
+        ):
+            raise _fail(
+                "ENTRYPOINT_INVALID",
+                "Runner entrypoint does not implement ChannelDriver",
+            )
+        peer = self._rpc_peer_class(self._transport)
+        self._driver.bind(peer, identity)
+        lifecycle_spec = self._driver.create_lifecycle_spec(
+            identity,
+            secret_handle_consumer=None,
+        )
+        controller = self._protocol_host.create_lifecycle_controller(
+            lifecycle_spec,
+        )
+        controller.register_rpc_methods(peer)
+        self._driver.attach_lifecycle(controller)
+        await peer.start()
+        try:
+            await self._protocol_host.exchange_hello(
+                peer,
+                controller,
+                identity,
+                hello=hello,
+            )
+            await peer.wait_closed()
+        finally:
+            stop = getattr(self._driver, "stop", None)
+            if callable(stop):
+                result = self._driver.stop()
+                if hasattr(result, "__await__"):
+                    await result
+            await peer.aclose()
+
+
+class _ThreadPipeReader:
+    """Feed a StreamReader from a blocking Windows stdin pipe."""
+
+    def __init__(
+        self,
+        handle: Any,
+        loop: asyncio.AbstractEventLoop,
+    ) -> None:
+        self.reader = asyncio.StreamReader()
+        self._handle = handle
+        self._loop = loop
+        self._thread = threading.Thread(
+            target=self._run,
+            name="qwenpaw-protocol-reader",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def _deliver(self, data: bytes) -> None:
+        """Deliver one blocking read result on the asyncio loop."""
+        if data:
+            self.reader.feed_data(data)
+        else:
+            self.reader.feed_eof()
+
+    def _run(self) -> None:
+        """Read stdin until EOF without blocking the asyncio loop."""
+        read = getattr(self._handle, "read1", None)
+        if read is None:
+            read = self._handle.read
+        while True:
+            try:
+                data = read(64 * 1024)
+                self._loop.call_soon_threadsafe(self._deliver, data)
+            except (OSError, RuntimeError, ValueError):
+                return
+            if not data:
+                return
 
 
 class _WindowsThreadHandle:
@@ -370,22 +477,47 @@ def _absolute_existing_directory(value: str, name: str) -> Path:
     return resolved
 
 
-def _parse_arguments(argv: list[str]) -> tuple[Path, Path]:
+def _parse_arguments(argv: list[str]) -> tuple[Path, Path, Path | None]:
     """Parse the closed v1 command-line surface."""
-    if len(argv) != 5 or argv[1] != "--code-root":
+    if len(argv) not in {5, 7} or argv[1] != "--code-root":
         raise _fail(
             "INVALID_BOOTSTRAP_ARGUMENT",
-            "Expected --code-root <path> --manifest <path>",
+            "Expected code root, manifest, and optional launch identity",
         )
     if argv[2] == "" or argv[3] != "--manifest" or argv[4] == "":
         raise _fail(
             "INVALID_BOOTSTRAP_ARGUMENT",
-            "Expected --code-root <path> --manifest <path>",
+            "Expected code root, manifest, and optional launch identity",
+        )
+    identity_path: Path | None = None
+    if len(argv) == 7:
+        if argv[5] != "--launch-identity" or argv[6] == "":
+            raise _fail(
+                "INVALID_BOOTSTRAP_ARGUMENT",
+                "Expected --launch-identity <path>",
+            )
+        identity_path = _absolute_existing_file(
+            argv[6],
+            "launch_identity_path",
         )
     return (
         _absolute_existing_directory(argv[2], "code_root"),
         _absolute_existing_file(argv[4], "manifest_path"),
+        identity_path,
     )
+
+
+def _read_launch_identity(path: Path | None) -> object | None:
+    """Read non-source launch identity before importing Channel code."""
+    if path is None:
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise _fail(
+            "LAUNCH_IDENTITY_INVALID",
+            "Launch identity is not valid JSON",
+        ) from exc
 
 
 def _read_manifest(path: Path) -> dict[str, Any]:
@@ -398,7 +530,7 @@ def _read_manifest(path: Path) -> dict[str, Any]:
         raise _fail("MANIFEST_INVALID", "Manifest fields do not match v1")
     if data["schema_version"] != 1:
         raise _fail("MANIFEST_INVALID", "Manifest schema_version must be 1")
-    for field in ("code_root_sha256", "descriptor_sha256"):
+    for field in ("source_revision", "descriptor_sha256"):
         value = data[field]
         if (
             not isinstance(value, str)
@@ -465,8 +597,11 @@ def _validate_manifest(code_root: Path, data: dict[str, Any]) -> Path:
         actual = _hash_code_root(code_root)
     except OSError as exc:
         raise _fail("CODE_ROOT_INVALID", "Unable to hash code_root") from exc
-    if actual != data["code_root_sha256"]:
-        raise _fail("CODE_ROOT_MISMATCH", "code_root digest does not match")
+    if actual != data["source_revision"]:
+        raise _fail(
+            "SOURCE_REVISION_MISMATCH",
+            "code_root digest does not match source_revision",
+        )
     try:
         descriptor_path = Path(data["descriptor_path"]).resolve(
             strict=True,
@@ -505,35 +640,74 @@ def _remove_ambient_import_environment() -> None:
             os.environ.pop(name, None)
 
 
-def _add_code_root(code_root: Path) -> None:
-    """Select the validated source root and bypass the Core package init."""
-    protocol_root = code_root / "qwenpaw" / "channel_protocol"
+def _runner_support_root() -> Path:
+    """Resolve the trusted support root containing this bootstrap and SDK."""
+    bootstrap_path = Path(__file__).resolve()
+    try:
+        support_root = bootstrap_path.parents[2]
+    except IndexError as exc:
+        raise _fail(
+            "PROTOCOL_SDK_INVALID",
+            "Runner support artifact layout is invalid",
+        ) from exc
+    protocol_root = support_root / "qwenpaw" / "channel_protocol"
     if not (
-        (protocol_root / "descriptor.py").is_file()
+        bootstrap_path.parent == protocol_root
+        and (protocol_root / "descriptor.py").is_file()
         and (protocol_root / "framing.py").is_file()
+        and (protocol_root / "errors.py").is_file()
+        and (protocol_root / "runner_host.py").is_file()
     ):
         raise _fail(
             "PROTOCOL_SDK_INVALID",
-            "code_root does not contain the Channel Protocol SDK",
+            "Runner support artifact does not contain the Protocol SDK",
         )
+    return support_root
+
+
+def _reject_protocol_sdk_shadow(code_root: Path) -> None:
+    """Reject a Channel artifact that can shadow the trusted Protocol SDK."""
+    candidates = (
+        code_root / "qwenpaw" / "channel_protocol",
+        code_root / "qwenpaw" / "channel_protocol.py",
+    )
+    if any(path.exists() or path.is_symlink() for path in candidates):
+        raise _fail(
+            "PROTOCOL_SDK_SHADOWED",
+            "Channel code_root must not provide the Protocol SDK",
+        )
+
+
+def _configure_import_roots(code_root: Path) -> Path:
+    """Load protocol code from support and Channel code from code_root."""
+    support_root = _runner_support_root()
+    _reject_protocol_sdk_shadow(code_root)
     selected = str(code_root)
-    bootstrap_root = Path(__file__).resolve().parent.parent.parent
+    support = str(support_root)
     sys.dont_write_bytecode = True
-    sys.path[:] = [selected] + [
+    sys.path[:] = [selected, support] + [
         item
         for item in sys.path
         if item
         and Path(item).resolve() != code_root
-        and Path(item).resolve() != bootstrap_root
+        and Path(item).resolve() != support_root
     ]
     package = types.ModuleType("qwenpaw")
     package.__package__ = "qwenpaw"
-    package.__path__ = [str(code_root / "qwenpaw")]
+    package_paths: list[str] = []
+    channel_namespace = code_root / "qwenpaw"
+    if channel_namespace.is_dir():
+        package_paths.append(str(channel_namespace))
+    package_paths.append(str(support_root / "qwenpaw"))
+    package.__path__ = package_paths
     sys.modules["qwenpaw"] = package
+    return support_root
 
 
-def _load_protocol_sdk() -> tuple[Any, Any, type[BaseException]]:
-    """Load the validated descriptor and framing implementations."""
+def _load_protocol_sdk(
+    support_root: Path,
+) -> tuple[Any, Any, type[BaseException], Any, Any, Any]:
+    """Load descriptor and framing only from the trusted support root."""
     try:
         descriptor_module = importlib.import_module(
             "qwenpaw.channel_protocol.descriptor",
@@ -544,16 +718,56 @@ def _load_protocol_sdk() -> tuple[Any, Any, type[BaseException]]:
         errors_module = importlib.import_module(
             "qwenpaw.channel_protocol.errors",
         )
+        runner_host_module = importlib.import_module(
+            "qwenpaw.channel_protocol.runner_host",
+        )
+        rpc_module = importlib.import_module(
+            "qwenpaw.channel_protocol.rpc",
+        )
     except ImportError as exc:
         raise _fail(
             "PROTOCOL_SDK_IMPORT_FAILED",
             "Unable to import the Channel Protocol SDK",
         ) from exc
+    expected_root = support_root / "qwenpaw" / "channel_protocol"
+    for module in (
+        descriptor_module,
+        framing_module,
+        errors_module,
+        runner_host_module,
+        rpc_module,
+    ):
+        module_file = getattr(module, "__file__", None)
+        if module_file is None or not Path(
+            module_file,
+        ).resolve().is_relative_to(
+            expected_root,
+        ):
+            raise _fail(
+                "PROTOCOL_SDK_INVALID",
+                "Protocol SDK was not loaded from Runner support",
+            )
     return (
         descriptor_module.ChannelDescriptor,
         framing_module.FramedTransport,
         errors_module.DescriptorValidationError,
+        runner_host_module.RunnerLaunchIdentity,
+        runner_host_module.RunnerProtocolHost,
+        rpc_module.RpcPeer,
     )
+
+
+def _parse_launch_identity(value: object | None, identity_class: Any) -> Any:
+    """Validate the closed non-source launch identity with trusted SDK."""
+    if value is None:
+        return None
+    try:
+        return identity_class.from_mapping(value)
+    except Exception as exc:
+        raise _fail(
+            "LAUNCH_IDENTITY_INVALID",
+            "Launch identity failed v1 validation",
+        ) from exc
 
 
 def _load_descriptor(
@@ -583,6 +797,28 @@ def _load_descriptor(
             "Descriptor does not declare a Runner ChannelDriver",
         )
     return descriptor
+
+
+def _bind_launch_identity_to_descriptor(
+    identity: Any | None,
+    descriptor: Any,
+) -> Any | None:
+    """Bind descriptor-owned launch claims before Channel import."""
+    if identity is None:
+        return None
+    if (
+        identity.channel_key != descriptor.channel_key
+        or identity.capabilities != descriptor.capabilities
+    ):
+        raise _fail(
+            "LAUNCH_IDENTITY_MISMATCH",
+            "Launch identity does not match the verified descriptor",
+        )
+    return replace(
+        identity,
+        channel_key=descriptor.channel_key,
+        capabilities=descriptor.capabilities,
+    )
 
 
 def _entrypoint_source(code_root: Path, entrypoint: Any) -> Path:
@@ -675,17 +911,29 @@ def _load_driver_class(entrypoint: Any, expected_source: Path) -> Any:
 async def _start_runner(
     descriptor: Any,
     expected_source: Path,
+    source_revision: str,
+    identity: Any | None,
     framed_transport_class: Any,
+    protocol_host_class: Any,
+    rpc_peer_class: Any,
     protocol_handle: Any,
 ) -> None:
     """Start one driver with the CH-0-003 protocol transport."""
     transport = await _open_protocol_transport(
         framed_transport_class,
         protocol_handle,
+        input_handle=sys.stdin.buffer if identity is not None else None,
     )
-    runner = _RunnerProcess(descriptor, transport)
+    runner = _RunnerProcess(
+        descriptor,
+        transport,
+        source_revision,
+        identity,
+        protocol_host_class,
+        rpc_peer_class,
+    )
     try:
-        runner.start(expected_source)
+        await runner.start(expected_source)
     finally:
         await transport.aclose()
 
@@ -694,9 +942,28 @@ async def _open_protocol_transport(
     framed_transport_class: Any,
     protocol_handle: Any,
     *,
+    input_handle: Any | None = None,
     limits: Any | None = None,
 ) -> Any:
     """Connect the private pipe directly to CH-0-003 framing."""
+    reader = asyncio.StreamReader()
+    if input_handle is not None:
+        loop = asyncio.get_running_loop()
+        if os.name == "nt":
+            reader = _ThreadPipeReader(input_handle, loop).reader
+        else:
+            read_protocol = asyncio.StreamReaderProtocol(reader)
+            try:
+                await loop.connect_read_pipe(
+                    lambda: read_protocol,
+                    input_handle,
+                )
+            except (OSError, ValueError) as exc:
+                protocol_handle.close()
+                raise _fail(
+                    "PROTOCOL_HANDLE_INVALID",
+                    "Unable to connect protocol stdin",
+                ) from exc
     if os.name == "nt":
         try:
             writer: Any = _ThreadPipeWriter(protocol_handle)
@@ -730,7 +997,7 @@ async def _open_protocol_transport(
             loop,
         )
     return framed_transport_class(
-        asyncio.StreamReader(),
+        reader,
         writer,
         limits=limits,
     )
@@ -751,22 +1018,31 @@ def main(argv: list[str] | None = None) -> int:
     arguments = list(sys.argv if argv is None else argv)
     try:
         _require_isolated_python()
-        code_root, manifest_path = _parse_arguments(arguments)
+        code_root, manifest_path, identity_path = _parse_arguments(arguments)
         manifest = _read_manifest(manifest_path)
+        launch_identity = _read_launch_identity(identity_path)
         descriptor_path = _validate_manifest(code_root, manifest)
         _remove_ambient_import_environment()
-        _add_code_root(code_root)
+        support_root = _configure_import_roots(code_root)
         (
             descriptor_class,
             framed_transport_class,
             validation_error,
-        ) = _load_protocol_sdk()
+            identity_class,
+            protocol_host_class,
+            rpc_peer_class,
+        ) = _load_protocol_sdk(support_root)
+        identity = _parse_launch_identity(
+            launch_identity,
+            identity_class,
+        )
         descriptor = _load_descriptor(
             descriptor_path,
             manifest,
             descriptor_class,
             validation_error,
         )
+        identity = _bind_launch_identity_to_descriptor(identity, descriptor)
         entrypoint_source = _entrypoint_source(
             code_root,
             descriptor.entrypoint,
@@ -778,7 +1054,11 @@ def main(argv: list[str] | None = None) -> int:
             _start_runner(
                 descriptor,
                 entrypoint_source,
+                manifest["source_revision"],
+                identity,
                 framed_transport_class,
+                protocol_host_class,
+                rpc_peer_class,
                 protocol_handle,
             ),
         )

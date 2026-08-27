@@ -207,6 +207,7 @@ async def test_generation_fencing_expiry_and_quiesce() -> None:
     [
         ("protocol_version", 2, "PROTOCOL_MISMATCH"),
         ("qwenpaw_version", "0.2", "QWENPAW_VERSION_MISMATCH"),
+        ("source_revision", "5" * 64, "SOURCE_REVISION_MISMATCH"),
         (
             "environment_spec_id",
             "ches1_" + "2" * 64,

@@ -9,8 +9,8 @@ from dataclasses import dataclass
 import ipaddress
 import json
 from pathlib import Path
+from runpy import run_path
 import socket
-import sys
 from typing import Any
 
 import aiohttp
@@ -34,8 +34,14 @@ from qwenpaw.channel_protocol import (
     RetryPolicy,
     RpcError,
     RpcPeer,
+    RunnerProtocolHost,
     SendParams,
 )
+
+
+build_runner_artifact = run_path(
+    str(Path(__file__).parents[1] / "runner_artifact.py"),
+)["build_runner_artifact"]
 
 
 PROCESS_FIXTURE = Path(__file__).with_name("runner.py")
@@ -47,6 +53,7 @@ class FixtureIdentity:
 
     channel_key: str = "onebot"
     instance_id: str = "chinst1_fixture-onebot"
+    source_revision: str = "4" * 64
     environment_spec_id: str = "ches1_fixture-onebot"
     environment_id: str = "chenv1_fixture-onebot"
     generation: int = 1
@@ -189,23 +196,14 @@ async def _session(
         },
         driver.consume_secret,
     )
-    controller = driver.create_lifecycle_controller(
+    protocol_host = RunnerProtocolHost(identity.source_revision)
+    lifecycle_spec = driver.create_lifecycle_spec(
         identity,
         secret_handle_consumer=consumer,
     )
+    controller = protocol_host.create_lifecycle_controller(lifecycle_spec)
     driver.attach_lifecycle(controller)
-    hello = HelloParams(
-        protocol_version=1,
-        qwenpaw_version=identity.qwenpaw_version,
-        channel_key=identity.channel_key,
-        instance_id=identity.instance_id,
-        environment_spec_id=identity.environment_spec_id,
-        environment_id=identity.environment_id,
-        lock_sha256=identity.lock_sha256,
-        python_abi=identity.python_abi,
-        platform_tag=identity.platform_tag,
-        capabilities=identity.capabilities,
-    )
+    hello = protocol_host.create_hello(identity)
     controller.accept_hello(hello)
     await controller.prepare(
         PrepareParams(
@@ -1051,8 +1049,9 @@ async def test_shutdown_is_bounded_concurrent_and_cancellation_safe() -> None:
 class ProcessHost:
     """Core-side RPC handlers for the subprocess Runner proof."""
 
-    def __init__(self, peer: RpcPeer) -> None:
+    def __init__(self, peer: RpcPeer, source_revision: str) -> None:
         self.hello = asyncio.Event()
+        self.source_revision = source_revision
         self.endpoint_ready = asyncio.Event()
         self.event_received = asyncio.Event()
         self.endpoint: EndpointParams | None = None
@@ -1077,6 +1076,7 @@ class ProcessHost:
         params: HelloParams,
         _: object,
     ) -> dict[str, Any]:
+        assert params.source_revision == self.source_revision
         self.hello.set()
         return {
             "protocol_version": 1,
@@ -1139,14 +1139,25 @@ def _identity_mapping(identity: FixtureIdentity) -> dict[str, Any]:
 
 
 @pytest.mark.asyncio
-async def test_subprocess_separates_stdio_from_platform_ingress() -> None:
+async def test_subprocess_separates_stdio_from_platform_ingress(
+    tmp_path: Path,
+) -> None:
     """External WebSocket traffic never traverses the framed stdio pipe."""
-    identity = FixtureIdentity(instance_id="chinst1_process-onebot")
+    prototype = FixtureIdentity(instance_id="chinst1_artifact-onebot")
+    artifact = build_runner_artifact(
+        tmp_path,
+        channel_key="onebot",
+        runner_source=PROCESS_FIXTURE,
+        entrypoint="FixtureOneBotDriver",
+        capabilities=prototype.capabilities,
+        ingress_owner="runner_owned",
+    )
+    identity = FixtureIdentity(
+        instance_id="chinst1_process-onebot",
+        source_revision=artifact.source_revision,
+    )
     process = await asyncio.create_subprocess_exec(
-        sys.executable,
-        "-I",
-        str(PROCESS_FIXTURE),
-        json.dumps(_identity_mapping(identity), separators=(",", ":")),
+        *artifact.command(_identity_mapping(identity)),
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
@@ -1154,7 +1165,7 @@ async def test_subprocess_separates_stdio_from_platform_ingress() -> None:
     assert process.stdin is not None
     assert process.stdout is not None
     core = RpcPeer(FramedTransport(process.stdout, process.stdin))
-    host = ProcessHost(core)
+    host = ProcessHost(core, artifact.source_revision)
     await core.start()
     websocket: aiohttp.ClientWebSocketResponse | None = None
     try:
