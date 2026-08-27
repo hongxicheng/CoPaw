@@ -326,8 +326,7 @@ descriptor validator 和聚焦单测机械验证；ADR-035/036 已确认。独�
 
 ### CH-0-004：JSON-RPC 2.0、Schema 和生命周期
 
-- 状态：[~] 原独立 Review 已通过；新协议审查缺口及本轮 cancel/close P1 已修复
-  并通过本地验证，待重新独立 Review 和跨平台增量复验
+- 状态：[x] 新协议审查缺口及 cancel/close P1 已修复，独立 Review 通过
 
 本轮只处理以下新审查问题，不重新打开已通过的 response lifecycle、generation authority
 或平台原型设计：
@@ -349,22 +348,22 @@ descriptor validator 和聚焦单测机械验证；ADR-035/036 已确认。独�
   `environment_id`、`lock_sha256`、Python ABI 和 platform tag；这些字段不是诊断性自报。
   `source_revision` 的 DTO/预期值接入仍由 `CH-0-010` 实现，正式 manifest/实际解释器取值
   接线仍属于 Phase 1/2。
-- [~] 添加并发洪峰、重复 ID/cancel/owner cleanup、notification shutdown、完全版本匹配、
+- [x] 添加并发洪峰、重复 ID/cancel/owner cleanup、notification shutdown、完全版本匹配、
   hello 各字段 mismatch 和 JSON-RPC conformance 测试；运行 CH-0-004 聚焦矩阵、完整
-  `tests/unit/channel_isolation`、目标文件 pre-commit 和 `git diff --check`；本地验证已
-  完成，独立 Review 待执行。
+  `tests/unit/channel_isolation`、目标文件 pre-commit 和 `git diff --check`；本地验证和
+  独立 Review 已完成。
 - [x] 迟到 `request.cancel` 只定位接收端当前 incoming owner；owner 已清理则
   幂等忽略，不得误取消反向同号 pending request。
 - [x] `RpcPeer.aclose()` 在禁止新准入后由唯一共享 close task 回收 reader、
   request、notification 和 transport；等待者取消不中断清理，重试等待同一结果。
-- [~] 迟到 cancel 反向同号和 transport close/task reap 阶段取消回归测试已补齐；
-  本地验证已通过，重新独立 Review 待执行。
+- [x] 迟到 cancel 反向同号和 transport close/task reap 阶段取消回归测试已补齐；
+  本地验证和重新独立 Review 已通过。
 
 本轮当前验证证据：CH-0-004 聚焦矩阵 `169 passed`；完整
 `tests/unit/channel_isolation` 为 `370 passed`；本地 G0 同范围矩阵为
 `891 passed, 1 skipped`。目标文件 pre-commit 和 `git diff --check` 通过。
-该证据尚未经独立 Review 或 Linux、macOS、Windows 跨平台增量复验，
-CH-0-004 和 G0 继续保持 `[~]`。
+独立 Review 已通过（用户确认），实现提交为 `707dd8cd`。Linux、macOS、Windows
+跨平台增量矩阵尚未执行；CH-0-004 状态为 `[x]`，G0 继续保持 `[~]`。
 
 - [x] 用唯一 Runner route/cleanup aggregate 替换 lifecycle response scope、Driver route
   tombstone 和 Host State 散落状态；本项与 CH-0-007 飞书基础设施做一次垂直迁移。
@@ -403,7 +402,7 @@ CH-0-004 和 G0 继续保持 `[~]`。
 unit/contract 相邻矩阵为 `185 passed, 1 skipped`。目标文件 pre-commit 和
 `git diff --check` 已通过；独立 Review 已通过（用户确认）。真实 Core per-handle
 sequencer 仍由 CH-2-005 实现和验证，不属于当时修复范围；该段只记录历史 `[x]` 证据，
-当前状态以本节开头的 `[~]` 和新审查 checklist 为准。
+当前状态以本节开头的 `[x]` 和新审查 checklist 为准。
 
 - [x] 实现 JSON-RPC 2.0 request、response、notification、error 和 cancel。
 - [x] 实现 pending request 上限、request timeout、未知方法和重复 response 处理。
@@ -589,8 +588,9 @@ CH-0-007 与飞书 unit/contract 相邻矩阵为 `185 passed, 1 skipped`。改�
 （包含 mypy、black、flake8 和 pylint）通过，`git diff --check` 通过。未运行全仓测试和
 真实 Windows/Linux/macOS 跨进程测试。独立 Review 已通过（用户确认）；最终修复提交为
 `d790fe82`。该结论随后因 response lifecycle 的重复 Runner 状态源被重新打开；当前重构已
-收敛唯一 Runner aggregate 并通过独立 Review；该结论不覆盖本轮新发现的协议缺口，当前
-状态以本节开头的 `[~]` 为准。真实 Core per-handle sequencer 保持为 CH-2-005 的独立任务。
+收敛唯一 Runner aggregate；后续协议缺口和 cancel/close P1 亦已修复并通过独立
+Review，当前状态以本节开头的 `[x]` 为准。真实 Core per-handle sequencer 保持为
+CH-2-005 的独立任务。
 
 ### CH-0-005：可靠事件、ACK 和幂等原型
 
@@ -869,16 +869,16 @@ environment installer、Console 弹窗或正式 Channel 打包。
 
 ### G0 Gate
 
-- 状态：[~] 原 Gate 已通过；ADR-042 至 ADR-044 的 CH-0-004/CH-0-005 协议修复和
-  ADR-039 至 ADR-041 的 artifact 增量待独立复验，暂不允许进入 Phase 1
+- 状态：[~] 原 Gate 已通过；CH-0-004 跨平台增量矩阵、CH-0-005 协议修复和
+  ADR-039 至 ADR-041 的 artifact 增量待复验，暂不允许进入 Phase 1
 
 - [~] 职责、descriptor、stdio framing、JSON-RPC、可靠投递、媒体和 Runner-owned Voice
   ingress 边界冻结；如需 Core-owned 兼容入口，必须有独立 ADR。
 - [x] CH-0-002 的 canonical encoder、ID/目录键模型和 descriptor v1 validator 已通过聚焦
   单测与独立 Review；目标平台运行同一固定 hash 向量得到一致结果。
 - [x] 飞书、OneBot、Voice/Twilio 三条纵向原型分别通过。
-- [ ] CH-0-004 的精确协议版本、RPC 入站准入/重复 ID、hello 环境证明和 JSON-RPC
-  conformance 已通过独立 Review 及 Linux、macOS、Windows 测试。
+- [~] CH-0-004 的精确协议版本、RPC 入站准入/重复 ID、hello 环境证明和 JSON-RPC
+  conformance 已通过独立 Review；Linux、macOS、Windows 增量矩阵待执行。
 - [ ] CH-0-005 的不可变 Delivery 状态转换已通过独立 Review 及 Linux、macOS、Windows
   测试。
 - [ ] CH-0-010 的 hello source identity、Runner support artifact/Channel `code_root` 分离
