@@ -24,7 +24,10 @@
 
 | 概念 | 含义 |
 | --- | --- |
-| Channel descriptor | 一个 Channel 的**静态元数据记录**：它是什么、怎么启动、需要哪些依赖、支持哪些能力。读取 descriptor 不导入平台 SDK、不安装依赖、不启动进程。它是 Catalog、lock 生成、installer、Registry、CLI/API/Console 的唯一事实来源 |
+| Channel descriptor | 一个 Channel 的**静态执行契约**：它是什么、怎么启动、需要哪些依赖、支持哪些能力。读取 descriptor 不导入平台 SDK、不安装依赖、不启动进程。它是运行能力、配置投影、lock 生成和 Registry 的事实来源；下载地址、发布版本和制品摘要由 Channel artifact record 负责 |
+| Channel artifact | 独立于 QwenPaw 主安装包和 dependency environment 的不可变 Channel 发行制品，包含 descriptor、完整配置 schema、release lock manifest、`ChannelDriver` 和平台代码，但不包含第三方 wheel 或 venv。官方与 isolated Plugin 可以复用同一安装边界，但保持不同的 `source_kind` 和信任来源 |
+| Channel artifact record | Catalog 提供的发行记录，至少绑定 `channel_key`、发行版本、QwenPaw/Protocol 兼容范围、下载地址和下载制品 SHA-256。它不是 descriptor，安装后由本地 artifact manifest 保存来源和完整性证据 |
+| Runner support artifact | 随 QwenPaw 发布的可信启动制品，包含 bootstrap 和 Protocol SDK；它不包含 Channel 业务代码，也不安装进 dependency environment |
 | Runner | 运行被隔离 Channel 的独立子进程。第三方平台 SDK 只在 Runner 中导入 |
 | `ChannelDriver` | Runner 内的平台接入接口。内置 Channel 和 Plugin 提供的 Channel 都可以实现它 |
 | `IsolatedChannelProxy` | Core 内代表一个 `runner_process` Channel 的对象，向 `ChannelManager` 提供与 `BaseChannel` 兼容的调用面 |
@@ -32,10 +35,11 @@
 | generation | 一个 instance 的单调递增世代号。切换时用于 fencing 旧进程 |
 | lease | Core 授予 Runner 的、带 TTL 的消费许可。只有 committed active lease 可以消费正式平台事件 |
 
-descriptor 之所以是本设计的中心，是因为当前 Channel 的“存在性”和“属性”分散在多张
+descriptor 之所以是执行契约的中心，是因为当前 Channel 的运行属性分散在多张
 per-channel 硬编码表中（见 §11.1），且部分信息只能通过 import 平台模块才能得到。
-隔离要求在不 import 平台 SDK、不启动进程的前提下就能枚举和校验 Channel，因此必须
-先把这些事实收敛到静态 descriptor。
+隔离要求在不 import 平台 SDK、不启动进程的前提下就能校验已安装 Channel，因此必须
+先把这些运行事实收敛到静态 descriptor；未安装官方 Channel 的可发现性和下载 metadata
+则由 artifact record 提供。
 
 ### 1.2 全局交付检查清单
 
@@ -47,7 +51,8 @@ per-channel 硬编码表中（见 §11.1），且部分信息只能通过 import
 - [ ] 冻结 Runner-owned Voice ingress 目标、endpoint 注册、顺序、背压和
   generation fencing，并记录 Core-owned ingress 的受控备选边界
 - [ ] 冻结环境 lock、ABI、平台和 manifest 校验规则
-- [ ] 冻结源码与 dependency environment 的分离规则
+- [ ] 冻结 QwenPaw、Channel artifact 与 dependency environment 的三层分离规则
+- [ ] 冻结 Channel artifact record、安装完整性和 Python 依赖下载源规则
 - [ ] 冻结 Channel 来源、进程位置及其对应的驱动接口规则
 - [ ] 冻结扫码/设备码登录保留在 Core 的例外边界及其依赖约束
 - [ ] 冻结 bot 身份查重的 descriptor 字段和 config 级比较规则
@@ -72,8 +77,10 @@ per-channel 硬编码表中（见 §11.1），且部分信息只能通过 import
    导入。
 3. Runner 的 dependency environment 只包含 Python 和第三方依赖，不安装 Channel
    源码、Core 源码或 Protocol SDK 的副本。
-4. Channel 源码随当前 QwenPaw 发布。源码改变但依赖 lock、Python ABI、平台和
-   condition set 不变时复用同一个 environment。
+4. `runner_process` 的官方 Channel 代码作为独立、可校验的 Channel artifact 下载和
+   安装，不随 QwenPaw 主安装包发布。QwenPaw 只提供 Core、bootstrap 和 Protocol SDK；
+   Channel 代码改变但依赖 lock、Python ABI、平台和 condition set 不变时复用同一个
+   environment。
 5. Core 与 Runner 使用进程绑定的 stdio IPC，不依赖本地端口。
 6. 入站事件具备至少一次投递、持久化 ACK 和幂等去重语义。
 7. 依赖不满足时禁止启动对应 Channel；安装、repair 和 doctor 严格验证，启动只做
@@ -163,7 +170,7 @@ Channel 来源和进程位置是两个正交分类维度，descriptor 必须分�
 
 | 分类 | 字段 | 允许值 | 含义 |
 | --- | --- | --- | --- |
-| 来源 | `source_kind` | `builtin`、`plugin` | Channel 由 QwenPaw 内置还是由 Plugin 提供 |
+| 来源 | `source_kind` | `builtin`、`plugin` | Channel 由 QwenPaw 官方维护还是由 Plugin 提供；不表达代码是否随主安装包分发 |
 | 进程位置 | `process_mode` | `in_process`、`runner_process` | Channel 在 Core 进程还是独立 Runner 进程执行 |
 
 当前组合固定为：
@@ -180,6 +187,10 @@ Channel 来源和进程位置是两个正交分类维度，descriptor 必须分�
 Channel 和 Plugin 提供的 Channel 都可以实现它。驱动接口不作为第三个 descriptor
 字段：`in_process` 固定解析为 `BaseChannel`，`runner_process` 固定解析为
 `IsolatedChannelProxy` + `ChannelDriver`，避免重复事实来源。
+
+`source_kind=builtin` 表达官方所有权、官方 Catalog 和兼容支持，不等价于源码物理内置
+在 QwenPaw Python 包中。隔离后的官方 Channel 仍为 `builtin`，但其业务代码通过独立
+Channel artifact 安装。Console 等 `in_process` Core Channel 才继续随 QwenPaw 发布。
 
 两个字段都必须明确声明或由 legacy 注册信息确定性合成，不得根据 import 是否成功、
 安装形态或启动探测动态推断。
@@ -345,11 +356,13 @@ Core 通过受控的 `RunnerSpec` 启动子进程：
 ```text
 RunnerSpec
   executable
+  bootstrap_path
   args
   cwd
   minimal_env
   code_root
   manifest_path
+  source_revision
   instance_id
 ```
 
@@ -358,15 +371,18 @@ RunnerSpec
 
 启动顺序：
 
-1. Channel Catalog 解析 descriptor 和 effective config。
-2. ChannelEnvManager 选择完全匹配的 lock 和 environment。
-3. ChannelProcessManager 创建子进程并将 stdin、stdout、stderr 设为 pipe。
-4. Runner bootstrap 在导入任何 Channel 或 SDK 前校验 `python -I`、代码根和 manifest。
-5. bootstrap 分离协议 stdout 与日志输出。
-6. Runner 发送 `runner.hello`，Core 校验身份和 environment；secret value 不出现在
-   hello 或其他协议 payload 中。
-7. Core 调用 `channel.prepare`，Runner 执行 import 和驱动初始化探测。
-8. Core 通过 `channel.activate` 授予 candidate provisional lease；只有 current pointer
+1. Channel Catalog 解析 artifact record、descriptor 和 effective config。
+2. ChannelArtifactManager 选择或安装精确的 Channel artifact，验证下载制品、
+   `code_root`、descriptor 和兼容范围，并得到不可变 `source_revision`。
+3. ChannelEnvManager 选择完全匹配的 lock 和 environment。
+4. ChannelProcessManager 创建子进程并将 stdin、stdout、stderr 设为 pipe。
+5. Runner bootstrap 在导入任何 Channel 或平台 SDK 前校验 `python -I`、代码根和 manifest。
+6. bootstrap 从 QwenPaw 提供的 Runner support artifact 加载 Protocol SDK，并分离协议
+   stdout 与日志输出；Channel `code_root` 不能提供或覆盖 Protocol SDK。
+7. Runner 发送 `runner.hello`，Core 校验身份、`source_revision` 和 environment；secret
+   value 不出现在 hello 或其他协议 payload 中。
+8. Core 调用 `channel.prepare`，Runner 执行 import 和驱动初始化探测。
+9. Core 通过 `channel.activate` 授予 candidate provisional lease；只有 current pointer
    CAS 成功且 `channel.commit` 确认后，Runner 才允许平台连接正式消费。
 
 ### 6.2 stdout、stderr 和 FD 约束
@@ -403,51 +419,67 @@ Core reads  <── Runner stderr log pipe
 
 ### 6.4 源码组织与 Runner 加载
 
-官方源码、Runner bootstrap 和 Protocol SDK 随当前 QwenPaw 发布。dependency
-environment 只提供 Python 和第三方 distribution，不安装 Channel 源码、Core 源码
-或完整 QwenPaw。推荐的代码边界如下：
+QwenPaw 主安装包只发布 Core、Runner bootstrap 和 Protocol SDK，不发布
+`runner_process` 官方 Channel 的业务代码。官方 Channel 和 isolated Plugin 的业务代码
+均作为独立 Channel artifact 安装；dependency environment 只提供 Python 和 lock 指定的
+第三方 distribution，不安装 Channel 源码、Core 源码、Protocol SDK 或完整 QwenPaw。
+推荐的边界如下：
 
 ```text
-src/qwenpaw/
-  channel_protocol/
-    models.py
-    errors.py
-    framing.py
-    rpc.py
-    runner_bootstrap.py
-  app/channels/
-    base.py
-    proxy.py
-    catalog.py
-    env_manager.py
-    process_manager.py
-    runners/
-      <channel>_runner.py
-    <channel>/
-      channel.py
-      handler.py
-      sender.py
-      media.py
+QwenPaw installation
+  src/qwenpaw/
+    channel_protocol/
+      models.py
+      errors.py
+      framing.py
+      rpc.py
+      runner_bootstrap.py
+    app/channels/
+      base.py
+      proxy.py
+      catalog.py
+      artifact_manager.py
+      env_manager.py
+      process_manager.py
+
+Channel artifact code_root
+  channel.json
+  config.schema.json
+  release-manifest.json
+  locks/...
+  <channel-package>/
+    driver.py
+    handler.py
+    sender.py
+    media.py
+
+dependency environment
+  Python + locked third-party distributions
 ```
 
-isolated Runner 的业务源码从当前安装包或受信任的 plugin artifact 加载，放在显式
-`code_root`；environment 内不复制源码。发布安装中的 `code_root` 应只读；source/
-editable 开发安装允许指向显式仓库根，但不能从 ambient cwd 或 `PYTHONPATH` 推断。
-`RunnerSpec` 显式传入经过校验的
-`executable`、`args`、`cwd`、`code_root` 和 `manifest_path`。bootstrap 必须在导入
-任何平台 SDK 前：
+`code_root` 只表示已选择的 Channel artifact 内容根，不再同时表示 QwenPaw 或 Protocol
+SDK 根。发布安装中的 `code_root` 必须只读；明确的 source/editable Channel 开发模式允许
+指向显式仓库根，但不能从 ambient cwd 或 `PYTHONPATH` 推断，并且每次内容变化都必须产生
+新的 `source_revision`。`RunnerSpec` 显式传入经过校验的 `executable`、绝对
+`bootstrap_path`、`args`、`cwd`、`code_root`、`manifest_path` 和预期
+`source_revision`。bootstrap 必须在导入任何平台 SDK 前：
 
 1. 使用受支持的 environment Python，以 isolated mode 启动；
-2. 校验 `code_root`、descriptor、manifest 和 entrypoint；
-3. 清除 `PYTHONPATH`、user site 和未声明的环境变量；
-4. 保存协议 stdout 句柄，把普通 `print()`、logging handler 和原生 FD 1 重定向到
+2. 从绝对 `bootstrap_path` 对应的可信 Runner support artifact 加载 Protocol SDK，且
+   不把 Channel `code_root` 用作 Protocol SDK 来源；
+3. 校验 `code_root`、artifact/launch manifest、descriptor、`source_revision` 和
+   entrypoint；
+4. 清除 `PYTHONPATH`、user site 和未声明的环境变量；
+5. 保存协议 stdout 句柄，把普通 `print()`、logging handler 和原生 FD 1 重定向到
    stderr；
-5. 仅加载 descriptor 声明的 `ChannelDriver` entrypoint。
+6. 仅从 Channel `code_root` 加载 descriptor 声明的 `ChannelDriver` entrypoint。
 
 environment Python 以 `-I` 执行绝对路径的受信任 bootstrap artifact（普通安装可为
 脚本/zipapp，frozen desktop 可为应用内等价入口）。bootstrap 自身不依赖 QwenPaw 已
-安装在 dependency environment 中；它校验 `code_root` 和 manifest 后，才把该根加入
-进程内受控 import path。不得用 `PYTHONPATH`、当前目录或 user site 完成 bootstrap。
+安装在 dependency environment 中；Protocol SDK 必须来自该受信任 support artifact，
+Channel `code_root` 只能在完整性校验后加入受控 import path。Channel artifact 声明或携带
+`qwenpaw.channel_protocol` 不能覆盖已加载的 Protocol SDK，必须作为 artifact invalid
+拒绝。不得用 `PYTHONPATH`、当前目录或 user site 完成 bootstrap。
 
 frozen desktop、pip/source/conda 和 container 只改变基础 Python 的来源，不改变
 上述代码加载、environment 隔离和协议语义。
@@ -699,8 +731,14 @@ target、stream type 不一致、sequence 跳跃或结束后更新返回
 identity fencing。
 
 `runner.hello` 必须包含：`protocol_min/max`、`qwenpaw_version`、`channel_key`、
-`instance_id`、`environment_spec_id`、`environment_id`、`lock_sha256`、Python ABI、
-platform tag 和 capability 声明。Core 校验失败时拒绝激活。
+`instance_id`、`source_revision`、`environment_spec_id`、`environment_id`、
+`lock_sha256`、Python ABI、platform tag 和 capability 声明。`source_revision` 是已安装
+Channel `code_root` 的 64 个小写 hex SHA-256，必须等于 RunnerSpec 和本地 artifact
+manifest 中的预期值；它不是下载 URL、发行版本、下载 archive digest 或
+`descriptor_sha256`。该字段由可信 bootstrap/Runner protocol host 从已验证 launch manifest
+构造，`ChannelDriver` 不能传入、覆盖或自行声明。Core 在 hello 阶段校验实际代码和
+environment 身份，任一不匹配都拒绝激活；源码不匹配使用稳定 reason code
+`SOURCE_REVISION_MISMATCH`。
 
 ### 7.4 Envelope、状态机和错误码
 
@@ -802,6 +840,7 @@ provisional lease 不单列为生命周期状态；Runner 在收到 `channel.com
 
 ```text
 PROTOCOL_MISMATCH
+SOURCE_REVISION_MISMATCH
 AUTH_FAILED
 CONFIG_INVALID
 DEPENDENCY_MISSING
@@ -1160,7 +1199,7 @@ generation fencing。若音频处理始终留在 Runner 内部，音频不跨 Co
 
 未来跨主机场景还必须另行设计认证、加密和流控，不能假定本机匿名 pipe 可以直接复用。
 
-## 10. 环境和源码模型
+## 10. Environment 和 Channel artifact 模型
 
 ### 10.1 标识
 
@@ -1332,6 +1371,24 @@ direct URL 和重复项，并证明等价输入得到相同 canonical requiremen
 `repair_required` 或 `incompatible`。新环境构建失败时，如果不存在仍满足当前已提交
 声明的 active generation，则停止对应 Channel；不能启动不符合当前声明的旧版本。
 
+Python 第三方依赖的网络获取只使用显式的“Python 依赖下载源”设置，不与 Channel
+artifact 的官方下载地址混用。设置模型固定为：
+
+- 全局默认源为阿里云 `https://mirrors.aliyun.com/pypi/simple/`；
+- 用户可选择 PyPI `https://pypi.org/simple/`，或输入一个自定义 PEP 503-compatible
+  simple index URL；
+- 每次 install/repair 可以覆盖本次操作使用的源，确认后同时可以保存为新的全局默认；
+- 自定义源的认证信息只保存为 secret-store reference，不能进入 URL、lock、manifest、
+  operation 日志或错误响应；
+- 所选源缺少 lock 指定且 hash 匹配的 wheel 时明确失败并提示用户切换来源，不得静默
+  fallback 到另一个网络源，不得重新解析版本，也不得现场构建 sdist。
+
+下载源只决定从哪里取得 lock 已选定的 wheel，不进入 `environment_spec_id`，也不改变
+lock 或 wheel hash。安装记录必须保存不含凭证的 source kind/base URL 和实际 wheel
+provenance，供 verify/repair 诊断。离线 wheel cache、Desktop 随附 wheel cache 或完整
+官方下载 bundle 都只能作为可选获取优化；核心模型不分发预建 venv，任何来源最终都按
+相同 lock 在本地创建和验证 environment。
+
 ### 10.3 安装形态
 
 | 安装形态 | isolated environment 基础解释器 |
@@ -1341,15 +1398,16 @@ direct URL 和重复项，并证明等价输入得到相同 canonical requiremen
 | container | 镜像内受支持 Python，或按同一 manifest 预构建 |
 | `process_mode=in_process` | 不创建额外 Channel environment |
 
-源码、bootstrap 和 Protocol SDK 从当前 QwenPaw 的显式 `code_root` 加载，不从 ambient
-cwd、`PYTHONPATH` 或 dependency environment 推断。普通/frozen 发布物应只读；明确的
-source/editable 开发安装可以使用仓库根，但其代码变化必须作为新的 source revision
-启动新 generation。
+四种安装形态都使用相同的三层边界：QwenPaw 提供可信 Runner support artifact；官方或
+Plugin Channel artifact 提供只读 `code_root`；dependency environment 提供 Python 和
+第三方 distribution。三层不得相互复制代码，也不得从 ambient cwd、`PYTHONPATH` 或
+dependency environment 推断。明确的 source/editable Channel 开发安装可以使用显式
+仓库根，但其代码变化必须作为新的 `source_revision` 启动新 generation。
 
-isolated Plugin 的业务源码作为独立、可校验的 plugin artifact 分发，放在 dependency
-environment 之外的只读 `code_root`；RunnerSpec 显式传入该根目录，bootstrap 只从
-该目录加载声明的 entrypoint。这样既不会把源码安装进 environment，也不会依赖用户
-工作树或隐式的 `PYTHONPATH`。
+官方 `runner_process` Channel 与 isolated Plugin 都使用独立、可校验的 Channel artifact，
+但来源信任、签名策略和 `source_kind` 保持不同。QwenPaw 升级只更新 Core、bootstrap 和
+Protocol SDK；Channel 代码升级只替换候选 artifact。只要 lock、ABI、平台和 condition set
+不变，二者都复用既有 dependency environment。
 
 ### 10.4 Lock、条件集和目录布局
 
@@ -1367,9 +1425,16 @@ hash。`condition_set` 只允许机器可求值的配置 equality，必须先按
 目录布局：
 
 ```text
+<working-dir>/channel_artifacts/
+  <channel_dir>/
+    releases/<source_dir>/
+      artifact.json
+      code/
+        channel.json
+        <channel-package>/...
+
 <working-dir>/channel_envs/
   <channel_dir>/
-    channel.json
     environments/<environment_spec_dir>/
       environment_spec.json
       <environment_dir>/
@@ -1388,6 +1453,7 @@ hash。`condition_set` 只允许机器可求值的配置 equality，必须先按
 
 ```text
 channel_dir = dir_key(channel_key)
+source_dir = dir_key(source_revision)
 environment_spec_dir = dir_key(environment_spec_id)
 environment_dir = dir_key(environment_id)
 instance_dir = dir_key(instance_id)
@@ -1395,15 +1461,19 @@ instance_dir = dir_key(instance_id)
 
 其中 `dir_key(logical_id)` 是 `dir1_` 加 logical ID UTF-8 bytes 的 SHA-256 前 32 个小写
 hex。任何目录布局不得直接使用 `channel_key`、`agent_id` 或完整逻辑 ID 作为路径片段。
-`channel.json` 保存完整 `channel_key`，`environment_spec.json` 保存完整
-`environment_spec_id`，`install.json` 保存完整 `environment_id` 和其 spec ID，
-`instance.json` 保存完整 `instance_id`、`agent_id` 和 `channel_key`；pointer 也必须保存其
-引用的完整逻辑 ID。创建或读取每一级目录时都要核对对应 manifest，短目录键冲突时必须返回
-稳定错误而不是复用目录。manifest 必须先写入 staging 并随目录原子发布；缺失、格式错误或
-逻辑 ID 不一致的 manifest 都不得解释为空目录或合法 installation。
+Channel artifact 的 `artifact.json` 位于 `code_root` 外，至少保存完整 `channel_key`、
+`source_kind`、发行版本、兼容范围、无凭证来源、下载 `artifact_sha256`、
+`source_revision`、`descriptor_sha256` 和安装时间；避免把 archive digest 写进被摘要的
+官方 artifact 自身。`environment_spec.json` 保存完整 `environment_spec_id`，
+`install.json` 保存完整 `environment_id` 和其 spec ID，`instance.json` 保存完整
+`instance_id`、`agent_id` 和 `channel_key`；pointer 也必须保存其引用的完整逻辑 ID。
+创建或读取每一级目录时都要核对对应 manifest，短目录键冲突时必须返回稳定错误而不是
+复用目录。artifact 和 environment manifest 必须先写入 staging 并随目录原子发布；缺失、
+格式错误或逻辑 ID 不一致的 manifest 都不得解释为空目录或合法 installation。
 
 逻辑 ID 与磁盘目录键分离，目录键使用跨平台安全的短 hash，完整逻辑 ID 保存在
-`install.json` 和 pointer 中。environment 按 Channel lock、ABI、平台和条件集共享，
+`artifact.json`、`install.json` 和 pointer 中。artifact 按 `source_revision` 不可变发布，
+environment 按 Channel lock、ABI、平台和条件集共享，
 Runner、secret、checkpoint、日志和运行状态按 `instance_id` 隔离。活动 environment
 不可原地升级；repair 在同一 spec 下创建新的不可变 `environment_id`，安装使用跨进程
 锁、staging 目录和原子 rename，正在被 lease 引用的 environment 禁止清理。
@@ -1474,7 +1544,11 @@ locale key 和字符串值，不得借此引入其他字段：
 
 - `schema_version` 当前只能为整数 `1`；未知版本必须拒绝，不能按最佳努力解析。
 - `channel_key` 遵守 §10.1.2。descriptor 集合中 key 全局唯一；`builtin` key 必须对应
-  发布物中的内置记录，`plugin` key 必须包含稳定的 plugin owner metadata。`plugin_metadata`
+  QwenPaw 官方 Catalog 记录，`plugin` key 必须包含稳定的 plugin owner metadata。
+  `builtin` 只表示官方所有权，不要求 descriptor 或业务代码随 QwenPaw 主安装包分发；
+  `runner_process` builtin 必须由已验证的独立 Channel artifact 提供。官方下载 URL、发行
+  版本、archive digest 和兼容范围属于 artifact record/install manifest，不新增到 v1
+  descriptor，也不改变 descriptor digest。`plugin_metadata`
   对 builtin 必须为 JSON `null`；对 plugin 必须为 object，严格包含 `plugin_id`、`version`
   和 `artifact_sha256` 三个非空字符串，其中 digest 是 64 个小写 hex 字符。plugin owner
   由 `plugin_id` 精确标识，不能从 channel key 反推。legacy Plugin 的 descriptor 是明确的
@@ -1633,8 +1707,9 @@ legacy Plugin descriptor 在插件完成既有注册后合成，依赖管理标�
 
 ### 11.1 需要收敛到 descriptor 的现有硬编码表
 
-“descriptor 是唯一事实来源”这条要求，落地时等价于消除下列已存在的 per-channel 硬编码
-表。实施前必须逐项确认归属，不能只新增 descriptor 而让旧表继续并行生效：
+“descriptor 是运行契约唯一事实来源”这条要求，落地时等价于消除下列已存在的
+per-channel 运行属性硬编码表。实施前必须逐项确认归属，不能只新增 descriptor 而让旧表
+继续并行生效；发行版本、下载来源和 archive digest 仍只属于 artifact record：
 
 | 位置 | 当前内容 | 收敛方向 |
 | --- | --- | --- |
@@ -1699,9 +1774,11 @@ Catalog 明确显示 legacy Plugin Channel 的 `source_kind=plugin`、
 - Protocol version 和 capability 声明；
 - Core 不导入平台 SDK 的 Runner 代码。
 
-插件源码可以独立分发，但仍不应复制到 dependency environment。插件安装器负责校验
-包 digest、来源 metadata、descriptor、lock 和 QwenPaw Protocol compatibility；只有
-产品已有可信签名链时才额外验证签名，本期不新建插件 PKI。旧插件不自动迁移。
+isolated Plugin 复用官方 Channel 已建立的 artifact 下载、staging、只读 `code_root`、
+`source_revision`、Runner support artifact 和 dependency environment 分离机制，不再建立
+第二套代码安装器。Plugin 安装器扩展其来源信任与 plugin metadata 校验，负责校验包
+digest、来源 metadata、descriptor、lock 和 QwenPaw Protocol compatibility；只有产品已有
+可信签名链时才额外验证签名，本期不新建插件 PKI。旧插件不自动迁移。
 如果选择性迁移失败且迁移尚未 commit，只能继续使用原本仍 active 且声明匹配的
 legacy 实例；不能把新的 isolated 配置静默改成 legacy 启动。
 
@@ -1710,7 +1787,8 @@ legacy 实例；不能把新的 isolated 配置静默改成 legacy 启动。
 ### 13.1 正常启动
 
 ```text
-resolve descriptor/config
+resolve artifact record/descriptor/config
+  -> select and verify exact Channel artifact
   -> select exact lock/environment
   -> light validation
   -> spawn Runner
@@ -1720,9 +1798,10 @@ resolve descriptor/config
   -> consume
 ```
 
-### 13.2 依赖或源码变化
+### 13.2 依赖或 Channel artifact 变化
 
-- 仅源码变化：复用符合 lock 的 environment，启动新 generation；
+- 仅 Channel artifact/`source_revision` 变化：复用符合 lock 的 environment，启动新
+  generation；
 - lock、ABI、平台或 condition set 的候选变化：创建新的候选 environment；
 - 新声明在 candidate prepare 和 health 通过前不 commit，当前活动 Runner 继续按旧的
   已提交声明服务；这不是回退；
@@ -1730,7 +1809,7 @@ resolve descriptor/config
 - commit 是持久化 current pointer 与新 active generation 的唯一线性化点；
 - 旧 generation 立即失去 lease，不能继续写入事件、状态或 delivery；
 - 候选构建或验证失败：候选不 commit，保持当前已提交声明和仍满足它的 active
-  generation；不得启动另一份旧源码或旧 environment 作为回退。如果当前声明已经
+  generation；不得启动另一份旧 artifact 或旧 environment 作为回退。如果当前声明已经
   commit，或 active environment 已不满足当前声明，则必须停止 Channel 并报告
   `repair_required`。
 
@@ -1745,10 +1824,11 @@ resolve descriptor/config
 
 ### 13.4 切换 Journal 和 CAS
 
-依赖或源码变化的切换流程为：
+依赖或 Channel artifact 变化的切换流程为：
 
 ```text
-select lock/environment
+select and verify artifact
+  -> select lock/environment
   -> build staging environment when required
   -> spawn candidate Runner
   -> hello / prepare / standby / health
@@ -1763,8 +1843,9 @@ select lock/environment
 `current.json` 至少保存 `instance_id`、`environment_spec_id`、`environment_id`、
 `descriptor_sha256`、`source_revision`、`config_revision`、`generation` 和更新时间。
 配置正文和 secret 值不写入 pointer；它们继续由现有 Core 配置/secret store 管理，
-pointer 只引用不可变 revision。CAS 使用旧 environment/generation/config revision 作为
-前置条件；journal 必须先持久化，再原子写 pointer，并使用 flush/fsync/replace。Core
+pointer 只引用不可变 revision。CAS 使用旧 `source_revision`、descriptor、environment、
+generation 和 config revision 作为前置条件；journal 必须先持久化，再原子写 pointer，并
+使用 flush/fsync/replace。Core
 重启时根据 journal、pointer 和进程状态继续、补偿或停止，不重新附着旧 Runner。
 candidate 在 pointer CAS 前只能持有 provisional lease，不能消费正式事件或对外发送；
 CAS 成功后 Core 发送 commit confirmation，Runner 才进入 active。若确认响应丢失，
@@ -1806,7 +1887,7 @@ environment 已不匹配时，必须停止并报告 `repair_required`，不能�
   层。Runner 保存的 host context 必须删除 `secret_handle`。
 - 上述旧实例继续服务只适用于新配置/新声明仍处于 staging、尚未 commit 的情况；此时
   当前生效声明没有变化，不属于版本回退。新声明一旦 commit，任何不满足它的旧
-  environment 或旧源码都不得重新启动。
+  environment 或旧 Channel artifact 都不得重新启动。
 - 配置变化导致 `condition_set` 或 lock 变化时，按环境 reconcile 处理；不能继续
   使用旧条件分支的 environment。普通配置变化也必须经过 prepare 和唯一 commit。
 - Runner 不直接并发写入 Core 的 instance state 目录。Channel 专属状态通过版本化
@@ -1849,14 +1930,22 @@ host.state.delete
 
 ### 14.3 Catalog、CLI/API 和状态
 
-Catalog 必须是静态 descriptor 与 Channel 状态的组合，不能通过 import 成功与否判断
-Channel 是否存在。descriptor 至少包含 `channel_key`、`source_kind`、`process_mode`、
-entrypoint、依赖/条件声明、支持平台、入口归属和 capabilities。
+Catalog 必须是 Channel artifact record、已安装静态 descriptor 与 Channel 状态的组合，
+不能通过 import 成功与否判断 Channel 是否存在。未安装的官方 Channel 从签名或 HTTPS
+保护的官方 Catalog record 枚举；安装后使用经过摘要校验的 descriptor。descriptor 至少
+包含 `channel_key`、`source_kind`、`process_mode`、entrypoint、依赖/条件声明、支持平台、
+入口归属和 capabilities；发行版本、下载 URL、archive digest、兼容范围和
+`source_revision` 由 artifact record/install manifest 提供。
 
-状态拆成三个维度：
+状态拆成四个维度，Channel 代码安装与 Python dependency environment 不得共用一个
+`install_status`：
 
 ```text
-install_status:
+artifact_status:
+  not_installed | downloading | installed | update_available |
+  incompatible | artifact_error
+
+environment_status:
   unsupported_platform | not_installed | installing | installed |
   incompatible | repair_required | install_error
 
@@ -1868,8 +1957,8 @@ platform_status:
   unknown | connected | degraded | auth_error | rate_limited
 ```
 
-环境操作按 `channel_key` 作用于共享 dependency environment；实例操作按当前 Agent
-的默认 `instance_id` 作用。建议提供：
+artifact 和环境操作按 `channel_key` 作用；environment 仍可由多个 Agent instance 共享，
+实例操作按当前 Agent 的默认 `instance_id` 作用。建议提供：
 
 ```text
 qwenpaw channels list
@@ -1895,10 +1984,17 @@ qwenpaw channels restart <channel_key>
   `qwenpaw doctor` 继续负责平台可达性。文档、帮助文本和 Console 必须明确区分，避免
   用户把“环境不匹配”与“平台连不通”混为一谈。
 
-安装和 repair 返回 operation id，由 CLI/API/Console 查询进度；health/list/Core 启动
-只检查状态，不隐式安装依赖。用户启用/启动 Channel 时可以按产品策略自动准备精确
-lock environment，并必须展示 operation 进度和失败结果。v1 不提供远程 environment
-feed、源码版本选择或
+安装和 repair 返回 operation id，由 CLI/API/Console 查询进度；一次用户安装流程可以先
+安装 Channel artifact、再准备 environment，但两个步骤保留独立状态、manifest 和失败
+原因。health/list/Core 启动只检查状态，不隐式下载 artifact 或依赖。用户启用/启动
+Channel 时可以按产品策略自动安装当前兼容 artifact 并准备精确 lock environment，必须
+展示 operation 进度和失败结果。
+
+需要联网准备 environment 时，CLI/API/Console 使用 §10.2 的“Python 依赖下载源”模型。
+Console 安装弹窗默认选中阿里云，下拉可选 PyPI 或自定义源；选择可保存为全局默认，当前
+操作也可临时覆盖。该控件不能命名为“Channel 下载源”，因为 Channel artifact 仍从其
+Catalog record 的官方地址获取。所选 Python 源缺 wheel 时显示明确错误和切换入口，不
+静默 fallback。v1 不提供远程 environment feed、任意 artifact 版本选择或
 `rollback-environment`；不匹配且 repair 失败时保持停止并报告 `repair_required`。
 
 ### 14.4 Bot 身份查重
@@ -1973,8 +2069,9 @@ Core，作为“Core 不承载平台逻辑”这条原则的显式例外。**
   AES-256-GCM 解密。这两处属于已知脆弱实现，迁移期间保持行为不变，但必须记录为技术债，
   且不得因“反正是例外”而继续增加同类逻辑。
 
-Catalog 与 Console 的 Channel 存在性、状态和配置表单仍以 descriptor 为准；扫码登录只是
-配置阶段的辅助入口，不构成第二套 Channel 事实来源。
+Catalog 与 Console 使用 artifact record 枚举未安装官方 Channel，使用已验证 descriptor
+解释安装后的运行契约、状态和配置表单；扫码登录只是配置阶段的辅助入口，不构成第二套
+Channel 事实来源。
 
 ### 14.6 环境变量透传白名单
 
@@ -2002,8 +2099,10 @@ Feishu 的 `domain` 需要单独区分：`feishu` 与 `lark` 两个枚举值是�
 
 ## 15. 安全边界
 
-stdio 是进程绑定的 IPC，不监听本地端口，但不构成不可信插件沙箱。官方源码默认受
-QwenPaw 安装包信任；如果未来支持不可信第三方代码，需要另行评估 Windows
+stdio 是进程绑定的 IPC，不监听本地端口，但不构成不可信插件沙箱。官方 Channel
+artifact 只有在官方 Catalog 来源、archive digest、安装 manifest 和 `source_revision`
+校验通过后才进入受信任启动路径；QwenPaw 主安装包不再隐式为其业务代码提供信任。
+如果未来支持不可信第三方代码，需要另行评估 Windows
 restricted token、macOS sandbox、Linux namespace/seccomp 或容器。本期必须实现：
 
 - minimal environment，不继承 `PYTHONPATH`、user site 和不必要的 secret；
@@ -2021,7 +2120,8 @@ restricted token、macOS sandbox、Linux namespace/seccomp 或容器。本期必
 
 迁移顺序：
 
-1. 先实现 Protocol SDK、stdio framing、Runner bootstrap 和环境管理；
+1. 先实现 Protocol SDK、stdio framing、Runner bootstrap、Channel artifact 安装和环境
+   管理；
 2. 用飞书验证主动连接、媒体和两个 Agent 实例的进程隔离；
 3. 用 OneBot 验证 Runner-owned ingress；
 4. 用 Voice/Twilio 验证优先采用 Runner-owned ingress 的签名/TwiML 边界、endpoint 注册、
@@ -2058,6 +2158,8 @@ Console Channel 是 Core 内部控制面入口，明确保留 `process_mode=in_p
 3.1 从 §11.1 的硬编码表中移除该 Channel 的条目，并补齐 descriptor 的
    `bot_identity_fields` 与环境变量透传白名单；该 Channel 若涉及扫码登录或 mock 注入点，
    按 §14.5、§14.6 逐条确认边界；
+3.2 生成独立 Channel artifact、官方 Catalog record 和安装完整性 fixture，证明 QwenPaw
+    主安装包不包含该 `runner_process` Channel 业务代码；
 4. 保持 `BaseChannel` 外部 contract，包括 ACL 的 `acl_sender_id`、session、群聊/私聊、
    `uses_manager_queue`/dispatch、mention、streaming、approval、卡片、媒体、
    typing/reaction 和主动发送中实际支持的项；
@@ -2081,8 +2183,12 @@ Console Channel 是 Core 内部控制面入口，明确保留 `process_mode=in_p
 
 ### 环境和兼容
 
+- `runner_process` 官方 Channel 代码不随 QwenPaw 主安装包发布，可由 artifact record
+  独立下载、校验和安装；
 - Channel 源码不在 dependency environment；
-- 源码变化但 lock 不变时复用 environment；
+- Channel artifact 变化但 lock 不变时复用 environment；
+- Runner support artifact、Channel `code_root` 和 dependency environment 互不混用，
+  hello 中的 `source_revision` 与本地 artifact manifest 一致；
 - lock、ABI、平台或实际 distribution 不匹配时禁止启动；
 - 未 commit 的候选环境构建失败保留当前合法 active generation；当前声明不匹配时
   停止，且不启动不兼容旧环境；
@@ -2112,6 +2218,8 @@ Console Channel 是 Core 内部控制面入口，明确保留 `process_mode=in_p
 - 环境变量透传白名单生效：Telegram/Discord/Slack 的代理变量和 `SSL_CERT_FILE` 在隔离后
   仍然生效；
 - `channels verify-env` 不产生网络 I/O，与 `qwenpaw doctor` 的平台连通性结果互不混淆；
+- Python 依赖下载源默认阿里云，可显式选择 PyPI 或自定义源；缺 wheel 不静默 fallback，
+  自定义源凭证不进入 URL、日志、manifest 或响应；
 - 所有落盘型 Channel 使用 Core 解析的最终 `media_work_dir`，文件平铺在该目录中；各 Channel
   现有下载、文件名和发送行为无回归；
 - 所有相关 Python 单测通过率 100%，改动文件通过 pre-commit。
@@ -2125,8 +2233,9 @@ standby 禁止消费、旧 generation fencing、媒体路径/URL 双向传递、
 ConversationRelay 文本 WebSocket 的顺序/背压/关闭、Runner-owned endpoint 注册与
 切换、必要时的 Core-owned 兼容入口、
 Core Channel、runner-process Channel 和 legacy Plugin Channel 混合运行、两个 Agent
-共享 environment 但状态隔离，以及并发安装、
-磁盘不足、依赖源不可达、跨平台路径和进程树清理。
+共享 environment 但状态隔离，Channel artifact digest/`source_revision` 不匹配、Protocol
+SDK shadowing、并发 artifact/environment 安装、磁盘不足、所选依赖源不可达或缺 wheel、
+跨平台路径和进程树清理。
 
 平台验证至少包括 macOS Intel/Apple Silicon、Windows 11、Linux x86_64，以及 Python
 3.11、3.12、3.13；frozen desktop、pip/source/conda 和 container 的 environment 语义
@@ -2136,7 +2245,7 @@ Core Channel、runner-process Channel 和 legacy Plugin Channel 混合运行、�
 
 | ID | 决策 | 状态 |
 | --- | --- | --- |
-| ADR-001 | 官方 Channel 源码随当前 QwenPaw 发布 | 已确认 |
+| ADR-001 | 官方 Channel 源码随当前 QwenPaw 发布 | 被 ADR-039 替代 |
 | ADR-002 | dependency environment 只包含第三方依赖，不安装 Channel 源码 | 已确认 |
 | ADR-003 | environment 按 channel/lock/ABI/platform/condition 复用 | 已确认 |
 | ADR-004 | Core 保留 ChannelManager/BaseChannel；isolated 使用 Proxy | 已确认 |
@@ -2174,3 +2283,6 @@ Core Channel、runner-process Channel 和 legacy Plugin Channel 混合运行、�
 | ADR-036 | v1 descriptor 使用 closed object、显式空值和字段级 required/nullable/secret/condition 语义；Requirement 在 digest 前统一 canonicalize，重复折叠且拒绝 `extra` marker；condition domain 必须有限；`config_fields` 是支持 number 的 UI 投影，完整 value schema 仍由 Pydantic/JSON Schema 或 plugin artifact schema 负责；身份声明可引用 secret 字段但 secret value 仅在 Core 内比较；静态读取不得 import 平台模块；process mode 唯一派生驱动接口 | 已确认 |
 | ADR-037 | request-scoped response 的终止由 Core 通过可重试、幂等的 `channel.response.finish` 显式通知 Runner；不得由 message、stream 或 delivery ACK 推断。Core 是业务生命周期唯一权威；Runner 以唯一 route/cleanup aggregate 维护执行侧 closed fence、delivery drain、可恢复资源清理和完成 receipt。永久 rejected route 先进入执行侧 `revoked`，只有 revoked snapshot 持久化确认后才执行 Host State delete；delete 未确认前不得复活或 TTL GC，重复 discard 共享可取消隔离的有界 reconcile task。cleanup pending 不做普通 TTL GC，只有 cleanup complete receipt 从完成时固定保留 24 小时且不可运行时覆盖；TTL GC 后仅 finish 保证 `RESPONSE_HANDLE_UNKNOWN`，不保留第二套历史 handle fence。Host State shard 的 unknown mutation 保留最新 desired 并由后续 mutation 完整重写；首次 provisional open 的确定性拒绝同时精确回滚 aggregate 和 checkpoint desired。Feishu 新 aggregate Host State 格式从内部 schema version 1 开始，不兼容未上线的开发期旧格式；平台资源引用必须在 acknowledged publication 前持久化。真实 Core per-handle sequencer 由 CH-2-005 `IsolatedChannelProxy` 提供 | 已确认 |
 | ADR-038 | Core 以有界 generation authority 同时持有一个 active 和一个 candidate，并通过 immutable snapshot、candidate epoch 与 operation token 统一 Host RPC 和 endpoint route authorization；只有 committed generation 的 `ready && !quiescing` endpoint 可接收正式流量。quiesce/stop 在 Runner RPC 前撤销，lease expiry 和 generation replacement 单调 fencing，迟到 control/endpoint 响应不得复活旧 generation | 已确认 |
+| ADR-039 | `runner_process` 官方 Channel 代码不随 QwenPaw 主安装包发布，作为独立、可校验的 Channel artifact 安装；`source_kind=builtin` 继续表示官方所有权而非物理打包。artifact 与 dependency environment 分离，代码变化但 lock/ABI/platform/condition 不变时复用 environment；Catalog record 和本地 artifact manifest 持有发行版本、来源与摘要，v1 descriptor 不新增自指的官方下载字段 | 已确认；替代 ADR-001 |
+| ADR-040 | QwenPaw 提供独立的可信 Runner support artifact（bootstrap + Protocol SDK）；Channel `code_root` 只包含 descriptor、Driver 和平台代码，不能提供或覆盖 Protocol SDK。`runner.hello` 必须携带并由 Core 校验 64-hex `source_revision`，不匹配时以 `SOURCE_REVISION_MISMATCH` 拒绝激活 | 已确认 |
+| ADR-041 | 核心 environment 安装模型按精确 lock 从用户选择的 Python 依赖源下载 hash 匹配的 wheel 并本地创建 venv，不分发预建 venv。全局默认源为阿里云，可选 PyPI 或自定义源并允许单次覆盖；缺 wheel 明确失败且不静默 fallback、不重新解析版本、不构建 sdist，自定义源凭证只进入 secret store。离线/Desktop bundle 仅是可选缓存优化 | 已确认 |

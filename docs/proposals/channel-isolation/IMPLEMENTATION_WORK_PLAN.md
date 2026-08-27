@@ -2,7 +2,8 @@
 
 ## 1. 文档信息
 
-- 状态：实施中（Phase 0/G0 已完成，Phase 1 待开始）
+- 状态：实施中（Phase 0 原 G0 已通过；独立 Channel artifact 架构增量
+  `CH-0-010` 待实施和复验，Phase 1 尚未开始）
 - 对应设计：`DESIGN.md`
 - 目标：按设计完成 Channel 的环境隔离、进程隔离、stdio IPC、可靠投递和迁移
 - 当前产品约束：每个 Agent 每种 `channel_key` 保持一个用户可见实例
@@ -30,9 +31,14 @@
 - [x] stdout 只承载协议，stderr 只承载日志；bootstrap 在导入 SDK 前完成 FD 分流。
 - [x] secret value 不进入 JSON-RPC、hello、命令行或持久环境文件；默认通过一次性继承
   pipe/handle 注入，SDK 必须读取环境变量时才临时设置并立即清除。
-- [x] Channel 源码随当前 QwenPaw 发布，不安装进 dependency environment。
+- [x] `runner_process` 官方 Channel 代码作为独立 Channel artifact 安装，不随 QwenPaw
+  主安装包发布；`source_kind=builtin` 继续表示官方所有权。
+- [x] QwenPaw 提供可信 Runner support artifact（bootstrap + Protocol SDK）；Channel
+  `code_root` 不得提供或覆盖 Protocol SDK。
 - [x] dependency environment 只安装 lock 指定的第三方依赖。
 - [x] 代码变化但 lock、ABI、平台和 condition set 不变时复用环境。
+- [x] Python 依赖下载源默认阿里云，可选 PyPI 或自定义源并允许单次覆盖；缺 wheel
+  明确失败且不静默 fallback，自定义源凭证只进入 secret store。
 - [x] 安装、repair、doctor 严格校验；不兼容 environment 禁止启动。
 - [x] 检测到不匹配后只能显式或策略允许的自动 repair；repair 失败保持停止，不能
   使用不兼容 environment。
@@ -110,8 +116,8 @@
 
 | 阶段 | 内容 | 状态 | Gate |
 | --- | --- | --- | --- |
-| Phase 0 | 边界、协议和纵向原型 | 已完成 | G0（已通过） |
-| Phase 1 | Lock、环境和 Runner bootstrap | 未开始 | G1 |
+| Phase 0 | 边界、协议和纵向原型 | 增量修订待验收 | G0（原 Gate 已通过，artifact 增量待复验） |
+| Phase 1 | Lock、Channel artifact、环境和 Runner bootstrap | 未开始 | G1 |
 | Phase 2 | 进程监督、Core 适配和 Catalog | 未开始 | G2 |
 | Phase 3 | 可靠投递、媒体和切换恢复 | 未开始 | G3 |
 | Phase 4 | 官方 Channel 正式迁移 | 未开始 | G4 |
@@ -121,13 +127,17 @@
 ### 4.1 执行依赖
 
 - Gate 严格按 `G0 -> G1 -> G2 -> G3 -> G4 -> G5 -> G6` 推进；前一 Gate 未通过，
-  后一阶段不得进入正式实施。
+  后一阶段不得进入正式实施。架构变化使已通过 Gate 的结论失效时，必须完成对应增量
+  任务和独立复验；本次 `CH-0-010` 通过前不得进入 Phase 1。
 - 同一 Phase 默认按任务编号顺序执行。只有依赖图明确独立且用户批准时才可并行；并行
   必须使用独立工作树/分支，并先确认文件归属，多个实施 Chat 不得共享同一工作树。
 - Phase 0 中 `CH-0-003` 完成 framing，`CH-0-004` 才构建 JSON-RPC；`CH-0-005`
   依赖前两者；`CH-0-007` 至 `CH-0-009` 依赖 `CH-0-001` 至 `CH-0-006`。
+- `CH-0-010` 依赖已完成的 `CH-0-002`、`CH-0-004` 和 `CH-0-006`，只实现独立
+  Channel artifact 对 hello/bootstrap 原型造成的增量，不重新打开其他 G0 任务。
 - Phase 1 中 installer 依赖 lock 和 spec；repair/doctor 依赖 installer；RunnerSpec 同时
-  依赖 Phase 0 bootstrap 结论和跨平台解释器策略。
+  依赖 `CH-0-010` 的 bootstrap 结论和跨平台解释器策略；Channel artifact installer
+  依赖 artifact release record，但与 dependency environment 原子发布保持独立。
 - Phase 2 先完成 spawn/supervision/generation，再接入 HostAdapter、Proxy、Registry
   和 Catalog；Phase 3 的切换与 Journal 依赖 Inbox、Delivery 和 Media 数据面稳定。
 - Phase 4 的三个参考 Channel 复用 Phase 0 纵向产物，剩余三批迁移复用同一模板；
@@ -136,10 +146,14 @@
 ## 5. 全局完成标准
 
 - [ ] isolated Channel 的第三方 SDK 不再作为默认 Core 依赖安装。
+- [ ] `runner_process` 官方 Channel 代码不随 QwenPaw 主安装包发布，可由官方 artifact
+  record 独立下载、校验、安装和更新。
 - [ ] 两个 Channel 可以使用互不兼容的同名依赖并同时运行。
 - [ ] 两个 Agent 可共享同一 environment，但 Runner、secret、checkpoint、日志和
   generation 完全隔离。
 - [ ] 代码变化但 lock 不变时复用 environment。
+- [ ] Runner support artifact、Channel `code_root` 和 dependency environment 三层分离，
+  hello 的 `source_revision` 与已安装 artifact manifest 一致。
 - [ ] lock、ABI、平台、condition 或实际 distribution 不匹配时禁止启动。
 - [ ] 未 commit 的候选构建失败保留当前合法 active generation；当前声明不匹配时停止，
   不启动不兼容环境。
@@ -149,9 +163,12 @@
   行为无回归。
 - [ ] Core 侧不保留平台入口：`routers/voice.py` 已删除，`twilio` 不在 Core 默认依赖；
   扫码登录是登记在案的有界例外。
-- [ ] Channel 的存在性、身份字段、配置字段展示投影和环境变量透传均以 descriptor 为唯一
-  事实来源；完整配置 value schema 仍按 Design §11.0 的 Pydantic/JSON Schema 边界校验。
+- [ ] 未安装官方 Channel 的存在性以 artifact record 为事实来源；安装后的运行身份字段、
+  配置字段展示投影和环境变量透传以已验证 descriptor 为事实来源。完整配置 value schema
+  仍按 Design §11.0 的 Pydantic/JSON Schema 边界校验。
 - [ ] pip/source/conda、frozen desktop 和容器语义一致。
+- [ ] Python 依赖下载源默认阿里云，可选 PyPI 或自定义源；缺 wheel 不静默 fallback，
+  自定义源凭证不离开 secret store。
 - [ ] Windows、Linux、macOS 验证通过。
 - [ ] 相关 Python 单测通过率 100%，pre-commit 和 diff check 通过。
 
@@ -551,7 +568,7 @@ CH-0-007 与飞书 unit/contract 相邻矩阵为 `185 passed, 1 skipped`。改�
 - [x] 在导入 Channel SDK 前校验 isolated Python、代码根和 manifest。
 - [x] 保存协议输出句柄，并将普通 stdout/FD 1 输出导向 stderr。
 - [x] 验证 `python -I <absolute-bootstrap>` 不依赖 dependency environment 中安装
-  QwenPaw，并仅从显式 `code_root` 加载源码。
+  QwenPaw，并按当时 ADR-001 从显式 `code_root` 加载源码。
 - [x] 清除 `PYTHONPATH`、user site 和不必要环境变量。
 - [x] 验证飞书 SDK、普通 `print()` 和原生 FD 1 输出不会污染协议。
 - [x] 验证 stderr 持续排空和日志 backpressure。
@@ -566,8 +583,9 @@ Proactor，同时继续复用同一有界队列、单 writer 和错误语义；�
 丢弃排队写入，并跨同步写启动竞态重试取消，直至 writer 线程退出且协议与线程句柄关闭。
 回归测试证明写超时后即使 pipe 恢复可写也不会发送迟到 frame。普通 stdout/FD 1 重定向到
 stderr 后保持可继承；subprocess 级 probe 已证明私有句柄输出合法 frame，SDK、`print()` 和
-原生 FD 1 输出仅进入 stderr。dependency environment 不需要安装 QwenPaw，Protocol SDK
-和 Channel 源码只从显式绝对 `code_root` 加载。聚焦测试位于
+原生 FD 1 输出仅进入 stderr。原 G0 实现证明 dependency environment 不需要安装 QwenPaw，
+但将 Protocol SDK 和 Channel 源码同时放入显式绝对 `code_root`；该同根假设已被
+ADR-039/ADR-040 替代，增量拆分唯一归入 CH-0-010。聚焦测试位于
 `tests/unit/channel_isolation/test_ch_0_006_bootstrap.py`，fixture 位于
 `tests/fixtures/channel_isolation/bootstrap_code/`。当前聚焦测试 `19 passed`，
 `tests/unit/channel_isolation` 共 `221 passed`；目标文件 pre-commit 全部通过，
@@ -764,16 +782,50 @@ Voice unit/contract/integration 当前 `58 passed`；目标文件 pre-commit 全
 验收：Voice 完成 Runner-owned Webhook、实时 WebSocket、Core query/reply、endpoint
 注册、切换和 shutdown 故障矩阵；兼容方案仅在有独立 ADR 时验收。
 
+### CH-0-010：独立 Channel artifact 协议增量
+
+- 状态：[ ] 未开始
+
+本任务只修订独立 Channel artifact 对已完成 CH-0-004/CH-0-006 原型造成的协议和启动
+边界变化。直接依赖为 `CH-0-002`、`CH-0-004`、`CH-0-006`；对应 Design §6.1、§6.4、
+§7.3、§10.3、§13.4 和 ADR-039 至 ADR-041。原任务的历史状态保持 `[x]`，本任务提供
+架构变化后的唯一增量实现和 Review 记录。
+
+- [ ] 在 closed `runner.hello` DTO 中增加必填 `source_revision`；Core controller 保存
+  RunnerSpec/artifact manifest 的预期值并在任何 prepare/activate 前校验，不匹配返回
+  `SOURCE_REVISION_MISMATCH`。Runner 侧字段只能由可信 bootstrap/protocol host 从已验证
+  manifest 构造，`ChannelDriver` 不得传入或覆盖。
+- [ ] 保持 CH-0-002 的 descriptor digest、`environment_spec_id`、`environment_id` 和目录键
+  算法不变；`source_revision` 不进入 environment identity。
+- [ ] 将 CH-0-006 bootstrap fixture 拆成 QwenPaw 可信 Runner support artifact 与独立
+  Channel `code_root`；Protocol SDK 只从 support artifact 加载，descriptor/entrypoint 只从
+  已校验 `code_root` 加载。
+- [ ] 拒绝 Channel `code_root` 提供或覆盖 `qwenpaw.channel_protocol`，并验证 dependency
+  environment 无需安装 QwenPaw 或 Channel 源码。
+- [ ] 更新 CH-0-004/CH-0-006 聚焦 fixture 和测试，覆盖 hello 缺字段/摘要格式/预期值不匹配、
+  support/code root 分离、Protocol SDK shadowing、source/editable 显式根和现有 stdout、
+  stderr、FD/handle 行为无回归。
+- [ ] 运行 CH-0-004、CH-0-006、完整 `tests/unit/channel_isolation`、目标文件 pre-commit 和
+  `git diff --check`；初始实现完成后状态保持 `[-]`，等待独立 Review。
+
+验收：Runner 只能以 QwenPaw 可信 bootstrap/Protocol SDK 启动已验证的独立 Channel
+`code_root`；Core 能在 hello 阶段证明实际 `source_revision` 与候选 artifact 一致，且代码
+变化不改变 environment identity。本任务不实现真实 Catalog、artifact downloader、
+environment installer、Console 弹窗或正式 Channel 打包。
+
 ### G0 Gate
 
-- 状态：[x] Gate 通过，允许进入 Phase 1
+- 状态：[~] 原 Gate 已通过；ADR-039 至 ADR-041 的 artifact 增量待独立复验，暂不允许进入
+  Phase 1
 
 - [x] 职责、descriptor、stdio framing、JSON-RPC、可靠投递、媒体和 Runner-owned Voice
   ingress 边界冻结；如需 Core-owned 兼容入口，必须有独立 ADR。
 - [x] CH-0-002 的 canonical encoder、ID/目录键模型和 descriptor v1 validator 已通过聚焦
   单测与独立 Review；目标平台运行同一固定 hash 向量得到一致结果。
 - [x] 飞书、OneBot、Voice/Twilio 三条纵向原型分别通过。
-- [x] 无阻塞当前 Phase 的 P0/P1。
+- [ ] CH-0-010 的 hello source identity、Runner support artifact/Channel `code_root` 分离
+  已通过独立 Review及 Linux、macOS、Windows 增量测试。
+- [ ] 架构增量无阻塞当前 Phase 的 P0/P1。
 
 验收证据：`8ad95d75` 的 GitHub Actions `Channel Isolation G0 Gate` 运行
 [`32863688912`](https://github.com/hongxicheng/QwenPaw/actions/runs/32863688912)
@@ -783,17 +835,26 @@ Voice unit/contract/integration 当前 `58 passed`；目标文件 pre-commit 全
 `git diff --check` 通过。独立 Gate 验收未发现阻塞 Phase 0 的 P0/P1，跨平台 CI 补证后
 全部强制项证据充分。G0 只验收源码级原型和协议边界；Desktop bundled Python、完整安装
 形态以及 OS/Python ABI/架构发布矩阵仍分别由 `CH-6-004`、`CH-6-005` 验收，不在本 Gate
-提前标记完成。
+提前标记完成。上述证据是 ADR-039 至 ADR-041 之前的历史基线，不证明独立 artifact
+增量；CH-0-010 Review 和跨平台增量验证通过后，必须在本节更新唯一当前证据并恢复 `[x]`。
 
-## 7. Phase 1：Lock、Environment 和 Bootstrap
+## 7. Phase 1：Lock、Channel Artifact、Environment 和 Bootstrap
 
-### CH-1-001：Lock 和发布制品
+### CH-1-001：Lock 和 Channel artifact 发布制品
 
 - [ ] 定义每个 Channel 的依赖输入和 conditional config domain。
+- [ ] 定义官方 Channel artifact record、发行版本、QwenPaw/Protocol 兼容范围、下载 URL、
+  `artifact_sha256`、安装后 `source_revision` 和 `descriptor_sha256` 的唯一归属；下载 metadata
+  不写入 builtin descriptor。
+- [ ] 定义 Channel artifact archive 和本地 `artifact.json` schema；artifact 内容只包含
+  descriptor、完整配置 schema、release lock manifest/lock、`ChannelDriver` 和平台代码，
+  不包含第三方 wheel/venv、Core、bootstrap 或 Protocol SDK。
 - [ ] 生成目标 Python ABI、platform tag 和 condition set 的完整 lock 矩阵。
 - [ ] lock 包含精确版本、传递依赖、environment marker 和 wheel hash。
 - [ ] 生成 manifest，保证每个目标 key 唯一映射一个 lock。
 - [ ] 明确离线安装、缓存和缺失 wheel 的 `unsupported_platform` 状态。
+- [ ] 生成可重复验证的空 Runner/fixture Channel artifact；正式官方 Channel artifact 由
+  Phase 4 各迁移任务基于同一格式产出。
 - [ ] 不得假设当前主环境已有的库“本来就在”：`aiohttp`（OneBot 需要）和 `fastapi`
   （Voice 若沿用 FastAPI 语义需要）目前都不是 `pyproject.toml` 声明的直接依赖，仅为传递
   依赖，必须在对应 Channel lock 中显式声明。盘点时逐 Channel 核实实际 import 与声明的
@@ -814,9 +875,16 @@ Voice unit/contract/integration 当前 `58 passed`；目标文件 pre-commit 全
 
 - [ ] 实现 staging venv、只读/不可变安装、原子 rename 和安装锁。
 - [ ] 按 lock 和 wheel hash 安装，不解析未锁定依赖或现场构建 sdist。
+- [ ] 实现“Python 依赖下载源”输入：全局默认阿里云
+  `https://mirrors.aliyun.com/pypi/simple/`，可选 PyPI
+  `https://pypi.org/simple/` 或自定义 PEP 503 simple index；每次 install/repair 可以覆盖。
+- [ ] 所选源缺少 hash 匹配 wheel 时明确失败并返回可诊断 reason，不静默切换源；自定义源
+  凭证只通过 secret-store reference 进入下载器，日志、URL、manifest 和响应均不得回显。
 - [ ] 处理离线缓存、缺失 wheel、磁盘不足、并发安装和失败 staging 清理。
 - [ ] 安装完成后写入不可变 install manifest，并在严格校验后才发布 environment。
 - [ ] 验证已有 environment 不被原地覆盖或升级。
+- [ ] 不提供预建 venv 作为核心安装路径；Desktop/offline bundle 只可预置经 hash 校验的
+  artifact/wheel cache，并继续走相同本地 environment 创建和验证流程。
 
 验收：安装失败不产生可启动 environment；并发安装只发布一个完整、严格匹配的不可变
 environment。
@@ -843,8 +911,11 @@ environment。
 ### CH-1-006：RunnerSpec 和受控 bootstrap
 
 - [ ] 实现 command/args/env/cwd 的 RunnerSpec。
-- [ ] 实现 `python -I <absolute-bootstrap>` 和显式 `code_root` 加载；发布物只读，
-  source/editable 安装不得依赖 ambient cwd 或 `PYTHONPATH`。
+- [ ] 实现 `python -I <absolute-bootstrap>`，从 QwenPaw 可信 Runner support artifact 加载
+  bootstrap/Protocol SDK，并从独立、只读 Channel `code_root` 加载 descriptor/entrypoint；
+  两个根不得互相替代或被 ambient cwd、`PYTHONPATH` 推断。
+- [ ] RunnerSpec 绑定绝对 `bootstrap_path`、`code_root`、artifact/launch `manifest_path` 和
+  预期 `source_revision`；source/editable Channel 开发模式同样使用显式根和新 revision。
 - [ ] 实现协议 FD、日志 FD 和后代句柄白名单。
 - [ ] 实现最小环境变量和一次性 secret pipe/handle 注入；SDK 必须读取环境变量时临时
   设置并在初始化后清除。
@@ -853,17 +924,40 @@ environment。
   仍生效（ADR-030）。
 - [ ] 证明 secret value 不进入 JSON-RPC、hello、日志或命令行。
 
+### CH-1-007：Channel Artifact Installer 和原子发布
+
+- [ ] 从官方 Catalog record 选择唯一兼容 Channel artifact，下载到 staging，按
+  `artifact_sha256` 校验 archive 后再解包。
+- [ ] 拒绝 path traversal、symlink/special-file 越界、重复路径和 Protocol SDK shadowing；
+  校验 descriptor、兼容范围和确定性 `source_revision` 后才原子发布只读 `code_root`。
+- [ ] 在 `code_root` 外写入不可变 `artifact.json`，记录 channel/version/source、archive、
+  source 和 descriptor identity；下载 URL 和错误日志必须移除凭证。
+- [ ] artifact 与 environment 使用独立 staging、锁、状态和清理保护；仅 artifact 变化且 lock
+  不变时不得创建新 environment。
+- [ ] 处理缓存命中、断点前失败、摘要不匹配、磁盘不足、并发安装、失败 staging 和 active
+  generation 引用保护；不得静默启动旧 artifact 作为后备。
+
+验收：官方 fixture Channel 可在不修改 QwenPaw 主安装和 environment 的情况下独立下载、
+校验、原子安装并生成可供 RunnerSpec 使用的 `code_root`；失败不发布部分 artifact，代码
+升级但 lock 不变时复用原 environment。
+
 ### G1 Gate
 
 - [ ] 空 Runner 可在三平台启动、hello、prepare、health、stop。
-- [ ] lock、manifest、ABI、platform 和环境完整性校验通过。
-- [ ] 源码变化不触发环境重建。
+- [ ] artifact record/archive/source revision、lock、manifest、ABI、platform 和环境完整性
+  校验通过。
+- [ ] Runner support artifact、Channel `code_root` 和 dependency environment 三层分离，
+  Channel 代码不能覆盖 Protocol SDK。
+- [ ] Channel artifact 变化不触发 environment 重建。
+- [ ] 阿里云、PyPI、自定义源、缺 wheel 不 fallback、凭证脱敏和离线 cache 测试通过。
 
 ## 8. Phase 2：进程监督、Proxy 和 Catalog
 
 ### CH-2-001：Runner Spawn 和 IPC I/O
 
 - [ ] 实现 spawn、hello、prepare、activate、quiesce、stop、terminate、kill。
+- [ ] 从已安装 artifact manifest/RunnerSpec 取得预期 `source_revision`，并在 hello 成功前
+  校验实际 Runner 代码身份；不匹配不得进入 prepare。
 - [ ] 持续读取 stdout 协议和 stderr 日志。
 - [ ] 处理 stdin/stdout/stderr 关闭和写入背压。
 
@@ -916,6 +1010,9 @@ stderr。
 ### CH-2-006：Descriptor Registry 和实例解析
 
 - [ ] 实现静态 descriptor 枚举和 Channel 实例解析两层 Registry。
+- [ ] Core `in_process` descriptor 从 QwenPaw 安装读取；`runner_process` 官方 descriptor
+  从已验证的 Channel artifact `code_root` 读取。未安装条目只能使用 Catalog record 展示，
+  不能伪造可启动 descriptor。
 - [ ] 复用 CH-0-002 的 descriptor model/validator；实现 builtin Pydantic JSON Schema
   adapter 和 `config_fields` 投影一致性检查，不得复制或改写 canonical/ID/descriptor 算法。
 - [ ] 支持 Core Channel、runner-process Channel 和 legacy Plugin Channel 混合运行。
@@ -927,10 +1024,12 @@ descriptor，并根据 `process_mode` 返回正确 Channel 实例和驱动接口
 
 ### CH-2-007：Catalog 和状态聚合
 
-- [ ] Catalog 展示 source/process 分类、派生驱动接口以及 install、instance、platform
-  状态。
-- [ ] 拆分 install、instance、platform 三个状态维度。
-- [ ] 验证未安装、repair_required、配置错误、Runner 崩溃和平台鉴权错误不会混淆。
+- [ ] Catalog 组合官方 artifact record、已安装 descriptor 和运行状态，展示 source/process
+  分类、发行版本、`source_revision`、派生驱动接口和更新可用状态。
+- [ ] 拆分 artifact、environment、instance、platform 四个状态维度；代码未安装、环境未准备
+  和环境 `repair_required` 不得共用一个 install 状态。
+- [ ] 验证 artifact 未安装/损坏、environment 未安装/repair_required、配置错误、Runner
+  崩溃和平台鉴权错误不会混淆。
 - [ ] 验证 Catalog 不以 import 成功与否判断 Channel 是否存在。
 
 ### G2 Gate
@@ -991,6 +1090,8 @@ descriptor，并根据 `process_mode` 返回正确 Channel 实例和驱动接口
 ### CH-3-004：Staging、Activate 和 Commit
 
 - [ ] 实现候选 Runner 健康门禁和 standby。
+- [ ] 候选绑定不可变 `source_revision`、descriptor、environment 和 config revision；仅
+  artifact 变化时复用 environment，但仍启动新 generation 并经过完整门禁。
 - [ ] 实现 quiesce、checkpoint、activate 和唯一 commit point。
 - [ ] candidate 在 CAS 前只持有 provisional lease；pointer/generation CAS 后确认 committed
   lease，确认丢失时通过只读 generation status 恢复。
@@ -1005,7 +1106,8 @@ descriptor，并根据 `process_mode` 返回正确 Channel 实例和驱动接口
 ### CH-3-005：Operation Journal 和崩溃恢复
 
 - [ ] 实现 operation journal、崩溃恢复和孤儿清理。
-- [ ] 定义 current pointer、CAS 前置条件和原子 replace 语义。
+- [ ] 定义包含 `source_revision` 的 current pointer，以及 source/descriptor/environment/
+  generation/config CAS 前置条件和原子 replace 语义。
 - [ ] 注入 prepare、quiesce、checkpoint、commit、activate 各步骤的 Core 崩溃。
 - [ ] 验证不兼容声明下不启动旧版本作为回退。
 
@@ -1018,6 +1120,11 @@ descriptor，并根据 `process_mode` 返回正确 Channel 实例和驱动接口
 
 ## 10. Phase 4：官方 Channel 正式迁移
 
+所有选择 `process_mode=runner_process` 的官方 Channel 都必须产出独立 Channel artifact、
+官方 Catalog record 和安装 fixture，并从 QwenPaw 主发布包中移除其业务代码和平台 SDK。
+源码可以继续在同一开发仓库维护，但发布边界必须独立；只完成子进程调用而仍依赖主包内
+Channel 模块，不算完成迁移。
+
 ### CH-4-001：飞书正式迁移
 
 - [ ] 复用 `CH-0-007` 的生产路径原型，不重新实现第二套 Runner。
@@ -1026,6 +1133,8 @@ descriptor，并根据 `process_mode` 返回正确 Channel 实例和驱动接口
   卡片和媒体 payload 编码。
 - [ ] 保持现有配置、私聊、群聊、mention、streaming 和媒体行为。
 - [ ] 删除 Core 对飞书 SDK 的进程内 import。
+- [ ] 产出飞书独立 Channel artifact/Catalog record，并证明 Runner 不从 QwenPaw 主包加载
+  飞书业务模块。
 
 验收：Phase 0 原型上的临时限制被清除，飞书全链路、依赖移除和兼容回归达到发布标准。
 
@@ -1036,6 +1145,8 @@ descriptor，并根据 `process_mode` 返回正确 Channel 实例和驱动接口
 - [ ] 支持显式端口与动态端口发现。
 - [ ] 明确这些端口仅属于平台 ingress，不得用于 Core↔Runner IPC。
 - [ ] 验证 candidate 在 commit 前不监听或消费正式入口。
+- [ ] 产出 OneBot 独立 Channel artifact/Catalog record，并证明代码升级不重建未变化的
+  dependency environment。
 
 验收：OneBot 现有配置和行为回归通过，端口交接、反向连接和隔离故障达到发布标准。
 
@@ -1058,6 +1169,8 @@ descriptor，并根据 `process_mode` 返回正确 Channel 实例和驱动接口
 - [ ] 验证签名、TwiML、token、ConversationRelay WebSocket 文本消息、断线和旧 generation
   fencing、endpoint 切换、有界背压和结果不明确的发送；不把当前 Voice 标记为 raw media
   pipe 使用者。
+- [ ] 产出 Voice/Twilio 独立 Channel artifact/Catalog record，并证明 Core 发布包不再携带
+  Voice 平台代码或 `twilio`。
 
 验收：Voice/Twilio 的 Runner-owned Webhook、ConversationRelay 文本会话、依赖隔离、
 endpoint 切换和故障矩阵达到发布标准；Core-owned 兼容实现仅按独立 ADR 验收。
@@ -1121,6 +1234,8 @@ endpoint 切换和故障矩阵达到发布标准；Core-owned 兼容实现仅按
   身份不跨发送者合并。
 - [ ] Console 及明确保留 `process_mode=in_process` 的 Channel 行为和 Catalog 状态无回归。
 - [ ] Core Channel、runner-process Channel 和 legacy Plugin Channel 混合运行无回归。
+- [ ] 所有 `runner_process` 官方 Channel 均从独立 artifact 安装和启动；QwenPaw 主发布包
+  不包含其业务代码，artifact 更新与 environment 更新可独立发生。
 
 ## 11. Phase 5：Isolated Plugin SDK 和 Legacy 迁移
 
@@ -1130,7 +1245,8 @@ endpoint 切换和故障矩阵达到发布标准；Core-owned 兼容实现仅按
 - [ ] 冻结 isolated Plugin artifact 的完整版本化 config value schema；descriptor
   `config_fields` 只作为该 schema 的 UI 投影，不替代运行时验证。
 - [ ] 定义插件依赖声明、lock、wheel hash 和支持目标。
-- [ ] 定义插件源码不进入 dependency environment 的加载方式。
+- [ ] 复用 CH-1-007 的 artifact staging、`source_revision`、只读 `code_root` 和与 dependency
+  environment 分离的加载方式，不建立 Plugin 专用的第二套代码安装器。
 - [ ] 定义 plugin artifact digest、来源 metadata 和 `code_root` 校验边界；仅复用产品
   已有可信签名链，本期不新建插件 PKI。
 - [ ] 接入 Catalog、installer、repair、doctor 和卸载清理保护。
@@ -1181,6 +1297,8 @@ endpoint 切换和故障矩阵达到发布标准；Core-owned 兼容实现仅按
 - [ ] 保持 `channels.<channel_key>` 配置兼容。
 - [ ] 实现 `channels list/install/repair/verify-env/restart` 的运维语义。环境校验命令命名
   为 `verify-env`，不占用 `doctor`（ADR-029）。
+- [ ] `channels install/repair` 支持选择本次 Python 依赖下载源并可更新全局默认；输出必须
+  区分 Channel artifact 下载与 Python wheel 下载，不允许把两个来源合并为一个参数。
 - [ ] 保持既有 `channels list`、`channels config`、`channels send` 兼容：`list` 输出兼容；
   `config` 的显示名和 `config_fields` 可表达的 projection 按 Design §11.1 收敛到 descriptor，
   未投影的 array/object/float 等字段继续从完整 Pydantic/JSON Schema（Plugin 为 artifact
@@ -1197,26 +1315,37 @@ endpoint 切换和故障矩阵达到发布标准；Core-owned 兼容实现仅按
 
 ### CH-6-002：API、Catalog 和状态模型
 
-- [ ] 实现静态 descriptor Catalog 和 install/instance/platform 三维状态。
-- [ ] 展示 source/process 分类、派生驱动接口以及 install、instance、platform 和 repair
-  状态。
+- [ ] 实现 artifact record + 静态 descriptor Catalog，以及 artifact/environment/instance/
+  platform 四维状态。
+- [ ] 展示 source/process 分类、发行版本、`source_revision`、派生驱动接口以及 artifact、
+  environment、instance、platform 和 repair 状态。
+- [ ] 提供 Python 依赖下载源的全局默认读取/更新和单次 operation override API；自定义源
+  认证只接受/返回 secret reference，不回显凭证。
 - [ ] 保持现有按 `channel_key` 的单实例 API 兼容适配。
 - [ ] 不通过 import 成功与否判断 Channel 是否存在。
 
 ### CH-6-003：Console 和文档
 
-- [ ] Channel 列表以 descriptor 为事实来源。
-- [ ] 明确 source/process 分类、派生驱动接口、legacy 标识、未安装和 repair_required
-  状态。
+- [ ] Channel 列表以 artifact record 枚举未安装官方 Channel，以已验证 descriptor 展示安装后
+  执行契约；不得通过 import 判断存在性。
+- [ ] 明确 source/process 分类、派生驱动接口、legacy 标识、artifact 未安装、environment
+  未安装和 repair_required 状态。
+- [ ] 安装/repair 弹窗提供名称为“Python 依赖下载源”的下拉：默认阿里云，可选 PyPI 或
+  自定义源；允许保存为全局默认或只覆盖本次操作。缺 wheel 时提示切换，不自动 fallback。
+- [ ] 自定义源认证信息使用 secret 输入与 reference；页面、operation 详情、日志和错误信息
+  不显示凭证。Channel artifact 官方下载地址不出现在该下拉中。
 - [ ] 现有配置字段、ACL、streaming 和文档链接保持兼容。
 
 ### CH-6-004：安装形态发布验证
 
 - [ ] 验证 Desktop bundled Python、pip/source/conda 和 container。
-- [ ] 验证源码定位、发布物只读 `code_root`、source/editable 显式仓库根、基础解释器
-  选择和 venv 创建语义。
+- [ ] 验证 Runner support artifact 定位、Channel artifact 只读 `code_root`、
+  source/editable Channel 显式仓库根、基础解释器选择和 venv 创建语义。
 - [ ] 验证各安装形态不继承主环境 site-packages、user site 或 `PYTHONPATH`。
-- [ ] 验证安装包、离线 wheel 缓存和首次环境准备流程。
+- [ ] 验证 QwenPaw 主安装包不携带 `runner_process` 官方 Channel 业务代码，并验证独立
+  Channel artifact 下载、摘要、只读发布、升级和首次环境准备流程。
+- [ ] 验证离线/Desktop bundle 只预置 artifact/wheel cache，不以预建 venv 替代标准本地
+  environment 创建和完整性校验。
 
 验收：四种安装形态使用相同的 descriptor、lock、manifest、environment 和 Runner
 协议语义，差异仅限基础解释器及发布物定位。
@@ -1282,6 +1411,8 @@ endpoint 切换和故障矩阵达到发布标准；Core-owned 兼容实现仅按
 ### G6 Gate
 
 - [ ] 相关平台和安装形态通过发布验证。
+- [ ] 官方 Channel artifact 可独立安装和更新，Python 依赖源选择、凭证脱敏、缺 wheel
+  不 fallback 和可选离线 cache 行为通过发布验证。
 - [ ] Design §11.1 的 per-channel 硬编码表已按归属收敛，descriptor 漏配可被校验发现，
   Core 通用编排层不保留按 `channel_key` 的行为分支。
 - [ ] bot 身份查重不依赖存活探测且不回显 secret；`channels verify-env` 与 `qwenpaw doctor`
@@ -1339,12 +1470,14 @@ endpoint 切换和故障矩阵达到发布标准；Core-owned 兼容实现仅按
 | CH-0-007 | Channel 隔离 - CH-0-007 飞书主动连接原型 |
 | CH-0-008 | Channel 隔离 - CH-0-008 OneBot ingress 原型 |
 | CH-0-009 | Channel 隔离 - CH-0-009 Voice/Twilio ingress 原型 |
+| CH-0-010 | Channel 隔离 - CH-0-010 独立 Channel Artifact 增量 |
 | CH-1-001 | Channel 隔离 - CH-1-001 Lock 制品 |
 | CH-1-002 | Channel 隔离 - CH-1-002 Environment Spec 与校验 |
 | CH-1-003 | Channel 隔离 - CH-1-003 Environment Installer |
 | CH-1-004 | Channel 隔离 - CH-1-004 Environment Repair 与 Doctor |
 | CH-1-005 | Channel 隔离 - CH-1-005 跨平台解释器策略 |
 | CH-1-006 | Channel 隔离 - CH-1-006 RunnerSpec 与 Bootstrap |
+| CH-1-007 | Channel 隔离 - CH-1-007 Channel Artifact Installer |
 | CH-2-001 | Channel 隔离 - CH-2-001 Runner Spawn 与 IPC I/O |
 | CH-2-002 | Channel 隔离 - CH-2-002 进程监督与故障恢复 |
 | CH-2-003 | Channel 隔离 - CH-2-003 Generation 与 Lease |
