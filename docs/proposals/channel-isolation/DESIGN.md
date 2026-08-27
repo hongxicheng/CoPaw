@@ -506,11 +506,13 @@ v1 只允许一个 Header：`Content-Length`。Header 大小、帧大小、读�
 
 - 使用 JSON-RPC 2.0 request、response 和 notification；
 - request 的 `id` 为字符串或整数，不使用 null；
-- 与正常 request 关联的 response 继续使用同一个字符串或整数 `id`；只有 parse error
-  无法恢复 request ID 时，error response 才按 JSON-RPC 2.0 使用 `id=null`。`id=null`
-  的 error 不得匹配任何 pending request，success response 不得使用 `id=null`；
+- 与正常 request 关联的 response 继续使用同一个字符串或整数 `id`；parse error，或
+  Invalid Request 无法恢复合法字符串/整数 ID 时，error response 按 JSON-RPC 2.0 使用
+  `id=null`。`id=null` 的 error 不得匹配任何 pending request，success response 不得使用
+  `id=null`；request 自身携带 `id=null` 属于 Invalid Request；
 - 一个 request 只能有一个 response；
-- notification 不需要 response，不用于要求可靠 ACK 的事件；
+- 合法 notification 不产生 response；其方法不存在或业务 params 无效时同样不响应，且
+  notification 不用于要求可靠 ACK 的事件；
 - 方法名使用 `runner.*`、`channel.*`、`event.*`、`delivery.*`、`ingress.*`、
   `host.*` 和 `request.*` 命名空间；
 - 错误使用稳定的 `code`、`message` 和可选 `data`；
@@ -519,6 +521,26 @@ v1 只允许一个 Header：`Content-Length`。Header 大小、帧大小、读�
 - reader loop 只负责解帧、校验和分派，不能等待业务 handler 完成；双向 request handler
   可以发起反向 request，dispatcher 必须持续读取并匹配 response，避免嵌套调用死锁；
 - 读写超时、最大帧、队列上限和 backpressure 必须可配置但有安全默认值。
+
+JSON-RPC conformance 固定为：无法解析 JSON 使用 `-32700 Parse error`；可以解析 JSON 但
+envelope 不合法使用 `-32600 Invalid Request`；只有 envelope 已识别为合法 request，且方法
+存在但其业务 params 不满足对应 DTO 时才使用 `-32602 Invalid params`。未知 request 方法
+使用 `-32601 Method not found`。Malformed envelope 即使看似没有 ID 也不是合法
+notification，必须返回 `id=null` 的 Invalid Request。第三方 Channel SDK 的一致性测试必须
+复用同一组官方 conformance vectors，不得自行重分类。
+
+每个 `RpcPeer` 分别限制本端等待 response 的 pending request、远端入站 request handler 和
+普通 notification handler 数量。达到入站 request 上限时不得启动 handler，返回
+`-32021`/`RPC_BACKPRESSURE`，并标记 `retryable=true`；合法 notification 仍不返回 response，
+达到 notification 上限时不启动 handler，增加可观测的丢弃/过载计数。`request.cancel` 是
+解除容量的控制 notification，必须在 reader 分派路径内直接处理且不占普通 notification
+容量。所有已启动 notification task 必须被跟踪，并在 peer 关闭时有界取消和回收。
+
+同一连接内仍在执行的 request ID 是唯一键。重复 ID 必须在启动第二个 handler 前以
+`-32020`/`RPC_REQUEST_ID_IN_USE` 稳定拒绝，不得覆盖原 task、执行第二次业务副作用或产生
+第二个成功 response。request 完成 callback 只有在 `_incoming[id]` 仍指向自己的 task 时才
+能删除索引；`request.cancel` 始终定位当前唯一 owner。ID 在原 request 完成并从索引移除后
+可以被对端再次使用，但每次可能产生平台副作用的业务 request 仍受自己的幂等 ID 规则约束。
 
 ### 7.3 最小方法集合
 
@@ -575,6 +597,21 @@ request.cancel     Either side notification
 - 每个可能产生平台副作用的 request 使用新的 `delivery_id`；update/delta/end 通过
   `target_delivery_id` 引用先前的 `stream.start`。平台 message/card ID 只保存在 Runner，
   不进入 Core wire DTO。
+
+OutboundDeliveryLedger 的状态转换固定为：
+
+```text
+absent -> requested                         Core 创建
+requested -> sending                       Runner 开始 attempt
+requested|sending -> acknowledged|failed|timeout|unknown
+```
+
+相同状态的重复 update 幂等成功；`acknowledged`、`failed`、`timeout` 和 `unknown` 全部是
+不可变终态，任何从终态到其他状态的 update 都返回 `DELIVERY_STATE_CONFLICT` 并保留原状态。
+`timeout` 只表示已确定没有产生平台副作用的超时；只要平台结果可能迟到或无法确认，就必须
+使用 `unknown`。重试必须创建新的 `delivery_id`，不得让 `failed`/`timeout` 回到
+`requested`/`sending`，v1 不增加 `retry_of` wire 字段。Core 是 `requested` 的唯一创建者；
+Runner 的 `delivery.update` 只允许 `sending` 或终态。
 
 `channel.send` 和 `channel.reaction` 使用相同的 closed result object，只包含
 `delivery_id`、`state=acknowledged|failed|timeout|unknown`、可选稳定 `reason_code` 和
@@ -730,15 +767,30 @@ target、stream type 不一致、sequence 跳跃或结束后更新返回
 `OUTBOUND_ORDER_VIOLATION`。所有出站操作还必须通过 active generation、有效 lease 和
 identity fencing。
 
-`runner.hello` 必须包含：`protocol_min/max`、`qwenpaw_version`、`channel_key`、
+`runner.hello` 必须包含：单一 `protocol_version`、`qwenpaw_version`、`channel_key`、
 `instance_id`、`source_revision`、`environment_spec_id`、`environment_id`、
 `lock_sha256`、Python ABI、platform tag 和 capability 声明。`source_revision` 是已安装
 Channel `code_root` 的 64 个小写 hex SHA-256，必须等于 RunnerSpec 和本地 artifact
 manifest 中的预期值；它不是下载 URL、发行版本、下载 archive digest 或
 `descriptor_sha256`。该字段由可信 bootstrap/Runner protocol host 从已验证 launch manifest
-构造，`ChannelDriver` 不能传入、覆盖或自行声明。Core 在 hello 阶段校验实际代码和
-environment 身份，任一不匹配都拒绝激活；源码不匹配使用稳定 reason code
-`SOURCE_REVISION_MISMATCH`。
+构造，`ChannelDriver` 不能传入、覆盖或自行声明。Core 为候选 generation 从当前 Core
+build、RunnerSpec、artifact manifest、environment spec/install manifest 和所选 release
+target 保存全部预期值；hello 对应字段必须逐项精确相等。`qwenpaw_version` 表示提供可信
+Runner support artifact/Protocol SDK 的 QwenPaw 版本，必须等于 Core 版本；lock、Python
+ABI 和 platform tag 不是诊断性自报字段。任一不匹配都在 prepare/activate 前拒绝；分别使用
+`PROTOCOL_MISMATCH`、`QWENPAW_VERSION_MISMATCH`、`SOURCE_REVISION_MISMATCH`、
+`ENVIRONMENT_SPEC_MISMATCH`、`ENVIRONMENT_ID_MISMATCH`、`LOCK_MISMATCH`、
+`PYTHON_ABI_MISMATCH` 和 `PLATFORM_TAG_MISMATCH`。可信 bootstrap/protocol host 从已验证
+manifest 和实际解释器构造这些字段，`ChannelDriver` 无权传入或覆盖。
+
+Core 和 Runner 不在同一连接上兼容多个 wire protocol 版本。双方只声明一个
+`protocol_version`，必须完全相等；不保存版本范围，不按 negotiated version 注册多套
+method/DTO schema。所有 wire DTO 保持 closed object，未知字段稳定拒绝。任何方法、字段或
+既有字段语义变化必须同步修改 Core、Runner、Protocol SDK 和一致性测试。当前 Phase 0
+source-level prototype 尚未发布，本轮修订直接定稿为 `protocol_version=1`；G0 重新通过并
+冻结 v1 后，任何 wire 变化都必须递增唯一 `protocol_version`。Channel artifact 的
+QwenPaw/Protocol 兼容范围在安装和启动前校验，不能用运行时降级代替。capability
+intersection 只协商当前同一协议版本下的可选 Channel 能力，不承担协议版本兼容。
 
 ### 7.4 Envelope、状态机和错误码
 
@@ -840,7 +892,13 @@ provisional lease 不单列为生命周期状态；Runner 在收到 `channel.com
 
 ```text
 PROTOCOL_MISMATCH
+QWENPAW_VERSION_MISMATCH
 SOURCE_REVISION_MISMATCH
+ENVIRONMENT_SPEC_MISMATCH
+ENVIRONMENT_ID_MISMATCH
+LOCK_MISMATCH
+PYTHON_ABI_MISMATCH
+PLATFORM_TAG_MISMATCH
 AUTH_FAILED
 CONFIG_INVALID
 DEPENDENCY_MISSING
@@ -864,11 +922,14 @@ SECRET_HANDLE_CONSUMED
 INGRESS_CONNECTION_UNKNOWN
 INGRESS_ORDER_VIOLATION
 INGRESS_BACKPRESSURE
+RPC_REQUEST_ID_IN_USE
+RPC_BACKPRESSURE
+DELIVERY_STATE_CONFLICT
 ```
 
 协议 v1 必须定义 JSON Schema、未知方法处理、lease renewal、timeout、cancel、最大帧、
-最大并发、backpressure 和重连规则。新增字段允许旧端忽略；改变已有字段语义必须
-提升协议主版本。
+最大并发、backpressure 和重连规则。DTO 是 closed object，不允许旧端忽略新增字段；任何
+G0 冻结后的 wire schema 变化都同步更新两端源码并提升唯一 `protocol_version`。
 
 ### 7.5 Runner-owned ingress 与 Voice/Twilio 目标闭环
 
@@ -2226,8 +2287,9 @@ Console Channel 是 Core 内部控制面入口，明确保留 `process_mode=in_p
 
 ### 测试矩阵
 
-至少覆盖：协议编解码、半帧/粘包/非法 Header/EOF、握手和版本协商、错误码、环境 ID、
-lock hash、状态机、Inbox/Delivery 去重、unknown、配置下发、Runner 崩溃、日志堵塞、
+至少覆盖：协议编解码、半帧/粘包/非法 Header/EOF、握手和协议版本精确匹配、JSON-RPC
+conformance、入站并发/重复 request ID、错误码、环境 ID、lock hash、状态机、
+Inbox/Delivery 去重和终态冲突、unknown、配置下发、Runner 崩溃、日志堵塞、
 standby 禁止消费、旧 generation fencing、媒体路径/URL 双向传递、入站下载目录和文件
 完整发布、跨平台路径解析、Polling checkpoint、Voice Webhook、一次性 token、
 ConversationRelay 文本 WebSocket 的顺序/背压/关闭、Runner-owned endpoint 注册与
@@ -2286,3 +2348,6 @@ SDK shadowing、并发 artifact/environment 安装、磁盘不足、所选依赖
 | ADR-039 | `runner_process` 官方 Channel 代码不随 QwenPaw 主安装包发布，作为独立、可校验的 Channel artifact 安装；`source_kind=builtin` 继续表示官方所有权而非物理打包。artifact 与 dependency environment 分离，代码变化但 lock/ABI/platform/condition 不变时复用 environment；Catalog record 和本地 artifact manifest 持有发行版本、来源与摘要，v1 descriptor 不新增自指的官方下载字段 | 已确认；替代 ADR-001 |
 | ADR-040 | QwenPaw 提供独立的可信 Runner support artifact（bootstrap + Protocol SDK）；Channel `code_root` 只包含 descriptor、Driver 和平台代码，不能提供或覆盖 Protocol SDK。`runner.hello` 必须携带并由 Core 校验 64-hex `source_revision`，不匹配时以 `SOURCE_REVISION_MISMATCH` 拒绝激活 | 已确认 |
 | ADR-041 | 核心 environment 安装模型按精确 lock 从用户选择的 Python 依赖源下载 hash 匹配的 wheel 并本地创建 venv，不分发预建 venv。全局默认源为阿里云，可选 PyPI 或自定义源并允许单次覆盖；缺 wheel 明确失败且不静默 fallback、不重新解析版本、不构建 sdist，自定义源凭证只进入 secret store。离线/Desktop bundle 仅是可选缓存优化 | 已确认 |
+| ADR-042 | Core 和 Runner 只使用一个完全相等的 `protocol_version`，不做版本范围协商或多版本 schema dispatcher。所有 wire DTO 为 closed object；当前未发布的 Phase 0 原型修订直接定稿为 v1，G0 冻结后任何方法、字段或语义变化必须同步更新 Core、Runner、Protocol SDK 和一致性测试并递增版本。capability 只协商同版本内的可选能力 | 已确认 |
+| ADR-043 | `RpcPeer` 分别限制本地 pending、入站 request 和普通 notification；`request.cancel` 直接处理且不占 notification 容量。执行中的 request ID 不得覆盖，重复 ID 和入站过载分别使用稳定 server error；task cleanup 必须核对 owner。JSON-RPC conformance 固定区分 parse error、invalid request、invalid params 和合法 notification 无响应 | 已确认 |
+| ADR-044 | 每个可能产生平台副作用的 attempt 使用不可变 `delivery_id`。Ledger 只允许 `absent→requested→sending→terminal` 的单向转换，允许从 requested 直接进入终态；四个终态均不可变，结果不确定必须使用 unknown，重试必须创建新 ID，v1 不增加 `retry_of` | 已确认 |

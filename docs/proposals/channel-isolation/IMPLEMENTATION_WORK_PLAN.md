@@ -116,7 +116,7 @@
 
 | 阶段 | 内容 | 状态 | Gate |
 | --- | --- | --- | --- |
-| Phase 0 | 边界、协议和纵向原型 | 增量修订待验收 | G0（原 Gate 已通过，artifact 增量待复验） |
+| Phase 0 | 边界、协议和纵向原型 | 协议与 artifact 修订待验收 | G0（原 Gate 已通过，增量待复验） |
 | Phase 1 | Lock、Channel artifact、环境和 Runner bootstrap | 未开始 | G1 |
 | Phase 2 | 进程监督、Core 适配和 Catalog | 未开始 | G2 |
 | Phase 3 | 可靠投递、媒体和切换恢复 | 未开始 | G3 |
@@ -128,13 +128,16 @@
 
 - Gate 严格按 `G0 -> G1 -> G2 -> G3 -> G4 -> G5 -> G6` 推进；前一 Gate 未通过，
   后一阶段不得进入正式实施。架构变化使已通过 Gate 的结论失效时，必须完成对应增量
-  任务和独立复验；本次 `CH-0-010` 通过前不得进入 Phase 1。
+  任务和独立复验；本次 `CH-0-004`、`CH-0-005` 修复与 `CH-0-010` 通过前不得进入
+  Phase 1。
 - 同一 Phase 默认按任务编号顺序执行。只有依赖图明确独立且用户批准时才可并行；并行
   必须使用独立工作树/分支，并先确认文件归属，多个实施 Chat 不得共享同一工作树。
 - Phase 0 中 `CH-0-003` 完成 framing，`CH-0-004` 才构建 JSON-RPC；`CH-0-005`
-  依赖前两者；`CH-0-007` 至 `CH-0-009` 依赖 `CH-0-001` 至 `CH-0-006`。
-- `CH-0-010` 依赖已完成的 `CH-0-002`、`CH-0-004` 和 `CH-0-006`，只实现独立
-  Channel artifact 对 hello/bootstrap 原型造成的增量，不重新打开其他 G0 任务。
+  依赖前两者；`CH-0-007` 至 `CH-0-009` 依赖 `CH-0-001` 至 `CH-0-006`。当前新证据要求
+  先完成 `CH-0-004` 协议修复，再完成 `CH-0-005` Delivery 修复。
+- `CH-0-010` 依赖 `CH-0-002`、修复后的 `CH-0-004` 和 `CH-0-006`，只实现独立
+  Channel artifact 对 hello/bootstrap 原型造成的增量；不得夹带 `CH-0-004`/`CH-0-005`
+  的协议修复。
 - Phase 1 中 installer 依赖 lock 和 spec；repair/doctor 依赖 installer；RunnerSpec 同时
   依赖 `CH-0-010` 的 bootstrap 结论和跨平台解释器策略；Channel artifact installer
   依赖 artifact release record，但与 dependency environment 原子发布保持独立。
@@ -323,7 +326,32 @@ descriptor validator 和聚焦单测机械验证；ADR-035/036 已确认。独�
 
 ### CH-0-004：JSON-RPC 2.0、Schema 和生命周期
 
-- 状态：[x] 共享 response route discard 收敛修复完成，独立 Review 通过
+- 状态：[~] 原独立 Review 已通过；新协议审查发现入站准入、版本、hello 校验和
+  JSON-RPC conformance 缺口，待修复和重新 Review
+
+本轮只处理以下新审查问题，不重新打开已通过的 response lifecycle、generation authority
+或平台原型设计：
+
+- [ ] 将 `runner.hello` 的 `protocol_min/max` 收敛为单一必填 `protocol_version`，Core 与
+  Runner 必须完全相等；DTO 保持 closed，不实现版本范围协商或多版本 schema dispatcher，
+  capability intersection 继续只表达同版本内的可选能力。本轮未发布原型直接定稿为
+  `protocol_version=1`，G0 冻结后的 wire 变化才递增版本（ADR-042）。
+- [ ] `RpcLimits` 分别限制本地 pending、入站 request 和普通 notification；
+  `request.cancel` 在 reader 路径直接处理且不占 notification 容量，所有 notification task
+  可观测并在关闭时回收；入站 request 过载使用 `-32021`/`RPC_BACKPRESSURE`。
+- [ ] 执行中的重复 request ID 在启动 handler 前使用
+  `-32020`/`RPC_REQUEST_ID_IN_USE` 拒绝；不得覆盖 owner、执行第二次副作用或发送第二个
+  成功 response，done callback 只能删除仍属于自己的索引（ADR-043）。
+- [ ] 补齐 JSON-RPC conformance vectors：parse error `-32700`、envelope invalid
+  `-32600`、已识别方法的 params invalid `-32602`、合法 notification 无响应、无合法 ID 的
+  Invalid Request 使用 `id=null`；本地 pending 过载不得再冒充 Invalid Request。
+- [ ] Core 保存并逐项比较 hello 的预期 `qwenpaw_version`、`environment_spec_id`、
+  `environment_id`、`lock_sha256`、Python ABI 和 platform tag；这些字段不是诊断性自报。
+  `source_revision` 的 DTO/预期值接入仍由 `CH-0-010` 实现，正式 manifest/实际解释器取值
+  接线仍属于 Phase 1/2。
+- [ ] 添加并发洪峰、重复 ID/cancel/owner cleanup、notification shutdown、完全版本匹配、
+  hello 各字段 mismatch 和 JSON-RPC conformance 测试；运行 CH-0-004 聚焦矩阵、完整
+  `tests/unit/channel_isolation`、目标文件 pre-commit 和 `git diff --check`，随后独立 Review。
 
 - [x] 用唯一 Runner route/cleanup aggregate 替换 lifecycle response scope、Driver route
   tombstone 和 Host State 散落状态；本项与 CH-0-007 飞书基础设施做一次垂直迁移。
@@ -361,7 +389,8 @@ descriptor validator 和聚焦单测机械验证；ADR-035/036 已确认。独�
 `149 passed`；完整 `tests/unit/channel_isolation` 为 `348 passed`；CH-0-007 与飞书
 unit/contract 相邻矩阵为 `185 passed, 1 skipped`。目标文件 pre-commit 和
 `git diff --check` 已通过；独立 Review 已通过（用户确认）。真实 Core per-handle
-sequencer 仍由 CH-2-005 实现和验证，不属于本轮修复范围；CH-0-004 状态为 `[x]`。
+sequencer 仍由 CH-2-005 实现和验证，不属于当时修复范围；该段只记录历史 `[x]` 证据，
+当前状态以本节开头的 `[~]` 和新审查 checklist 为准。
 
 - [x] 实现 JSON-RPC 2.0 request、response、notification、error 和 cancel。
 - [x] 实现 pending request 上限、request timeout、未知方法和重复 response 处理。
@@ -380,8 +409,10 @@ sequencer 仍由 CH-2-005 实现和验证，不属于本轮修复范围；CH-0-0
 - [x] 实现持续 reader/dispatcher，使 request handler 可以发起反向 request；禁止在 reader
   loop 内等待业务 handler，覆盖嵌套调用与 response 乱序。
 - [x] 定义 created、preparing、standby、active、quiescing、stopped、failed 状态转换。
-- [x] 实现 protocol version、capability negotiation 和稳定错误码。
-- [x] 校验 `channel_key`、`instance_id`、generation 和 environment identity。
+- [x] 历史原型实现 protocol range、capability negotiation 和稳定错误码；range negotiation
+  不作为当前完成证据，必须由本轮 ADR-042 精确版本任务替代。
+- [x] 历史原型校验 `channel_key`、`instance_id`、generation、`environment_spec_id` 和
+  `environment_id`；其余 hello 预期值校验仍以本轮未完成 checklist 为准。
 - [x] 冻结并实现 `channel.send` 的 message create/update、stream start/delta/end 和
   approval card 平台无关 DTO，以及 `channel.reaction` 的 completed reaction DTO；不得
   新增 Design §7.3 之外的 RPC 方法。
@@ -545,12 +576,22 @@ CH-0-007 与飞书 unit/contract 相邻矩阵为 `185 passed, 1 skipped`。改�
 （包含 mypy、black、flake8 和 pylint）通过，`git diff --check` 通过。未运行全仓测试和
 真实 Windows/Linux/macOS 跨进程测试。独立 Review 已通过（用户确认）；最终修复提交为
 `d790fe82`。该结论随后因 response lifecycle 的重复 Runner 状态源被重新打开；当前重构已
-收敛唯一 Runner aggregate 并通过独立 Review，最终状态以本节开头的 `[x]` 和当前验证证据
-为准。真实 Core per-handle sequencer 保持为 CH-2-005 的独立任务。
+收敛唯一 Runner aggregate 并通过独立 Review；该结论不覆盖本轮新发现的协议缺口，当前
+状态以本节开头的 `[~]` 为准。真实 Core per-handle sequencer 保持为 CH-2-005 的独立任务。
 
 ### CH-0-005：可靠事件、ACK 和幂等原型
 
-- 状态：[x] 独立 Review 和最终验证通过
+- 状态：[~] 原独立 Review 已通过；新证据发现 Delivery 转换允许终态重入，待修复和
+  重新 Review
+
+- [ ] 按 ADR-044 实现 `absent -> requested -> sending -> terminal` 单向状态机，允许从
+  `requested` 直接进入终态和相同状态幂等重复；`acknowledged`、`failed`、`timeout`、
+  `unknown` 全部不可变，冲突 update 返回 `DELIVERY_STATE_CONFLICT` 并保留原状态。
+- [ ] Core 是 `requested` 的唯一创建者，Runner `delivery.update` 只接受 `sending` 或终态；
+  结果可能迟到或不确定时必须使用 `unknown`，重试使用新 `delivery_id`，v1 不添加
+  `retry_of`。补齐完整转换表、late ACK、终态冲突、快路径直接终态和重启恢复测试，并运行
+  CH-0-005 聚焦测试、完整 `tests/unit/channel_isolation`、目标文件 pre-commit、
+  `git diff --check` 及独立 Review。
 
 - [x] 定义 `event.batch`、`batch_id`、稳定 `event_id` 和
   accepted/duplicate/rejected ACK；rejected 带 reason code 与 `retryable`。
@@ -787,9 +828,9 @@ Voice unit/contract/integration 当前 `58 passed`；目标文件 pre-commit 全
 - 状态：[ ] 未开始
 
 本任务只修订独立 Channel artifact 对已完成 CH-0-004/CH-0-006 原型造成的协议和启动
-边界变化。直接依赖为 `CH-0-002`、`CH-0-004`、`CH-0-006`；对应 Design §6.1、§6.4、
-§7.3、§10.3、§13.4 和 ADR-039 至 ADR-041。原任务的历史状态保持 `[x]`，本任务提供
-架构变化后的唯一增量实现和 Review 记录。
+边界变化。直接依赖为 `CH-0-002`、修复并重新 Review 后的 `CH-0-004`、`CH-0-006`；
+对应 Design §6.1、§6.4、§7.3、§10.3、§13.4 和 ADR-039 至 ADR-041。本任务提供 artifact
+架构变化的唯一增量实现和 Review 记录，不承载 ADR-042 至 ADR-044 的协议修复。
 
 - [ ] 在 closed `runner.hello` DTO 中增加必填 `source_revision`；Core controller 保存
   RunnerSpec/artifact manifest 的预期值并在任何 prepare/activate 前校验，不匹配返回
@@ -815,17 +856,21 @@ environment installer、Console 弹窗或正式 Channel 打包。
 
 ### G0 Gate
 
-- 状态：[~] 原 Gate 已通过；ADR-039 至 ADR-041 的 artifact 增量待独立复验，暂不允许进入
-  Phase 1
+- 状态：[~] 原 Gate 已通过；ADR-042 至 ADR-044 的 CH-0-004/CH-0-005 协议修复和
+  ADR-039 至 ADR-041 的 artifact 增量待独立复验，暂不允许进入 Phase 1
 
-- [x] 职责、descriptor、stdio framing、JSON-RPC、可靠投递、媒体和 Runner-owned Voice
+- [~] 职责、descriptor、stdio framing、JSON-RPC、可靠投递、媒体和 Runner-owned Voice
   ingress 边界冻结；如需 Core-owned 兼容入口，必须有独立 ADR。
 - [x] CH-0-002 的 canonical encoder、ID/目录键模型和 descriptor v1 validator 已通过聚焦
   单测与独立 Review；目标平台运行同一固定 hash 向量得到一致结果。
 - [x] 飞书、OneBot、Voice/Twilio 三条纵向原型分别通过。
+- [ ] CH-0-004 的精确协议版本、RPC 入站准入/重复 ID、hello 环境证明和 JSON-RPC
+  conformance 已通过独立 Review 及 Linux、macOS、Windows 测试。
+- [ ] CH-0-005 的不可变 Delivery 状态转换已通过独立 Review 及 Linux、macOS、Windows
+  测试。
 - [ ] CH-0-010 的 hello source identity、Runner support artifact/Channel `code_root` 分离
-  已通过独立 Review及 Linux、macOS、Windows 增量测试。
-- [ ] 架构增量无阻塞当前 Phase 的 P0/P1。
+  已通过独立 Review 及 Linux、macOS、Windows 增量测试。
+- [ ] 协议修复和架构增量无阻塞当前 Phase 的 P0/P1。
 
 验收证据：`8ad95d75` 的 GitHub Actions `Channel Isolation G0 Gate` 运行
 [`32863688912`](https://github.com/hongxicheng/QwenPaw/actions/runs/32863688912)
@@ -835,8 +880,9 @@ environment installer、Console 弹窗或正式 Channel 打包。
 `git diff --check` 通过。独立 Gate 验收未发现阻塞 Phase 0 的 P0/P1，跨平台 CI 补证后
 全部强制项证据充分。G0 只验收源码级原型和协议边界；Desktop bundled Python、完整安装
 形态以及 OS/Python ABI/架构发布矩阵仍分别由 `CH-6-004`、`CH-6-005` 验收，不在本 Gate
-提前标记完成。上述证据是 ADR-039 至 ADR-041 之前的历史基线，不证明独立 artifact
-增量；CH-0-010 Review 和跨平台增量验证通过后，必须在本节更新唯一当前证据并恢复 `[x]`。
+提前标记完成。上述证据是 ADR-039 至 ADR-044 以及本轮协议问题之前的历史基线，不证明
+当前协议修复或独立 artifact 增量；CH-0-004、CH-0-005、CH-0-010 的 Review 和跨平台增量
+验证全部通过后，必须在本节更新唯一当前证据并恢复 `[x]`。
 
 ## 7. Phase 1：Lock、Channel Artifact、Environment 和 Bootstrap
 
@@ -1450,7 +1496,7 @@ endpoint 切换和故障矩阵达到发布标准；Core-owned 兼容实现仅按
 | Runner-owned Voice ingress 切换或乱序 | endpoint readiness、generation fencing、有界队列、sequence、deadline、过载关闭和排空 |
 | 未来需要原始媒体跨进程 | 单独设计版本化二进制数据面；不得把字节塞入 JSON 或提前绑定当前 Voice |
 | legacy 插件回归 | legacy 保持原注册和 BaseChannel，隔离迁移选择性执行 |
-| Core/Runner 协议升级 | protocol version、capability negotiation 和兼容矩阵 |
+| Core/Runner 协议升级 | 单一 `protocol_version` 精确匹配；两端源码、Protocol SDK 和一致性测试同步升级；capability 只协商同版本可选能力 |
 | 未声明的传递依赖在隔离环境缺失 | 逐 Channel 核对实际 import 与 pyproject 声明的差集；`aiohttp`、`fastapi` 必须显式进 lock |
 | 仅靠环境变量的平台端点覆盖静默失效 | descriptor 声明透传白名单，`minimal_env` 按白名单构造并回归验证 |
 | Core 侧遗留平台入口被误认为已隔离 | Voice 完成定义包含删除 Core 路由与 `twilio` 依赖；扫码登录作为登记例外单独约束 |
