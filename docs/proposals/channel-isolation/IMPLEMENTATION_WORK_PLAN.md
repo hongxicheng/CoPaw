@@ -2,8 +2,7 @@
 
 ## 1. 文档信息
 
-- 状态：实施中（Phase 0 原 G0 已通过；独立 Channel artifact 架构增量
-  `CH-0-010` 待跨平台最终验证，Phase 1 尚未开始）
+- 状态：实施中（Phase 0 G0 已通过增量复验；Phase 1 可开始但尚未实施）
 - 对应设计：`DESIGN.md`
 - 目标：按设计完成 Channel 的环境隔离、进程隔离、stdio IPC、可靠投递和迁移
 - 当前产品约束：每个 Agent 每种 `channel_key` 保持一个用户可见实例
@@ -116,7 +115,7 @@
 
 | 阶段 | 内容 | 状态 | Gate |
 | --- | --- | --- | --- |
-| Phase 0 | 边界、协议和纵向原型 | 协议与 artifact 修订待验收 | G0（原 Gate 已通过，增量待复验） |
+| Phase 0 | 边界、协议和纵向原型 | 已完成 | G0 已通过 |
 | Phase 1 | Lock、Channel artifact、环境和 Runner bootstrap | 未开始 | G1 |
 | Phase 2 | 进程监督、Core 适配和 Catalog | 未开始 | G2 |
 | Phase 3 | 可靠投递、媒体和切换恢复 | 未开始 | G3 |
@@ -128,8 +127,8 @@
 
 - Gate 严格按 `G0 -> G1 -> G2 -> G3 -> G4 -> G5 -> G6` 推进；前一 Gate 未通过，
   后一阶段不得进入正式实施。架构变化使已通过 Gate 的结论失效时，必须完成对应增量
-  任务和独立复验；本次 `CH-0-004`、`CH-0-005` 修复与 `CH-0-010` 通过前不得进入
-  Phase 1。
+  任务和独立复验；本次 `CH-0-004`、`CH-0-005` 修复与 `CH-0-010` 已通过增量复验，
+  Phase 1 可以开始。
 - 同一 Phase 默认按任务编号顺序执行。只有依赖图明确独立且用户批准时才可并行；并行
   必须使用独立工作树/分支，并先确认文件归属，多个实施 Chat 不得共享同一工作树。
 - Phase 0 中 `CH-0-003` 完成 framing，`CH-0-004` 才构建 JSON-RPC；`CH-0-005`
@@ -363,7 +362,8 @@ descriptor validator 和聚焦单测机械验证；ADR-035/036 已确认。独�
 `tests/unit/channel_isolation` 为 `370 passed`；本地 G0 同范围矩阵为
 `891 passed, 1 skipped`。目标文件 pre-commit 和 `git diff --check` 通过。
 独立 Review 已通过（用户确认），实现提交为 `707dd8cd`。Linux、macOS、Windows
-跨平台增量矩阵尚未执行；CH-0-004 状态为 `[x]`，G0 继续保持 `[~]`。
+跨平台增量矩阵已由 GitHub Actions 运行 `33076832334` 在提交 `c7b0e94c` 上验证；四个平台
+均收集并通过 CH-0-004 的 `170` 个 testcase，零失败、零跳过。
 
 - [x] 用唯一 Runner route/cleanup aggregate 替换 lifecycle response scope、Driver route
   tombstone 和 Host State 散落状态；本项与 CH-0-007 飞书基础设施做一次垂直迁移。
@@ -607,8 +607,9 @@ CH-2-005 的独立任务。
 
 本轮本地实施验证：CH-0-005 与直接相关 Host Adapter 聚焦矩阵 `49 passed`，完整
 `tests/unit/channel_isolation` 为 `389 passed`，目标代码和测试文件 pre-commit 全部通过。
-独立 Review 已通过（用户确认）；正式 Linux、macOS、Windows 增量矩阵尚未执行，任务更新
-为 `[x]`，G0 保持 `[~]`。
+独立 Review 已通过（用户确认）；GitHub Actions 运行 `33076832334` 在 Linux Python
+3.11/3.13、macOS Python 3.11 和 Windows Python 3.11 上均收集并通过 CH-0-005 的 `32` 个
+testcase，零失败、零跳过。
 
 - [x] 定义 `event.batch`、`batch_id`、稳定 `event_id` 和
   accepted/duplicate/rejected ACK；rejected 带 reason code 与 `retryable`。
@@ -842,7 +843,7 @@ Voice unit/contract/integration 当前 `58 passed`；目标文件 pre-commit 全
 
 ### CH-0-010：独立 Channel artifact 协议增量
 
-- 状态：[-] 独立 Review 已通过，等待跨平台最终验证
+- 状态：[x] 独立 Review 和跨平台最终验证通过
 
 本任务只修订独立 Channel artifact 对已完成 CH-0-004/CH-0-006 原型造成的协议和启动
 边界变化。直接依赖为 `CH-0-002`、修复并重新 Review 后的 `CH-0-004`、`CH-0-006`；
@@ -864,7 +865,7 @@ Voice unit/contract/integration 当前 `58 passed`；目标文件 pre-commit 全
   support/code root 分离、Protocol SDK shadowing、source/editable 显式根和现有 stdout、
   stderr、FD/handle 行为无回归。
 - [x] 运行 CH-0-004、CH-0-006、完整 `tests/unit/channel_isolation`、目标文件 pre-commit 和
-  `git diff --check`；独立 Review 通过后仍保持 `[-]`，等待跨平台最终验证。
+  `git diff --check`；独立 Review 和跨平台最终验证均已通过。
 
 本轮本地实施与 P1 修复证据：真实 bootstrap 子进程从已验证 manifest 取得实际
 `code_root` 摘要 A，在加载 Driver 前冻结 hello；外部 launch identity 与 Driver 提供的
@@ -878,8 +879,9 @@ Feishu、OneBot、Voice 三条相邻原型均改为构建包含实际 Driver 代
 并复用该 bootstrap 路径，不再拥有手写 stdio transport、手工 hello 或独立摘要常量。
 CH-0-004 与 CH-0-006 聚焦矩阵 `200 passed`；完整 `tests/unit/channel_isolation` 为
 `400 passed`；三条相邻 wrapper `3 passed`；目标文件 pre-commit 和 `git diff --check`
-通过。独立 Review 已通过（用户确认）；当前仅完成 macOS 本地验证，Linux/Windows 增量测试
-和 G0 复验仍待执行，因此任务保持 `[-]`。
+通过。独立 Review 已通过（用户确认）。GitHub Actions 运行 `33076832334` 在 Linux Python
+3.11/3.13、macOS Python 3.11 和 Windows Python 3.11 上均收集并通过 bootstrap 的 `30` 个
+testcase 及飞书、OneBot、Voice 三条 artifact wrapper，目标范围零失败、零跳过；任务完成。
 
 验收：Runner 只能以 QwenPaw 可信 bootstrap/Protocol SDK 启动已验证的独立 Channel
 `code_root`；Core 能在 hello 阶段证明实际 `source_revision` 与候选 artifact 一致，且代码
@@ -888,33 +890,33 @@ environment installer、Console 弹窗或正式 Channel 打包。
 
 ### G0 Gate
 
-- 状态：[~] 原 Gate 已通过；CH-0-004/CH-0-005 跨平台增量矩阵和
-  ADR-039 至 ADR-041 的 artifact 增量待复验，暂不允许进入 Phase 1
+- 状态：[x] 协议修复和独立 Channel artifact 增量复验通过，允许进入 Phase 1
 
-- [~] 职责、descriptor、stdio framing、JSON-RPC、可靠投递、媒体和 Runner-owned Voice
+- [x] 职责、descriptor、stdio framing、JSON-RPC、可靠投递、媒体和 Runner-owned Voice
   ingress 边界冻结；如需 Core-owned 兼容入口，必须有独立 ADR。
 - [x] CH-0-002 的 canonical encoder、ID/目录键模型和 descriptor v1 validator 已通过聚焦
   单测与独立 Review；目标平台运行同一固定 hash 向量得到一致结果。
 - [x] 飞书、OneBot、Voice/Twilio 三条纵向原型分别通过。
-- [~] CH-0-004 的精确协议版本、RPC 入站准入/重复 ID、hello 环境证明和 JSON-RPC
-  conformance 已通过独立 Review；Linux、macOS、Windows 增量矩阵待执行。
-- [~] CH-0-005 的不可变 Delivery 状态转换已通过独立 Review；Linux、macOS、Windows
-  增量矩阵待执行。
-- [ ] CH-0-010 的 hello source identity、Runner support artifact/Channel `code_root` 分离
-  已通过独立 Review；Linux/Windows 增量测试和 G0 复验待完成。
-- [ ] 协议修复和架构增量无阻塞当前 Phase 的 P0/P1。
+- [x] CH-0-004 的精确协议版本、RPC 入站准入/重复 ID、hello 环境证明和 JSON-RPC
+  conformance 已通过独立 Review 及 Linux、macOS、Windows 增量矩阵。
+- [x] CH-0-005 的不可变 Delivery 状态转换已通过独立 Review 及 Linux、macOS、Windows
+  增量矩阵。
+- [x] CH-0-010 的 hello source identity、Runner support artifact/Channel `code_root` 分离
+  已通过独立 Review 及 Linux、macOS、Windows 增量矩阵。
+- [x] 协议修复和架构增量无阻塞当前 Phase 的 P0/P1。
 
-验收证据：`8ad95d75` 的 GitHub Actions `Channel Isolation G0 Gate` 运行
-[`32863688912`](https://github.com/hongxicheng/QwenPaw/actions/runs/32863688912)
+验收证据：`c7b0e94c` 的 GitHub Actions `Channel Isolation G0 Gate` 运行
+[`33076832334`](https://github.com/hongxicheng/QwenPaw/actions/runs/33076832334)
 已通过；Linux Python 3.11、Linux Python 3.13、macOS Python 3.11 和 Windows Python
-3.11 四个矩阵项分别为 `871 passed, 1 skipped`，最终 `G0 Gate Tests` 为 success。
-本地同范围测试为 `871 passed, 1 skipped`，目标文件 pre-commit 和
-`git diff --check` 通过。独立 Gate 验收未发现阻塞 Phase 0 的 P0/P1，跨平台 CI 补证后
-全部强制项证据充分。G0 只验收源码级原型和协议边界；Desktop bundled Python、完整安装
-形态以及 OS/Python ABI/架构发布矩阵仍分别由 `CH-6-004`、`CH-6-005` 验收，不在本 Gate
-提前标记完成。上述证据是 ADR-039 至 ADR-044 以及本轮协议问题之前的历史基线，不证明
-当前协议修复或独立 artifact 增量；CH-0-004、CH-0-005、CH-0-010 的 Review 和跨平台增量
-验证全部通过后，必须在本节更新唯一当前证据并恢复 `[x]`。
+3.11 四个矩阵项分别为 `921 passed, 1 skipped`，最终 `G0 Gate Tests` 为 success。四份
+JUnit 均收集 `922` 个 testcase；每个平台包含 CH-0-004 的 `170` 个、CH-0-005 的 `32` 个、
+CH-0-010 bootstrap 的 `30` 个及三条 artifact wrapper，目标范围零失败、零跳过。唯一 skip
+是既有 Feishu contract 的 `test_has_token_management`，不属于本轮增量范围。
+
+CH-0-004、CH-0-005、CH-0-010 均已完成独立 Review，当前没有未解决的阻塞 P0/P1；跨平台
+CI 补证后全部强制项证据充分，G0 通过并允许进入 Phase 1。G0 只验收源码级原型和协议边界；
+Desktop bundled Python、完整安装形态以及 OS/Python ABI/架构发布矩阵仍分别由
+`CH-6-004`、`CH-6-005` 验收，不在本 Gate 提前标记完成。
 
 ## 7. Phase 1：Lock、Channel Artifact、Environment 和 Bootstrap
 
