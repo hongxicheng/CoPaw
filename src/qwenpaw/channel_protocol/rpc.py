@@ -14,7 +14,6 @@ from typing import Any
 
 from .errors import (
     ProtocolValidationError,
-    RpcCancelledError,
     RpcClosedError,
     RpcError,
     RpcTimeoutError,
@@ -37,6 +36,9 @@ JSONRPC_INVALID_REQUEST = -32600
 JSONRPC_METHOD_NOT_FOUND = -32601
 JSONRPC_INVALID_PARAMS = -32602
 JSONRPC_INTERNAL_ERROR = -32603
+RPC_REQUEST_ID_IN_USE = -32020
+RPC_BACKPRESSURE = -32021
+_TASK_SHUTDOWN_TIMEOUT = 0.1
 
 
 def _reject_non_finite(value: str) -> object:
@@ -54,20 +56,18 @@ def _strict_json_dumps(value: object) -> str:
     )
 
 
-def _recover_request_id(
-    raw: str,
-) -> tuple[bool, str | int | None] | None:
-    """Recover request-ID presence from a loosely parsed JSON object."""
-    try:
-        value = json.loads(raw)
-    except (json.JSONDecodeError, TypeError, ValueError):
-        return None
+def _valid_request_id(value: object) -> str | int | None:
+    """Return a valid request ID from a malformed JSON-RPC envelope."""
     if not isinstance(value, Mapping) or "id" not in value:
-        return (False, None)
+        return None
     request_id = value["id"]
-    if isinstance(request_id, (str, int)) and not isinstance(request_id, bool):
-        return True, request_id
-    return True, None
+    if (
+        isinstance(request_id, (str, int))
+        and not isinstance(request_id, bool)
+        and request_id != ""
+    ):
+        return request_id
+    return None
 
 
 RequestHandler = Callable[[Any, RpcRequest], Any]
@@ -97,16 +97,24 @@ class RpcLimits:
     """Limits for one JSON-RPC peer."""
 
     max_pending_requests: int = 64
+    max_incoming_requests: int = 64
+    max_notification_tasks: int = 64
     request_timeout: float = 30.0
 
     def __post_init__(self) -> None:
         """Reject disabled or invalid RPC limits."""
-        if (
-            not isinstance(self.max_pending_requests, int)
-            or isinstance(self.max_pending_requests, bool)
-            or self.max_pending_requests <= 0
+        for name in (
+            "max_pending_requests",
+            "max_incoming_requests",
+            "max_notification_tasks",
         ):
-            raise ValueError("max_pending_requests must be positive")
+            value = getattr(self, name)
+            if (
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or value <= 0
+            ):
+                raise ValueError(f"{name} must be positive")
         if (
             not isinstance(self.request_timeout, (int, float))
             or isinstance(self.request_timeout, bool)
@@ -168,12 +176,14 @@ class RpcPeer:
         self._notification_handlers: dict[str, NotificationHandler] = {}
         self._pending: dict[str | int, _PendingRequest] = {}
         self._incoming: dict[str | int, _IncomingRequest] = {}
+        self._notification_tasks: set[asyncio.Task[Any]] = set()
         self._request_counter = 0
         self._reader_task: asyncio.Task[None] | None = None
         self._closed = False
-        self._close_lock = asyncio.Lock()
+        self._close_task: asyncio.Task[None] | None = None
         self._started = asyncio.Event()
         self._duplicate_responses = 0
+        self._dropped_notifications = 0
 
     @property
     def is_closed(self) -> bool:
@@ -184,6 +194,11 @@ class RpcPeer:
     def duplicate_responses(self) -> int:
         """Return the number of ignored duplicate or late responses."""
         return self._duplicate_responses
+
+    @property
+    def dropped_notifications(self) -> int:
+        """Return the number of notifications dropped under backpressure."""
+        return self._dropped_notifications
 
     def register_method(self, method: str, handler: RequestHandler) -> None:
         """Register a request handler for one method."""
@@ -236,9 +251,12 @@ class RpcPeer:
             await self.start()
         if len(self._pending) >= self._limits.max_pending_requests:
             raise RpcError(
-                JSONRPC_INVALID_REQUEST,
+                RPC_BACKPRESSURE,
                 "pending request limit reached",
-                data={"reason_code": "TEMPORARY_UNAVAILABLE"},
+                data={
+                    "reason_code": "RPC_BACKPRESSURE",
+                    "retryable": True,
+                },
             )
         request_id = self._next_request_id()
         future = asyncio.get_running_loop().create_future()
@@ -360,58 +378,81 @@ class RpcPeer:
         except Exception:
             await self._fail_pending()
         finally:
-            await self.aclose()
+            if self._close_task is None:
+                await self.aclose()
 
     async def _dispatch_raw(self, raw: str) -> None:
         """Parse one JSON frame and schedule its work."""
-        try:
-            value = json.loads(raw, parse_constant=_reject_non_finite)
-            message = parse_rpc_message(value)
-        except json.JSONDecodeError as exc:
-            recovered = _recover_request_id(raw)
-            if recovered is None or recovered[0]:
-                await self._send_error(
-                    recovered[1] if recovered is not None else None,
-                    JSONRPC_PARSE_ERROR,
-                    "Parse error",
-                    allow_null_id=True,
-                )
-            _ = exc
-            return
-        except ProtocolValidationError as exc:
-            request_id = (
-                value.get("id") if isinstance(value, Mapping) else None
-            )
-            if isinstance(request_id, (str, int)) and not isinstance(
-                request_id,
-                bool,
-            ):
-                await self._send_error(
-                    request_id,
-                    JSONRPC_INVALID_PARAMS,
-                    str(exc),
-                    data={"reason_code": exc.reason_code},
-                )
-            return
-        except ValueError as exc:
-            recovered = _recover_request_id(raw)
-            if recovered is None or recovered[0]:
-                await self._send_error(
-                    recovered[1] if recovered is not None else None,
-                    JSONRPC_PARSE_ERROR,
-                    "Parse error",
-                    allow_null_id=True,
-                )
-            _ = exc
+        message = await self._parse_raw_message(raw)
+        if message is None:
             return
         if isinstance(message, RpcResponse):
             self._resolve_response(message)
+        elif isinstance(message, RpcNotification):
+            self._admit_notification(message)
+        else:
+            await self._admit_request(message)
+
+    async def _parse_raw_message(self, raw: str) -> RpcMessage | None:
+        """Parse one frame and emit the matching conformance error."""
+        try:
+            value = json.loads(raw, parse_constant=_reject_non_finite)
+        except (json.JSONDecodeError, ValueError):
+            await self._send_error(
+                None,
+                JSONRPC_PARSE_ERROR,
+                "Parse error",
+                allow_null_id=True,
+            )
+            return None
+        try:
+            message = parse_rpc_message(value)
+        except ProtocolValidationError as exc:
+            await self._send_error(
+                _valid_request_id(value),
+                JSONRPC_INVALID_REQUEST,
+                "Invalid Request",
+                data={"reason_code": exc.reason_code},
+                allow_null_id=True,
+            )
+            return None
+        return message
+
+    def _admit_notification(self, message: RpcNotification) -> None:
+        """Handle control notifications or admit bounded ordinary work."""
+        if message.method == "request.cancel":
+            self._cancel_incoming(message.params)
             return
-        if isinstance(message, RpcNotification):
-            if message.method == "request.cancel":
-                self._cancel_incoming(message.params)
-            task = asyncio.create_task(self._dispatch_notification(message))
-            task.add_done_callback(self._consume_task_exception)
+        if (
+            len(self._notification_tasks)
+            >= self._limits.max_notification_tasks
+        ):
+            self._dropped_notifications += 1
+            return
+        task = asyncio.create_task(self._dispatch_notification(message))
+        self._notification_tasks.add(task)
+        task.add_done_callback(self._notification_done)
+
+    async def _admit_request(self, message: RpcRequest) -> None:
+        """Reject conflicting or overloaded requests before task creation."""
+        if message.id in self._incoming:
+            await self._send_error(
+                message.id,
+                RPC_REQUEST_ID_IN_USE,
+                "request id is already in use",
+                data={"reason_code": "RPC_REQUEST_ID_IN_USE"},
+            )
+            return
+        if len(self._incoming) >= self._limits.max_incoming_requests:
+            await self._send_error(
+                message.id,
+                RPC_BACKPRESSURE,
+                "incoming request limit reached",
+                data={
+                    "reason_code": "RPC_BACKPRESSURE",
+                    "retryable": True,
+                },
+            )
             return
         cancellation = _RequestCancellation()
         task = asyncio.create_task(
@@ -612,15 +653,6 @@ class RpcPeer:
         if incoming is not None and not incoming.task.done():
             incoming.cancellation.requested = True
             incoming.task.cancel()
-            return
-
-        pending = self._pending.get(cancel.request_id)
-        if pending is not None and not pending.future.done():
-            pending.future.set_exception(
-                RpcCancelledError(
-                    f"request cancelled: {cancel.reason or 'unspecified'}",
-                ),
-            )
 
     async def _send_error(
         self,
@@ -656,7 +688,14 @@ class RpcPeer:
         task: asyncio.Task[Any],
     ) -> None:
         """Remove a completed inbound request task."""
-        self._incoming.pop(request_id, None)
+        incoming = self._incoming.get(request_id)
+        if incoming is not None and incoming.task is task:
+            self._incoming.pop(request_id, None)
+        self._consume_task_exception(task)
+
+    def _notification_done(self, task: asyncio.Task[Any]) -> None:
+        """Remove and consume one completed notification task."""
+        self._notification_tasks.discard(task)
         self._consume_task_exception(task)
 
     @staticmethod
@@ -667,20 +706,47 @@ class RpcPeer:
 
     async def aclose(self) -> None:
         """Close the peer and resolve every pending operation."""
-        async with self._close_lock:
-            if self._closed:
-                return
+        close_task = self._close_task
+        if close_task is None:
             self._closed = True
-            current = asyncio.current_task()
-            for incoming in self._incoming.values():
-                task = incoming.task
-                if task is not current and not task.done():
-                    incoming.cancellation.requested = True
-                    task.cancel()
-            self._incoming.clear()
-            await self._fail_pending()
-            with contextlib.suppress(Exception):
-                await self._transport.aclose()
+            close_task = asyncio.create_task(
+                self._close_resources(asyncio.current_task()),
+            )
+            self._close_task = close_task
+        await asyncio.shield(close_task)
+
+    async def _close_resources(
+        self,
+        excluded_task: asyncio.Task[Any] | None,
+    ) -> None:
+        """Cancel owned work and close the transport exactly once."""
+        tasks: list[asyncio.Task[Any]] = []
+        reader_task = self._reader_task
+        if (
+            reader_task is not None
+            and reader_task is not excluded_task
+            and not reader_task.done()
+        ):
+            reader_task.cancel()
+            tasks.append(reader_task)
+        for incoming in self._incoming.values():
+            task = incoming.task
+            if task is not excluded_task and not task.done():
+                incoming.cancellation.requested = True
+                task.cancel()
+                tasks.append(task)
+        for task in self._notification_tasks:
+            if task is not excluded_task and not task.done():
+                task.cancel()
+                tasks.append(task)
+        await self._fail_pending()
+        with contextlib.suppress(Exception):
+            await self._transport.aclose()
+        if tasks:
+            await asyncio.wait(
+                tasks,
+                timeout=_TASK_SHUTDOWN_TIMEOUT,
+            )
 
 
 __all__ = [
@@ -689,6 +755,8 @@ __all__ = [
     "JSONRPC_INTERNAL_ERROR",
     "JSONRPC_METHOD_NOT_FOUND",
     "JSONRPC_PARSE_ERROR",
+    "RPC_BACKPRESSURE",
+    "RPC_REQUEST_ID_IN_USE",
     "request_was_cancelled",
     "RpcLimits",
     "RpcPeer",

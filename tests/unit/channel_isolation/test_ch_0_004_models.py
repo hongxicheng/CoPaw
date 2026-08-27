@@ -8,12 +8,14 @@ import pytest
 from qwenpaw.channel_protocol import (
     ApprovalSeverity,
     EndpointParams,
+    HelloParams,
     HostContext,
     HostStateParams,
     InboundEvent,
     LeaseParams,
     DeliveryState,
     OutboundResult,
+    PROTOCOL_VERSION,
     ProtocolValidationError,
     RpcErrorObject,
     RpcRequest,
@@ -33,6 +35,7 @@ from qwenpaw.channel_protocol import (
     voice_event_from_setup,
     voice_event_from_status_callback,
 )
+from tests.unit.channel_isolation._ch_0_004_support import _hello
 
 
 def _identity() -> dict[str, object]:
@@ -92,6 +95,29 @@ def test_rpc_parse_error_allows_only_error_response_null_id() -> None:
             {"jsonrpc": "2.0", "id": None, "result": None},
         )
     assert invalid_success.value.reason_code == "SCHEMA_MISMATCH"
+
+
+def test_hello_requires_one_closed_protocol_version() -> None:
+    """Hello v1 rejects ranges, missing versions, and unknown fields."""
+    mapping = _hello().to_mapping()
+    assert mapping["protocol_version"] == PROTOCOL_VERSION == 1
+    assert "protocol_min" not in mapping
+    assert "protocol_max" not in mapping
+
+    missing = dict(mapping)
+    missing.pop("protocol_version")
+    with pytest.raises(ProtocolValidationError) as absent:
+        HelloParams.from_mapping(missing)
+    assert absent.value.reason_code == "SCHEMA_MISMATCH"
+
+    legacy = {
+        **mapping,
+        "protocol_min": 1,
+        "protocol_max": 1,
+    }
+    with pytest.raises(ProtocolValidationError) as ranged:
+        HelloParams.from_mapping(legacy)
+    assert ranged.value.reason_code == "SCHEMA_MISMATCH"
 
 
 def test_host_context_requires_cross_platform_absolute_media_path() -> None:

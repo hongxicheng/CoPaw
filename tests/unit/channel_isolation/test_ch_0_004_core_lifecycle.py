@@ -31,6 +31,7 @@ from tests.unit.channel_isolation._ch_0_004_support import (
     _controller,
     _endpoint,
     _hello,
+    _hello_expectation,
     _identity,
     _transport_pair,
 )
@@ -465,6 +466,7 @@ async def test_real_rpc_timeout_keeps_generation_revoked() -> None:
         generation=7,
         environment_spec_id="ches1_" + "1" * 64,
         environment_id="ches1_" + "1" * 64 + ".install1_" + "2" * 32,
+        **_hello_expectation(),
         capabilities=("ingress_endpoint",),
         endpoint_handler=blocked_unregister,
         clock_ms=clock,

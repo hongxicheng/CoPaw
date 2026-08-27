@@ -21,6 +21,7 @@ from .errors import (
     SecretHandleInvalidError,
 )
 from .models import (
+    PROTOCOL_VERSION,
     DeliveryState,
     EndpointParams,
     GenerationStatus,
@@ -120,11 +121,13 @@ class LifecycleController:  # pylint: disable=too-many-public-methods
         instance_id: str,
         environment_spec_id: str,
         environment_id: str,
+        qwenpaw_version: str,
+        lock_sha256: str,
+        python_abi: str,
+        platform_tag: str,
         generation: int,
-        protocol_min: int = 1,
-        protocol_max: int = 1,
+        protocol_version: int = PROTOCOL_VERSION,
         capabilities: tuple[str, ...] = (),
-        qwenpaw_version: str = "",
         send_handler: Callable[[SendParams], Any] | None = None,
         reaction_handler: Callable[[ReactionParams], Any] | None = None,
         response_finish_handler: Callable[
@@ -148,11 +151,13 @@ class LifecycleController:  # pylint: disable=too-many-public-methods
         self.instance_id = instance_id
         self.environment_spec_id = environment_spec_id
         self.environment_id = environment_id
-        self.generation = generation
-        self.protocol_min = protocol_min
-        self.protocol_max = protocol_max
-        self.capabilities = tuple(capabilities)
         self.qwenpaw_version = qwenpaw_version
+        self.lock_sha256 = lock_sha256
+        self.python_abi = python_abi
+        self.platform_tag = platform_tag
+        self.generation = generation
+        self.protocol_version = protocol_version
+        self.capabilities = tuple(capabilities)
         self.state = RunnerState.CREATED
         self.hello: HelloParams | None = None
         self.host_context: HostContext | None = None
@@ -272,19 +277,46 @@ class LifecycleController:  # pylint: disable=too-many-public-methods
             raise self._identity_error("CHANNEL_KEY_MISMATCH")
         if params.instance_id != self.instance_id:
             raise self._identity_error("INSTANCE_ID_MISMATCH")
-        if params.environment_spec_id != self.environment_spec_id:
-            raise self._identity_error("ENVIRONMENT_SPEC_MISMATCH")
-        if params.environment_id != self.environment_id:
-            raise self._identity_error("ENVIRONMENT_ID_MISMATCH")
-        if not (
-            params.protocol_min <= self.protocol_max
-            and self.protocol_min <= params.protocol_max
-        ):
-            raise RpcError(
-                RPC_LIFECYCLE_ERROR,
-                "protocol versions do not overlap",
-                data={"reason_code": "PROTOCOL_MISMATCH"},
-            )
+        expected = (
+            (
+                params.protocol_version,
+                self.protocol_version,
+                "PROTOCOL_MISMATCH",
+            ),
+            (
+                params.qwenpaw_version,
+                self.qwenpaw_version,
+                "QWENPAW_VERSION_MISMATCH",
+            ),
+            (
+                params.environment_spec_id,
+                self.environment_spec_id,
+                "ENVIRONMENT_SPEC_MISMATCH",
+            ),
+            (
+                params.environment_id,
+                self.environment_id,
+                "ENVIRONMENT_ID_MISMATCH",
+            ),
+            (
+                params.lock_sha256,
+                self.lock_sha256,
+                "LOCK_MISMATCH",
+            ),
+            (
+                params.python_abi,
+                self.python_abi,
+                "PYTHON_ABI_MISMATCH",
+            ),
+            (
+                params.platform_tag,
+                self.platform_tag,
+                "PLATFORM_TAG_MISMATCH",
+            ),
+        )
+        for actual, required, reason in expected:
+            if actual != required:
+                raise self._lifecycle_error(reason)
         if self.state != RunnerState.CREATED:
             raise self._lifecycle_error("HELLO_ALREADY_ACCEPTED")
         self.hello = params
@@ -292,7 +324,7 @@ class LifecycleController:  # pylint: disable=too-many-public-methods
             set(self.capabilities).intersection(params.capabilities),
         )
         return {
-            "protocol_version": min(self.protocol_max, params.protocol_max),
+            "protocol_version": self.protocol_version,
             "capabilities": list(
                 sorted(
                     self.negotiated_capabilities,

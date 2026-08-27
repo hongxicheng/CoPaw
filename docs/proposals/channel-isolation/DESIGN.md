@@ -534,7 +534,12 @@ notification，必须返回 `id=null` 的 Invalid Request。第三方 Channel SD
 `-32021`/`RPC_BACKPRESSURE`，并标记 `retryable=true`；合法 notification 仍不返回 response，
 达到 notification 上限时不启动 handler，增加可观测的丢弃/过载计数。`request.cancel` 是
 解除容量的控制 notification，必须在 reader 分派路径内直接处理且不占普通 notification
-容量。所有已启动 notification task 必须被跟踪，并在 peer 关闭时有界取消和回收。
+容量。cancel 只能定位接收端当前 `_incoming` 中的同号 owner；owner 已结束时为
+幂等 no-op，不得回退取消反向 `_pending` 中碰巧同号的请求。所有已启动
+notification task 必须被跟踪，并在 peer 关闭时有界取消和回收。首次关闭在禁止
+新准入后必须发布唯一共享 close task，由该 task 回收 reader、request、notification 和
+transport；所有 `aclose()` 等待者通过 cancellation shield 等待该 task，单个等待者
+取消不得中断共享清理，重复关闭不得提前成功或重复关闭 transport。
 
 同一连接内仍在执行的 request ID 是唯一键。重复 ID 必须在启动第二个 handler 前以
 `-32020`/`RPC_REQUEST_ID_IN_USE` 稳定拒绝，不得覆盖原 task、执行第二次业务副作用或产生
@@ -2349,5 +2354,5 @@ SDK shadowing、并发 artifact/environment 安装、磁盘不足、所选依赖
 | ADR-040 | QwenPaw 提供独立的可信 Runner support artifact（bootstrap + Protocol SDK）；Channel `code_root` 只包含 descriptor、Driver 和平台代码，不能提供或覆盖 Protocol SDK。`runner.hello` 必须携带并由 Core 校验 64-hex `source_revision`，不匹配时以 `SOURCE_REVISION_MISMATCH` 拒绝激活 | 已确认 |
 | ADR-041 | 核心 environment 安装模型按精确 lock 从用户选择的 Python 依赖源下载 hash 匹配的 wheel 并本地创建 venv，不分发预建 venv。全局默认源为阿里云，可选 PyPI 或自定义源并允许单次覆盖；缺 wheel 明确失败且不静默 fallback、不重新解析版本、不构建 sdist，自定义源凭证只进入 secret store。离线/Desktop bundle 仅是可选缓存优化 | 已确认 |
 | ADR-042 | Core 和 Runner 只使用一个完全相等的 `protocol_version`，不做版本范围协商或多版本 schema dispatcher。所有 wire DTO 为 closed object；当前未发布的 Phase 0 原型修订直接定稿为 v1，G0 冻结后任何方法、字段或语义变化必须同步更新 Core、Runner、Protocol SDK 和一致性测试并递增版本。capability 只协商同版本内的可选能力 | 已确认 |
-| ADR-043 | `RpcPeer` 分别限制本地 pending、入站 request 和普通 notification；`request.cancel` 直接处理且不占 notification 容量。执行中的 request ID 不得覆盖，重复 ID 和入站过载分别使用稳定 server error；task cleanup 必须核对 owner。JSON-RPC conformance 固定区分 parse error、invalid request、invalid params 和合法 notification 无响应 | 已确认 |
+| ADR-043 | `RpcPeer` 分别限制本地 pending、入站 request 和普通 notification；`request.cancel` 直接处理且不占 notification 容量，只定位接收端当前 incoming owner，不回退取消反向同号 pending。执行中的 request ID 不得覆盖，重复 ID 和入站过载分别使用稳定 server error；task cleanup 必须核对 owner，peer 关闭由共享、抗等待者取消的 close task 完成。JSON-RPC conformance 固定区分 parse error、invalid request、invalid params 和合法 notification 无响应 | 已确认 |
 | ADR-044 | 每个可能产生平台副作用的 attempt 使用不可变 `delivery_id`。Ledger 只允许 `absent→requested→sending→terminal` 的单向转换，允许从 requested 直接进入终态；四个终态均不可变，结果不确定必须使用 unknown，重试必须创建新 ID，v1 不增加 `retry_of` | 已确认 |

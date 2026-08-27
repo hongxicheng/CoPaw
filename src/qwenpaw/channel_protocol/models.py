@@ -428,8 +428,7 @@ def parse_rpc_message(value: object) -> RpcMessage:
 class HelloParams:
     """Runner identity and protocol capability handshake."""
 
-    protocol_min: int
-    protocol_max: int
+    protocol_version: int
     qwenpaw_version: str
     channel_key: str
     instance_id: str
@@ -443,8 +442,7 @@ class HelloParams:
     def to_mapping(self) -> dict[str, Any]:
         """Encode handshake parameters."""
         return {
-            "protocol_min": self.protocol_min,
-            "protocol_max": self.protocol_max,
+            "protocol_version": self.protocol_version,
             "qwenpaw_version": self.qwenpaw_version,
             "channel_key": self.channel_key,
             "instance_id": self.instance_id,
@@ -461,8 +459,7 @@ class HelloParams:
         """Validate handshake parameters."""
         data = _object(value)
         allowed = {
-            "protocol_min",
-            "protocol_max",
+            "protocol_version",
             "qwenpaw_version",
             "channel_key",
             "instance_id",
@@ -474,15 +471,10 @@ class HelloParams:
             "capabilities",
         }
         _closed(data, allowed)
-        protocol_min = _integer(
-            data.get("protocol_min"),
-            "protocol_min",
+        protocol_version = _integer(
+            _required(data, "protocol_version"),
+            "protocol_version",
             minimum=1,
-        )
-        protocol_max = _integer(
-            data.get("protocol_max"),
-            "protocol_max",
-            minimum=protocol_min,
         )
         qwenpaw_version = _string(
             data.get("qwenpaw_version"),
@@ -505,8 +497,7 @@ class HelloParams:
         platform_tag = _string(data.get("platform_tag"), "platform_tag")
         capabilities = _capabilities(data.get("capabilities"))
         return cls(
-            protocol_min=protocol_min,
-            protocol_max=protocol_max,
+            protocol_version=protocol_version,
             qwenpaw_version=qwenpaw_version,
             channel_key=channel_key,
             instance_id=instance_id,

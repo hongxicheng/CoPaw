@@ -166,8 +166,7 @@ async def _run_session(
     await peer.start()
     try:
         hello = HelloParams(
-            protocol_min=1,
-            protocol_max=1,
+            protocol_version=1,
             qwenpaw_version=identity.qwenpaw_version,
             channel_key=identity.channel_key,
             instance_id=identity.instance_id,

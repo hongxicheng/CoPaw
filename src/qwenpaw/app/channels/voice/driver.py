@@ -281,9 +281,12 @@ class VoiceDriver:
             instance_id=identity.instance_id,
             environment_spec_id=identity.environment_spec_id,
             environment_id=identity.environment_id,
+            qwenpaw_version=identity.qwenpaw_version,
+            lock_sha256=identity.lock_sha256,
+            python_abi=identity.python_abi,
+            platform_tag=identity.platform_tag,
             generation=identity.generation,
             capabilities=identity.capabilities,
-            qwenpaw_version=identity.qwenpaw_version,
             send_handler=self.send,
             secret_handle_consumer=secret_handle_consumer,
             endpoint_handler=self._publish_endpoint,
@@ -554,6 +557,7 @@ class VoiceDriver:
             except RpcError as exc:
                 if self._rpc_reason(exc) not in {
                     "INGRESS_BACKPRESSURE",
+                    "RPC_BACKPRESSURE",
                     "TEMPORARY_UNAVAILABLE",
                 }:
                     raise

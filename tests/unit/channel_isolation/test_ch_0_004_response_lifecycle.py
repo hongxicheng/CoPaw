@@ -121,8 +121,7 @@ def _hello() -> HelloParams:
     """Return a compatible response-capable Runner hello."""
     return HelloParams.from_mapping(
         {
-            "protocol_min": 1,
-            "protocol_max": 1,
+            "protocol_version": 1,
             "qwenpaw_version": "0.1",
             "channel_key": "voice",
             "instance_id": "instance-1",
@@ -148,6 +147,10 @@ def _controller(
         generation=7,
         environment_spec_id=_ENVIRONMENT_SPEC_ID,
         environment_id=_ENVIRONMENT_ID,
+        qwenpaw_version="0.1",
+        lock_sha256="0" * 64,
+        python_abi="cp313-cp313",
+        platform_tag="macosx_11_0_arm64",
         capabilities=("response_lifecycle",),
         max_response_routes=max_response_routes,
         clock_ms=clock,

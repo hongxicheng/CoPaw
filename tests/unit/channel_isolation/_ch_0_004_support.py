@@ -419,16 +419,12 @@ def _hello() -> HelloParams:
     """Return a valid handshake fixture."""
     return HelloParams.from_mapping(
         {
-            "protocol_min": 1,
-            "protocol_max": 1,
-            "qwenpaw_version": "0.1",
+            "protocol_version": 1,
+            **_hello_expectation(),
             "channel_key": "voice",
             "instance_id": "instance-1",
             "environment_spec_id": "ches1_" + "1" * 64,
             "environment_id": "ches1_" + "1" * 64 + ".install1_" + "2" * 32,
-            "lock_sha256": "0" * 64,
-            "python_abi": "cp313-cp313",
-            "platform_tag": "macosx_11_0_arm64",
             "capabilities": [
                 "approval_card",
                 "host_state",
@@ -440,6 +436,16 @@ def _hello() -> HelloParams:
             ],
         },
     )
+
+
+def _hello_expectation() -> dict[str, str]:
+    """Return the Core-owned expected Runner environment fields."""
+    return {
+        "qwenpaw_version": "0.1",
+        "lock_sha256": "0" * 64,
+        "python_abi": "cp313-cp313",
+        "platform_tag": "macosx_11_0_arm64",
+    }
 
 
 def _endpoint() -> EndpointParams:
@@ -468,6 +474,7 @@ def _controller(clock: Clock) -> LifecycleController:
         generation=7,
         environment_spec_id="ches1_" + "1" * 64,
         environment_id="ches1_" + "1" * 64 + ".install1_" + "2" * 32,
+        **_hello_expectation(),
         capabilities=(
             "approval_card",
             "host_state",

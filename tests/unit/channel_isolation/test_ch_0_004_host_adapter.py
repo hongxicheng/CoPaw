@@ -38,6 +38,7 @@ from tests.unit.channel_isolation._ch_0_004_support import (
     _controller,
     _endpoint,
     _hello,
+    _hello_expectation,
     _identity,
     _response_event,
     _transport_pair,
@@ -466,6 +467,7 @@ async def test_capability_gates_and_bounded_host_state() -> None:
         generation=7,
         environment_spec_id="ches1_" + "1" * 64,
         environment_id="ches1_" + "1" * 64 + ".install1_" + "2" * 32,
+        **_hello_expectation(),
         capabilities=("media",),
         clock_ms=clock,
     )
@@ -714,6 +716,7 @@ async def test_endpoint_unregister_hook_can_reenter_lifecycle() -> None:
         generation=7,
         environment_spec_id="ches1_" + "1" * 64,
         environment_id="ches1_" + "1" * 64 + ".install1_" + "2" * 32,
+        **_hello_expectation(),
         capabilities=("ingress_endpoint",),
         endpoint_handler=reentrant_hook,
         clock_ms=clock,

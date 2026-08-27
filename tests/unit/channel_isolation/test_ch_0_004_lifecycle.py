@@ -19,6 +19,7 @@ from qwenpaw.channel_protocol import (
     LifecycleController,
     CoreLifecycleAdapter,
     FixtureSecretHandleConsumer,
+    HelloParams,
     PrepareParams,
     RpcError,
     RunnerState,
@@ -32,6 +33,7 @@ from tests.unit.channel_isolation._ch_0_004_support import (
     _controller,
     _endpoint,
     _hello,
+    _hello_expectation,
     _identity,
     _transport_pair,
 )
@@ -59,6 +61,7 @@ async def test_endpoint_register_hook_can_reenter_lifecycle() -> None:
         generation=7,
         environment_spec_id="ches1_" + "1" * 64,
         environment_id="ches1_" + "1" * 64 + ".install1_" + "2" * 32,
+        **_hello_expectation(),
         capabilities=("ingress_endpoint",),
         endpoint_handler=reentrant_hook,
         clock_ms=Clock(),
@@ -199,22 +202,38 @@ async def test_generation_fencing_expiry_and_quiesce() -> None:
     assert fenced.value.data["reason_code"] == "GENERATION_FENCED"
 
 
-def test_protocol_version_mismatch_has_stable_reason() -> None:
-    """Hello rejects non-overlapping protocol versions deterministically."""
-    clock = Clock()
-    controller = LifecycleController(
-        channel_key="voice",
-        instance_id="instance-1",
-        generation=7,
-        environment_spec_id="ches1_" + "1" * 64,
-        environment_id="ches1_" + "1" * 64 + ".install1_" + "2" * 32,
-        protocol_min=2,
-        protocol_max=2,
-        clock_ms=clock,
-    )
+@pytest.mark.parametrize(
+    ("field", "value", "reason"),
+    [
+        ("protocol_version", 2, "PROTOCOL_MISMATCH"),
+        ("qwenpaw_version", "0.2", "QWENPAW_VERSION_MISMATCH"),
+        (
+            "environment_spec_id",
+            "ches1_" + "2" * 64,
+            "ENVIRONMENT_SPEC_MISMATCH",
+        ),
+        (
+            "environment_id",
+            "ches1_" + "1" * 64 + ".install1_" + "3" * 32,
+            "ENVIRONMENT_ID_MISMATCH",
+        ),
+        ("lock_sha256", "4" * 64, "LOCK_MISMATCH"),
+        ("python_abi", "cp312-cp312", "PYTHON_ABI_MISMATCH"),
+        ("platform_tag", "win_amd64", "PLATFORM_TAG_MISMATCH"),
+    ],
+)
+def test_hello_environment_mismatch_has_stable_reason(
+    field: str,
+    value: object,
+    reason: str,
+) -> None:
+    """Hello rejects every mismatch against Core-owned expectations."""
+    controller = _controller(Clock())
+    mapping = _hello().to_mapping()
+    mapping[field] = value
     with pytest.raises(RpcError) as mismatch:
-        controller.accept_hello(_hello())
-    assert mismatch.value.data["reason_code"] == "PROTOCOL_MISMATCH"
+        controller.accept_hello(HelloParams.from_mapping(mapping))
+    assert mismatch.value.data["reason_code"] == reason
 
 
 async def test_secret_handle_is_consumed_once_during_prepare() -> None:
@@ -232,6 +251,7 @@ async def test_secret_handle_is_consumed_once_during_prepare() -> None:
         generation=7,
         environment_spec_id="ches1_" + "1" * 64,
         environment_id="ches1_" + "1" * 64 + ".install1_" + "2" * 32,
+        **_hello_expectation(),
         secret_handle_consumer=consumer,
         clock_ms=clock,
     )
@@ -258,6 +278,7 @@ async def test_secret_handle_is_consumed_once_during_prepare() -> None:
         generation=7,
         environment_spec_id="ches1_" + "1" * 64,
         environment_id="ches1_" + "1" * 64 + ".install1_" + "2" * 32,
+        **_hello_expectation(),
         secret_handle_consumer=consumer,
         clock_ms=clock,
     )
@@ -287,6 +308,7 @@ async def test_secret_handle_invalid_and_auth_errors_are_stable() -> None:
         generation=7,
         environment_spec_id="ches1_" + "1" * 64,
         environment_id="ches1_" + "1" * 64 + ".install1_" + "2" * 32,
+        **_hello_expectation(),
         secret_handle_consumer=consumer,
         clock_ms=clock,
     )
@@ -317,6 +339,7 @@ async def test_secret_handle_invalid_and_auth_errors_are_stable() -> None:
         generation=7,
         environment_spec_id="ches1_" + "1" * 64,
         environment_id="ches1_" + "1" * 64 + ".install1_" + "2" * 32,
+        **_hello_expectation(),
         secret_handle_consumer=auth_consumer,
         clock_ms=clock,
     )
@@ -344,6 +367,7 @@ async def test_secret_handle_invalid_and_auth_errors_are_stable() -> None:
         generation=7,
         environment_spec_id="ches1_" + "1" * 64,
         environment_id="ches1_" + "1" * 64 + ".install1_" + "2" * 32,
+        **_hello_expectation(),
         secret_handle_consumer=auth_consumer,
         clock_ms=clock,
     )
@@ -371,6 +395,7 @@ async def test_secret_handle_without_consumer_is_invalid() -> None:
         generation=7,
         environment_spec_id="ches1_" + "1" * 64,
         environment_id="ches1_" + "1" * 64 + ".install1_" + "2" * 32,
+        **_hello_expectation(),
         clock_ms=clock,
     )
     controller.accept_hello(_hello())
@@ -415,6 +440,7 @@ async def test_secret_rpc_error_is_sanitized_before_rpc_response() -> None:
         generation=7,
         environment_spec_id="ches1_" + "1" * 64,
         environment_id="ches1_" + "1" * 64 + ".install1_" + "2" * 32,
+        **_hello_expectation(),
         secret_handle_consumer=consumer,
         clock_ms=clock,
     )
@@ -464,6 +490,7 @@ async def test_cancelled_prepare_fails_and_consumes_secret_handle() -> None:
         generation=7,
         environment_spec_id="ches1_" + "1" * 64,
         environment_id="ches1_" + "1" * 64 + ".install1_" + "2" * 32,
+        **_hello_expectation(),
         secret_handle_consumer=consumer,
         clock_ms=clock,
     )
@@ -499,6 +526,7 @@ async def test_cancelled_prepare_fails_and_consumes_secret_handle() -> None:
         generation=7,
         environment_spec_id="ches1_" + "1" * 64,
         environment_id="ches1_" + "1" * 64 + ".install1_" + "2" * 32,
+        **_hello_expectation(),
         secret_handle_consumer=consumer,
         clock_ms=clock,
     )
@@ -544,6 +572,7 @@ async def test_swallowed_secret_cancel_fails_prepare() -> None:
         generation=7,
         environment_spec_id="ches1_" + "1" * 64,
         environment_id="ches1_" + "1" * 64 + ".install1_" + "2" * 32,
+        **_hello_expectation(),
         secret_handle_consumer=consumer,
         clock_ms=clock,
     )
@@ -578,6 +607,7 @@ async def test_swallowed_secret_cancel_fails_prepare() -> None:
         generation=7,
         environment_spec_id="ches1_" + "1" * 64,
         environment_id="ches1_" + "1" * 64 + ".install1_" + "2" * 32,
+        **_hello_expectation(),
         secret_handle_consumer=consumer,
         clock_ms=clock,
     )
@@ -615,6 +645,7 @@ async def test_outbound_and_secret_contract_crosses_rpc_dispatch() -> None:
         generation=7,
         environment_spec_id="ches1_" + "1" * 64,
         environment_id="ches1_" + "1" * 64 + ".install1_" + "2" * 32,
+        **_hello_expectation(),
         capabilities=("approval_card", "reaction", "streaming"),
         secret_handle_consumer=consumer,
         clock_ms=clock,

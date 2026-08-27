@@ -20,6 +20,9 @@ from qwenpaw.channel_protocol import (
     RpcPeer,
     RpcTimeoutError,
 )
+from tests.unit.channel_isolation._ch_0_004_support import (
+    _hello_expectation,
+)
 
 
 class MemoryTransport:
@@ -65,6 +68,23 @@ class MemoryTransport:
         self.closed = True
         if self.peer is not None:
             await self.peer.inbox.put(None)
+
+
+class BlockingCloseTransport(MemoryTransport):
+    """Hold transport shutdown until a test releases it."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.close_started = asyncio.Event()
+        self.close_release = asyncio.Event()
+        self.close_calls = 0
+
+    async def aclose(self) -> None:
+        """Record one close attempt and wait for explicit release."""
+        self.close_calls += 1
+        self.close_started.set()
+        await self.close_release.wait()
+        await super().aclose()
 
 
 def _transport_pair() -> tuple[MemoryTransport, MemoryTransport]:
@@ -161,21 +181,18 @@ async def test_pending_limit_timeout_and_cancel_notification() -> None:
         limits=RpcLimits(max_pending_requests=1, request_timeout=0.5),
     )
     runner = RpcPeer(right_transport)
-    cancellations: list[object] = []
     cancellation_received = asyncio.Event()
     request_started = asyncio.Event()
-
-    async def remember_cancel(params: object, _: object) -> None:
-        """Record cancellation notifications."""
-        cancellations.append(params)
-        cancellation_received.set()
 
     async def never_respond(_: object, __: object) -> None:
         """Keep one request pending until the caller timeout."""
         request_started.set()
-        await asyncio.Future()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            cancellation_received.set()
+            raise
 
-    runner.register_notification("request.cancel", remember_cancel)
     runner.register_method("never.respond", never_respond)
     await asyncio.gather(core.start(), runner.start())
 
@@ -184,12 +201,12 @@ async def test_pending_limit_timeout_and_cancel_notification() -> None:
     with pytest.raises(RpcError) as limit_error:
         await core.call("second")
     assert limit_error.value.data == {
-        "reason_code": "TEMPORARY_UNAVAILABLE",
+        "reason_code": "RPC_BACKPRESSURE",
+        "retryable": True,
     }
     with pytest.raises(RpcTimeoutError):
         await pending
     await asyncio.wait_for(cancellation_received.wait(), timeout=1.0)
-    assert cancellations
     await asyncio.gather(core.aclose(), runner.aclose())
 
 
@@ -229,6 +246,340 @@ async def test_explicit_cancel_notification_cancels_incoming_request() -> None:
 
 
 @pytest.mark.asyncio
+async def test_late_cancel_does_not_cancel_reverse_pending_request() -> None:
+    """Cancel only targets the current inbound request ID owner."""
+    left_transport, right_transport = _transport_pair()
+    left = RpcPeer(left_transport)
+    right = RpcPeer(right_transport)
+    reverse_started = asyncio.Event()
+    reverse_release = asyncio.Event()
+
+    async def completed(_: object, __: object) -> str:
+        """Complete the first inbound owner of rpc-1."""
+        return "completed"
+
+    async def reverse(_: object, __: object) -> str:
+        """Hold the unrelated reverse rpc-1 request pending."""
+        reverse_started.set()
+        await reverse_release.wait()
+        return "reverse"
+
+    left.register_method("left.completed", completed)
+    right.register_method("right.reverse", reverse)
+    await asyncio.gather(left.start(), right.start())
+
+    assert await right.call("left.completed") == "completed"
+    await asyncio.sleep(0)
+    reverse_call = asyncio.create_task(left.call("right.reverse"))
+    await asyncio.wait_for(reverse_started.wait(), timeout=1.0)
+    await right.notify(
+        "request.cancel",
+        {"request_id": "rpc-1", "reason": "late"},
+    )
+    await asyncio.sleep(0)
+    assert not reverse_call.done()
+
+    reverse_release.set()
+    assert await reverse_call == "reverse"
+    await asyncio.gather(left.aclose(), right.aclose())
+
+
+@pytest.mark.asyncio
+async def test_incoming_request_limit_rejects_before_handler() -> None:
+    """Inbound backpressure does not start a second request handler."""
+    client_transport, server_transport = _transport_pair()
+    server = RpcPeer(
+        server_transport,
+        limits=RpcLimits(max_incoming_requests=1),
+    )
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def blocking(_: object, __: object) -> dict[str, int]:
+        """Hold the sole inbound request slot."""
+        nonlocal calls
+        calls += 1
+        started.set()
+        await release.wait()
+        return {"calls": calls}
+
+    server.register_method("blocking", blocking)
+    await server.start()
+    await client_transport.send(
+        '{"jsonrpc":"2.0","id":"first","method":"blocking"}',
+    )
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    await client_transport.send(
+        '{"jsonrpc":"2.0","id":"second","method":"blocking"}',
+    )
+    overloaded = json.loads(await client_transport.receive())
+    assert overloaded["id"] == "second"
+    assert overloaded["error"] == {
+        "code": -32021,
+        "message": "incoming request limit reached",
+        "data": {
+            "reason_code": "RPC_BACKPRESSURE",
+            "retryable": True,
+        },
+    }
+    assert calls == 1
+    release.set()
+    completed = json.loads(await client_transport.receive())
+    assert completed["id"] == "first"
+    await server.aclose()
+
+
+@pytest.mark.asyncio
+async def test_duplicate_id_preserves_owner_and_can_be_reused() -> None:
+    """Duplicate IDs cannot replace the active owner or its cancellation."""
+    client_transport, server_transport = _transport_pair()
+    server = RpcPeer(server_transport)
+    started = asyncio.Event()
+    calls = 0
+
+    async def controlled(_: object, __: object) -> dict[str, int]:
+        """Block the first owner and let a later reused ID finish."""
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            started.set()
+            await asyncio.Future()
+        return {"calls": calls}
+
+    server.register_method("controlled", controlled)
+    await server.start()
+    request = '{"jsonrpc":"2.0","id":"shared","method":"controlled"}'
+    await client_transport.send(request)
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    await client_transport.send(request)
+    duplicate = json.loads(await client_transport.receive())
+    assert duplicate["id"] == "shared"
+    assert duplicate["error"]["code"] == -32020
+    assert duplicate["error"]["data"] == {
+        "reason_code": "RPC_REQUEST_ID_IN_USE",
+    }
+    assert calls == 1
+
+    await client_transport.send(
+        '{"jsonrpc":"2.0","method":"request.cancel",'
+        '"params":{"request_id":"shared","reason":"test"}}',
+    )
+    cancelled = json.loads(await client_transport.receive())
+    assert cancelled["id"] == "shared"
+    assert cancelled["error"]["data"]["reason_code"] == "REQUEST_CANCELLED"
+    await asyncio.sleep(0)
+
+    await client_transport.send(request)
+    reused = json.loads(await client_transport.receive())
+    assert reused == {
+        "jsonrpc": "2.0",
+        "id": "shared",
+        "result": {"calls": 2},
+    }
+    await server.aclose()
+
+
+@pytest.mark.asyncio
+async def test_cancel_bypasses_notification_limit_and_reaps_tasks() -> None:
+    """Cancel remains available while ordinary notifications are saturated."""
+    client_transport, server_transport = _transport_pair()
+    server = RpcPeer(
+        server_transport,
+        limits=RpcLimits(max_notification_tasks=1),
+    )
+    request_started = asyncio.Event()
+    notification_started = asyncio.Event()
+    notification_cancelled = asyncio.Event()
+
+    async def request_handler(_: object, __: object) -> None:
+        """Wait until the direct cancel path stops the request."""
+        request_started.set()
+        await asyncio.Future()
+
+    async def notification_handler(_: object, __: object) -> None:
+        """Occupy the notification slot until peer shutdown."""
+        notification_started.set()
+        try:
+            await asyncio.Future()
+        finally:
+            notification_cancelled.set()
+
+    server.register_method("blocking", request_handler)
+    server.register_notification("ordinary", notification_handler)
+    await server.start()
+    await client_transport.send(
+        '{"jsonrpc":"2.0","id":"request-1","method":"blocking"}',
+    )
+    await asyncio.wait_for(request_started.wait(), timeout=1.0)
+    await client_transport.send(
+        '{"jsonrpc":"2.0","method":"ordinary","params":{}}',
+    )
+    await asyncio.wait_for(notification_started.wait(), timeout=1.0)
+    await client_transport.send(
+        '{"jsonrpc":"2.0","method":"request.cancel",'
+        '"params":{"request_id":"request-1","reason":"test"}}',
+    )
+    cancelled = json.loads(await client_transport.receive())
+    assert cancelled["error"]["data"]["reason_code"] == ("REQUEST_CANCELLED")
+    await client_transport.send(
+        '{"jsonrpc":"2.0","method":"ordinary","params":{}}',
+    )
+    await asyncio.sleep(0)
+    assert server.dropped_notifications == 1
+
+    await server.aclose()
+    await asyncio.wait_for(notification_cancelled.wait(), timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_close_waiter_can_retry_transport_cleanup() -> None:
+    """Caller cancellation does not abandon shared transport cleanup."""
+    transport = BlockingCloseTransport()
+    peer = RpcPeer(transport)
+    first_waiter = asyncio.create_task(peer.aclose())
+    await asyncio.wait_for(transport.close_started.wait(), timeout=1.0)
+
+    first_waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first_waiter
+    assert peer.is_closed
+    assert not transport.closed
+
+    retry = asyncio.create_task(peer.aclose())
+    await asyncio.sleep(0)
+    assert not retry.done()
+    assert transport.close_calls == 1
+    transport.close_release.set()
+    await retry
+    assert transport.closed
+    assert transport.close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_cancelled_close_waiter_does_not_abandon_task_reap() -> None:
+    """Caller cancellation cannot cancel bounded handler cleanup."""
+    client_transport, server_transport = _transport_pair()
+    server = RpcPeer(server_transport)
+    handler_started = asyncio.Event()
+    cancellation_seen = asyncio.Event()
+    handler_release = asyncio.Event()
+    handler_stopped = asyncio.Event()
+
+    async def notification(_: object, __: object) -> None:
+        """Delay completion after receiving shutdown cancellation."""
+        handler_started.set()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            cancellation_seen.set()
+            await handler_release.wait()
+        finally:
+            handler_stopped.set()
+
+    server.register_notification("blocking", notification)
+    await server.start()
+    await client_transport.send(
+        '{"jsonrpc":"2.0","method":"blocking"}',
+    )
+    await asyncio.wait_for(handler_started.wait(), timeout=1.0)
+
+    first_waiter = asyncio.create_task(server.aclose())
+    await asyncio.wait_for(cancellation_seen.wait(), timeout=1.0)
+    first_waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first_waiter
+
+    retry = asyncio.create_task(server.aclose())
+    await asyncio.sleep(0)
+    assert not retry.done()
+    handler_release.set()
+    await retry
+    await asyncio.wait_for(handler_stopped.wait(), timeout=1.0)
+    assert server_transport.closed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("payload", "expected_id", "expected_code"),
+    [
+        ("{", None, -32700),
+        ("[]", None, -32600),
+        (
+            '{"jsonrpc":"2.0","id":null,"method":"echo"}',
+            None,
+            -32600,
+        ),
+        (
+            '{"jsonrpc":"2.0","id":"","method":"echo"}',
+            None,
+            -32600,
+        ),
+        (
+            '{"jsonrpc":"2.0","id":"bad","method":1}',
+            "bad",
+            -32600,
+        ),
+        (
+            '{"jsonrpc":"1.0","method":"echo"}',
+            None,
+            -32600,
+        ),
+    ],
+)
+async def test_jsonrpc_envelope_conformance(
+    payload: str,
+    expected_id: str | None,
+    expected_code: int,
+) -> None:
+    """Malformed JSON and envelopes retain distinct JSON-RPC errors."""
+    client_transport, server_transport = _transport_pair()
+    server = RpcPeer(server_transport)
+    await server.start()
+    await client_transport.send(payload)
+    response = json.loads(await client_transport.receive())
+    assert response["id"] == expected_id
+    assert response["error"]["code"] == expected_code
+    await server.aclose()
+
+
+@pytest.mark.asyncio
+async def test_invalid_params_and_notifications_follow_conformance() -> None:
+    """Only a valid request receives Invalid params from DTO validation."""
+    client_transport, server_transport = _transport_pair()
+    server = RpcPeer(server_transport)
+    calls = 0
+
+    async def health(_: object, __: object) -> None:
+        """Record calls that pass the method DTO validator."""
+        nonlocal calls
+        calls += 1
+
+    server.register_method("channel.health", health)
+    server.register_notification("channel.health", health)
+    await server.start()
+    await client_transport.send(
+        '{"jsonrpc":"2.0","id":"params","method":"channel.health",'
+        '"params":{"unexpected":true}}',
+    )
+    response = json.loads(await client_transport.receive())
+    assert response["id"] == "params"
+    assert response["error"]["code"] == -32602
+
+    await client_transport.send(
+        '{"jsonrpc":"2.0","method":"channel.health",'
+        '"params":{"unexpected":true}}',
+    )
+    await client_transport.send(
+        '{"jsonrpc":"2.0","method":"missing.notification"}',
+    )
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(client_transport.receive(), timeout=0.02)
+    assert calls == 0
+    await server.aclose()
+
+
+@pytest.mark.asyncio
 async def test_protocol_and_schema_errors_are_stable() -> None:
     """Protocol mismatch and invalid DTOs expose stable reason codes."""
     left_transport, right_transport = _transport_pair()
@@ -257,14 +608,13 @@ async def test_protocol_mismatch_returns_rpc_error_envelope() -> None:
         generation=7,
         environment_spec_id="ches1_" + "1" * 64,
         environment_id="ches1_" + "1" * 64 + ".install1_" + "2" * 32,
-        protocol_min=2,
-        protocol_max=2,
+        **_hello_expectation(),
+        protocol_version=2,
     )
     CoreLifecycleAdapter(controller).register_rpc_methods(core)
     await asyncio.gather(core.start(), runner.start())
     hello = {
-        "protocol_min": 1,
-        "protocol_max": 1,
+        "protocol_version": 1,
         "qwenpaw_version": "0.1",
         "channel_key": "voice",
         "instance_id": "instance-1",
@@ -312,7 +662,7 @@ async def test_rpc_strict_json_rejects_non_finite_values() -> None:
         '"params":{"score":NaN}}',
     )
     response = json.loads(await input_transport.receive())
-    assert response["id"] == "bad"
+    assert response["id"] is None
     assert response["error"]["code"] == -32700
     assert handled is False
     await input_transport.send("not-json")

@@ -97,6 +97,10 @@ async def _active_rpc_pair(
         instance_id="instance-1",
         environment_spec_id=_ENVIRONMENT_SPEC_ID,
         environment_id=_ENVIRONMENT_ID,
+        qwenpaw_version="0.1",
+        lock_sha256="0" * 64,
+        python_abi="cp313-cp313",
+        platform_tag="macosx_11_0_arm64",
         generation=7,
         capabilities=(),
     )
@@ -111,8 +115,7 @@ async def _active_rpc_pair(
     controller.accept_hello(
         HelloParams.from_mapping(
             {
-                "protocol_min": 1,
-                "protocol_max": 1,
+                "protocol_version": 1,
                 "qwenpaw_version": "0.1",
                 "channel_key": "voice",
                 "instance_id": "instance-1",

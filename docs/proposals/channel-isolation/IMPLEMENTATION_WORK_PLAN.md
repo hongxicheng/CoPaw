@@ -326,32 +326,45 @@ descriptor validator 和聚焦单测机械验证；ADR-035/036 已确认。独�
 
 ### CH-0-004：JSON-RPC 2.0、Schema 和生命周期
 
-- 状态：[~] 原独立 Review 已通过；新协议审查发现入站准入、版本、hello 校验和
-  JSON-RPC conformance 缺口，待修复和重新 Review
+- 状态：[~] 原独立 Review 已通过；新协议审查缺口及本轮 cancel/close P1 已修复
+  并通过本地验证，待重新独立 Review 和跨平台增量复验
 
 本轮只处理以下新审查问题，不重新打开已通过的 response lifecycle、generation authority
 或平台原型设计：
 
-- [ ] 将 `runner.hello` 的 `protocol_min/max` 收敛为单一必填 `protocol_version`，Core 与
+- [x] 将 `runner.hello` 的 `protocol_min/max` 收敛为单一必填 `protocol_version`，Core 与
   Runner 必须完全相等；DTO 保持 closed，不实现版本范围协商或多版本 schema dispatcher，
   capability intersection 继续只表达同版本内的可选能力。本轮未发布原型直接定稿为
   `protocol_version=1`，G0 冻结后的 wire 变化才递增版本（ADR-042）。
-- [ ] `RpcLimits` 分别限制本地 pending、入站 request 和普通 notification；
+- [x] `RpcLimits` 分别限制本地 pending、入站 request 和普通 notification；
   `request.cancel` 在 reader 路径直接处理且不占 notification 容量，所有 notification task
   可观测并在关闭时回收；入站 request 过载使用 `-32021`/`RPC_BACKPRESSURE`。
-- [ ] 执行中的重复 request ID 在启动 handler 前使用
+- [x] 执行中的重复 request ID 在启动 handler 前使用
   `-32020`/`RPC_REQUEST_ID_IN_USE` 拒绝；不得覆盖 owner、执行第二次副作用或发送第二个
   成功 response，done callback 只能删除仍属于自己的索引（ADR-043）。
-- [ ] 补齐 JSON-RPC conformance vectors：parse error `-32700`、envelope invalid
+- [x] 补齐 JSON-RPC conformance vectors：parse error `-32700`、envelope invalid
   `-32600`、已识别方法的 params invalid `-32602`、合法 notification 无响应、无合法 ID 的
   Invalid Request 使用 `id=null`；本地 pending 过载不得再冒充 Invalid Request。
-- [ ] Core 保存并逐项比较 hello 的预期 `qwenpaw_version`、`environment_spec_id`、
+- [x] Core 保存并逐项比较 hello 的预期 `qwenpaw_version`、`environment_spec_id`、
   `environment_id`、`lock_sha256`、Python ABI 和 platform tag；这些字段不是诊断性自报。
   `source_revision` 的 DTO/预期值接入仍由 `CH-0-010` 实现，正式 manifest/实际解释器取值
   接线仍属于 Phase 1/2。
-- [ ] 添加并发洪峰、重复 ID/cancel/owner cleanup、notification shutdown、完全版本匹配、
+- [~] 添加并发洪峰、重复 ID/cancel/owner cleanup、notification shutdown、完全版本匹配、
   hello 各字段 mismatch 和 JSON-RPC conformance 测试；运行 CH-0-004 聚焦矩阵、完整
-  `tests/unit/channel_isolation`、目标文件 pre-commit 和 `git diff --check`，随后独立 Review。
+  `tests/unit/channel_isolation`、目标文件 pre-commit 和 `git diff --check`；本地验证已
+  完成，独立 Review 待执行。
+- [x] 迟到 `request.cancel` 只定位接收端当前 incoming owner；owner 已清理则
+  幂等忽略，不得误取消反向同号 pending request。
+- [x] `RpcPeer.aclose()` 在禁止新准入后由唯一共享 close task 回收 reader、
+  request、notification 和 transport；等待者取消不中断清理，重试等待同一结果。
+- [~] 迟到 cancel 反向同号和 transport close/task reap 阶段取消回归测试已补齐；
+  本地验证已通过，重新独立 Review 待执行。
+
+本轮当前验证证据：CH-0-004 聚焦矩阵 `169 passed`；完整
+`tests/unit/channel_isolation` 为 `370 passed`；本地 G0 同范围矩阵为
+`891 passed, 1 skipped`。目标文件 pre-commit 和 `git diff --check` 通过。
+该证据尚未经独立 Review 或 Linux、macOS、Windows 跨平台增量复验，
+CH-0-004 和 G0 继续保持 `[~]`。
 
 - [x] 用唯一 Runner route/cleanup aggregate 替换 lifecycle response scope、Driver route
   tombstone 和 Host State 散落状态；本项与 CH-0-007 飞书基础设施做一次垂直迁移。
