@@ -29,7 +29,11 @@ from .models import (
     RejectedEvent,
     is_external_host,
 )
-from .reliability import InboundInbox, OutboundDeliveryLedger
+from .reliability import (
+    DeliveryStateConflictError,
+    InboundInbox,
+    OutboundDeliveryLedger,
+)
 from .rpc import RpcPeer
 
 
@@ -354,7 +358,14 @@ class CoreLifecycleAdapter:
             params,
             allowed_phases=("active",),
         ):
-            state = self.delivery_ledger.apply(params)
+            try:
+                state = self.delivery_ledger.apply(params)
+            except DeliveryStateConflictError as exc:
+                raise RpcError(
+                    RPC_LIFECYCLE_ERROR,
+                    str(exc),
+                    data={"reason_code": exc.reason_code},
+                ) from exc
             return {
                 "status": "recorded",
                 "delivery_id": params.delivery_id,

@@ -594,17 +594,21 @@ CH-2-005 的独立任务。
 
 ### CH-0-005：可靠事件、ACK 和幂等原型
 
-- 状态：[~] 原独立 Review 已通过；新证据发现 Delivery 转换允许终态重入，待修复和
-  重新 Review
+- 状态：[x] ADR-044 Delivery 修复完成，独立 Review 和最终验证通过
 
-- [ ] 按 ADR-044 实现 `absent -> requested -> sending -> terminal` 单向状态机，允许从
+- [x] 按 ADR-044 实现 `absent -> requested -> sending -> terminal` 单向状态机，允许从
   `requested` 直接进入终态和相同状态幂等重复；`acknowledged`、`failed`、`timeout`、
   `unknown` 全部不可变，冲突 update 返回 `DELIVERY_STATE_CONFLICT` 并保留原状态。
-- [ ] Core 是 `requested` 的唯一创建者，Runner `delivery.update` 只接受 `sending` 或终态；
+- [x] Core 是 `requested` 的唯一创建者，Runner `delivery.update` 只接受 `sending` 或终态；
   结果可能迟到或不确定时必须使用 `unknown`，重试使用新 `delivery_id`，v1 不添加
   `retry_of`。补齐完整转换表、late ACK、终态冲突、快路径直接终态和重启恢复测试，并运行
   CH-0-005 聚焦测试、完整 `tests/unit/channel_isolation`、目标文件 pre-commit、
   `git diff --check` 及独立 Review。
+
+本轮本地实施验证：CH-0-005 与直接相关 Host Adapter 聚焦矩阵 `49 passed`，完整
+`tests/unit/channel_isolation` 为 `389 passed`，目标代码和测试文件 pre-commit 全部通过。
+独立 Review 已通过（用户确认）；正式 Linux、macOS、Windows 增量矩阵尚未执行，任务更新
+为 `[x]`，G0 保持 `[~]`。
 
 - [x] 定义 `event.batch`、`batch_id`、稳定 `event_id` 和
   accepted/duplicate/rejected ACK；rejected 带 reason code 与 `retryable`。
@@ -869,7 +873,7 @@ environment installer、Console 弹窗或正式 Channel 打包。
 
 ### G0 Gate
 
-- 状态：[~] 原 Gate 已通过；CH-0-004 跨平台增量矩阵、CH-0-005 协议修复和
+- 状态：[~] 原 Gate 已通过；CH-0-004/CH-0-005 跨平台增量矩阵和
   ADR-039 至 ADR-041 的 artifact 增量待复验，暂不允许进入 Phase 1
 
 - [~] 职责、descriptor、stdio framing、JSON-RPC、可靠投递、媒体和 Runner-owned Voice
@@ -879,8 +883,8 @@ environment installer、Console 弹窗或正式 Channel 打包。
 - [x] 飞书、OneBot、Voice/Twilio 三条纵向原型分别通过。
 - [~] CH-0-004 的精确协议版本、RPC 入站准入/重复 ID、hello 环境证明和 JSON-RPC
   conformance 已通过独立 Review；Linux、macOS、Windows 增量矩阵待执行。
-- [ ] CH-0-005 的不可变 Delivery 状态转换已通过独立 Review 及 Linux、macOS、Windows
-  测试。
+- [~] CH-0-005 的不可变 Delivery 状态转换已通过独立 Review；Linux、macOS、Windows
+  增量矩阵待执行。
 - [ ] CH-0-010 的 hello source identity、Runner support artifact/Channel `code_root` 分离
   已通过独立 Review 及 Linux、macOS、Windows 增量测试。
 - [ ] 协议修复和架构增量无阻塞当前 Phase 的 P0/P1。

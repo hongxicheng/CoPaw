@@ -1256,6 +1256,11 @@ class DeliveryUpdateParams(IdentityParams):
                 "unsupported delivery state",
                 path=("state",),
             ) from exc
+        if state is DeliveryState.REQUESTED:
+            raise _error(
+                "delivery update state must be sending or terminal",
+                path=("state",),
+            )
         return cls(
             **identity.__dict__,
             delivery_id=_string(data.get("delivery_id"), "delivery_id"),

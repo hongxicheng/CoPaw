@@ -16,6 +16,24 @@ from .models import (
 )
 
 
+class DeliveryStateConflictError(ValueError):
+    """Report an attempted non-monotonic delivery transition."""
+
+    reason_code = "DELIVERY_STATE_CONFLICT"
+
+    def __init__(
+        self,
+        delivery_id: str,
+        current: DeliveryState | None,
+        next_state: DeliveryState,
+    ) -> None:
+        current_value = current.value if current is not None else "absent"
+        super().__init__(
+            f"{self.reason_code}: delivery {delivery_id} cannot transition "
+            f"from {current_value} to {next_state.value}",
+        )
+
+
 @dataclass(frozen=True)
 class RetryPolicy:
     """Bounded deterministic exponential retry policy."""
@@ -101,18 +119,46 @@ class OutboundDeliveryLedger:
 
     def request(self, delivery_id: str) -> DeliveryState:
         """Create a delivery in the requested state once."""
-        if delivery_id not in self.states:
+        current = self.states.get(delivery_id)
+        if current is None:
             self._record(delivery_id, DeliveryState.REQUESTED)
-        return self.states[delivery_id]
+            return DeliveryState.REQUESTED
+        if current is not DeliveryState.REQUESTED:
+            raise DeliveryStateConflictError(
+                delivery_id,
+                current,
+                DeliveryState.REQUESTED,
+            )
+        return current
 
     def apply(self, update: DeliveryUpdateParams) -> DeliveryState:
         """Apply a monotonic delivery update without replacing its ID."""
         current = self.states.get(update.delivery_id)
-        if current in {
-            DeliveryState.ACKNOWLEDGED,
-            DeliveryState.UNKNOWN,
-        }:
+        if current is update.state and current is not DeliveryState.REQUESTED:
             return current
+        terminal_states = {
+            DeliveryState.ACKNOWLEDGED,
+            DeliveryState.FAILED,
+            DeliveryState.TIMEOUT,
+            DeliveryState.UNKNOWN,
+        }
+        valid_transition = (
+            current is DeliveryState.REQUESTED
+            and update.state
+            in {
+                DeliveryState.SENDING,
+                *terminal_states,
+            }
+        ) or (
+            current is DeliveryState.SENDING
+            and update.state in terminal_states
+        )
+        if not valid_transition:
+            raise DeliveryStateConflictError(
+                update.delivery_id,
+                current,
+                update.state,
+            )
         self._record(update.delivery_id, update.state)
         return update.state
 
@@ -215,6 +261,7 @@ def delivery_updates(
 
 
 __all__ = [
+    "DeliveryStateConflictError",
     "InboundInbox",
     "OutboundDeliveryLedger",
     "RetryPolicy",

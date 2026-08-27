@@ -680,6 +680,7 @@ async def test_independent_rpc_authority_admits_core_host_methods() -> None:
                 "state": "acknowledged",
             },
         )
+        adapter.delivery_ledger.request("independent-delivery")
         result = await runner.call(
             "delivery.update",
             delivery.to_mapping(),

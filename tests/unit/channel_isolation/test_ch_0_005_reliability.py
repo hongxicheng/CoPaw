@@ -23,6 +23,7 @@ from qwenpaw.channel_protocol import (
     PrepareParams,
     ProtocolValidationError,
     RetryPolicy,
+    RpcError,
     RpcLimits,
     RpcPeer,
     RpcTimeoutError,
@@ -33,6 +34,12 @@ from qwenpaw.channel_protocol import (
 
 _ENVIRONMENT_SPEC_ID = f"ches1_{'1' * 64}"
 _ENVIRONMENT_ID = f"{_ENVIRONMENT_SPEC_ID}.install1_{'2' * 32}"
+_TERMINAL_DELIVERY_STATES = (
+    DeliveryState.ACKNOWLEDGED,
+    DeliveryState.FAILED,
+    DeliveryState.TIMEOUT,
+    DeliveryState.UNKNOWN,
+)
 
 
 class MemoryTransport:
@@ -176,6 +183,20 @@ def _batch(*event_ids: str) -> EventBatchParams:
             "batch_id": "generation-7-batch-1",
             "events": [_event(event_id) for event_id in event_ids],
         },
+    )
+
+
+def _delivery_update(
+    delivery_id: str,
+    state: DeliveryState,
+) -> DeliveryUpdateParams:
+    """Return one stable Runner delivery update."""
+    return DeliveryUpdateParams(
+        channel_key="voice",
+        instance_id="instance-1",
+        generation=7,
+        delivery_id=delivery_id,
+        state=state,
     )
 
 
@@ -352,53 +373,131 @@ def test_retry_policy_retries_unacknowledged_and_retryable_events() -> None:
     ) == ((), None)
 
 
-def test_delivery_ledger_preserves_unknown_and_restart_state() -> None:
-    """Unknown results are retained and never implicitly acknowledged."""
+def test_delivery_update_rejects_requested_state() -> None:
+    """Only Core can create the requested delivery state."""
+    with pytest.raises(ProtocolValidationError):
+        DeliveryUpdateParams.from_mapping(
+            {
+                "channel_key": "voice",
+                "instance_id": "instance-1",
+                "generation": 7,
+                "delivery_id": "delivery-1",
+                "state": "requested",
+            },
+        )
+
+
+@pytest.mark.parametrize("terminal_state", _TERMINAL_DELIVERY_STATES)
+@pytest.mark.parametrize("via_sending", [False, True])
+def test_delivery_ledger_accepts_all_forward_transitions(
+    terminal_state: DeliveryState,
+    via_sending: bool,
+) -> None:
+    """Every documented forward path reaches one terminal state."""
     ledger = OutboundDeliveryLedger()
     assert ledger.request("delivery-1") is DeliveryState.REQUESTED
-    update = DeliveryUpdateParams.from_mapping(
-        {
-            "channel_key": "voice",
-            "instance_id": "instance-1",
-            "generation": 7,
-            "delivery_id": "delivery-1",
-            "state": "unknown",
-            "retryable": False,
-        },
-    )
-    assert ledger.apply(update) is DeliveryState.UNKNOWN
+    assert ledger.request("delivery-1") is DeliveryState.REQUESTED
+    if via_sending:
+        sending = _delivery_update("delivery-1", DeliveryState.SENDING)
+        assert ledger.apply(sending) is DeliveryState.SENDING
+        assert ledger.apply(sending) is DeliveryState.SENDING
+        with pytest.raises(ValueError, match="DELIVERY_STATE_CONFLICT"):
+            ledger.request("delivery-1")
+        assert ledger.states["delivery-1"] is DeliveryState.SENDING
+    terminal = _delivery_update("delivery-1", terminal_state)
+    assert ledger.apply(terminal) is terminal_state
+    assert ledger.apply(terminal) is terminal_state
+    expected_history = [DeliveryState.REQUESTED]
+    if via_sending:
+        expected_history.append(DeliveryState.SENDING)
+    expected_history.append(terminal_state)
+    assert ledger.history["delivery-1"] == expected_history
+
+
+@pytest.mark.parametrize(
+    "state",
+    (DeliveryState.SENDING, *_TERMINAL_DELIVERY_STATES),
+)
+def test_delivery_ledger_rejects_runner_created_delivery(
+    state: DeliveryState,
+) -> None:
+    """A Runner update cannot create an absent delivery ID."""
+    ledger = OutboundDeliveryLedger()
+    with pytest.raises(ValueError, match="DELIVERY_STATE_CONFLICT"):
+        ledger.apply(_delivery_update("delivery-1", state))
+    assert not ledger.states
+    assert not ledger.history
+
+
+@pytest.mark.parametrize("terminal_state", _TERMINAL_DELIVERY_STATES)
+def test_delivery_terminal_state_is_immutable_after_restart(
+    terminal_state: DeliveryState,
+) -> None:
+    """Recovered terminal states reject late or conflicting results."""
+    ledger = OutboundDeliveryLedger()
+    ledger.request("delivery-1")
+    ledger.apply(_delivery_update("delivery-1", terminal_state))
     restored = OutboundDeliveryLedger.from_snapshot(ledger.snapshot())
-    late_ack = DeliveryUpdateParams(
-        channel_key="voice",
-        instance_id="instance-1",
-        generation=7,
-        delivery_id="delivery-1",
-        state=DeliveryState.ACKNOWLEDGED,
-    )
-    assert restored.apply(late_ack) is DeliveryState.UNKNOWN
-    assert not delivery_is_safe_to_retry(DeliveryState.UNKNOWN)
-    assert delivery_is_safe_to_retry(DeliveryState.TIMEOUT)
-    retry_update = DeliveryUpdateParams(
-        channel_key="voice",
-        instance_id="instance-1",
-        generation=7,
-        delivery_id="delivery-2",
-        state=DeliveryState.FAILED,
-    )
-    ledger.request("delivery-2")
-    assert ledger.apply(retry_update) is DeliveryState.FAILED
+    original_history = list(restored.history["delivery-1"])
+    for conflicting_state in DeliveryState:
+        if conflicting_state is terminal_state:
+            continue
+        with pytest.raises(ValueError, match="DELIVERY_STATE_CONFLICT"):
+            if conflicting_state is DeliveryState.REQUESTED:
+                restored.request("delivery-1")
+            else:
+                restored.apply(
+                    _delivery_update("delivery-1", conflicting_state),
+                )
+        assert restored.states["delivery-1"] is terminal_state
+        assert restored.history["delivery-1"] == original_history
+
+
+def test_delivery_retry_uses_a_new_id() -> None:
+    """A retry cannot reopen its failed predecessor delivery ID."""
+    ledger = OutboundDeliveryLedger()
+    ledger.request("delivery-1")
+    ledger.apply(_delivery_update("delivery-1", DeliveryState.FAILED))
+    with pytest.raises(ValueError, match="DELIVERY_STATE_CONFLICT"):
+        ledger.apply(
+            _delivery_update("delivery-1", DeliveryState.SENDING),
+        )
+    assert ledger.request("delivery-2") is DeliveryState.REQUESTED
     assert (
         ledger.apply(
-            DeliveryUpdateParams(
-                channel_key="voice",
-                instance_id="instance-1",
-                generation=7,
-                delivery_id="delivery-2",
-                state=DeliveryState.SENDING,
-            ),
+            _delivery_update("delivery-2", DeliveryState.SENDING),
         )
         is DeliveryState.SENDING
     )
+    assert ledger.states["delivery-1"] is DeliveryState.FAILED
+    assert not delivery_is_safe_to_retry(DeliveryState.UNKNOWN)
+    assert delivery_is_safe_to_retry(DeliveryState.TIMEOUT)
+
+
+@pytest.mark.asyncio
+async def test_delivery_update_rpc_rejects_conflicts() -> None:
+    """Core maps immutable delivery conflicts to one stable RPC error."""
+    adapter, core, runner = await _active_rpc_pair()
+    adapter.delivery_ledger.request("delivery-1")
+    unknown = _delivery_update("delivery-1", DeliveryState.UNKNOWN)
+    recorded = await runner.call("delivery.update", unknown.to_mapping())
+    assert recorded["state"] == "unknown"
+    repeated = await runner.call("delivery.update", unknown.to_mapping())
+    assert repeated["state"] == "unknown"
+    for update in (
+        _delivery_update("delivery-1", DeliveryState.ACKNOWLEDGED),
+        _delivery_update("missing-delivery", DeliveryState.SENDING),
+    ):
+        with pytest.raises(RpcError) as error:
+            await runner.call("delivery.update", update.to_mapping())
+        assert error.value.data == {
+            "reason_code": "DELIVERY_STATE_CONFLICT",
+        }
+    assert (
+        adapter.delivery_ledger.states["delivery-1"] is DeliveryState.UNKNOWN
+    )
+    assert "missing-delivery" not in adapter.delivery_ledger.states
+    await asyncio.gather(core.aclose(), runner.aclose())
 
 
 @pytest.mark.asyncio
