@@ -254,7 +254,10 @@ class SlackSender:
     ) -> Optional[str]:
         """Upload an image via ``files.uploadV2``."""
         url: Optional[str] = getattr(part, "image_url", None)
-        filename = getattr(part, "filename", None) or "image.png"
+        default_name = (
+            "image" if url and url.startswith("data:") else "image.png"
+        )
+        filename = getattr(part, "filename", None) or default_name
 
         if not url:
             logger.warning("slack send: image has no url")
@@ -284,7 +287,7 @@ class SlackSender:
             or getattr(part, "video_url", None)
         )
         filename = getattr(part, "filename", None)
-        if not filename and url:
+        if not filename and url and not url.startswith("data:"):
             filename = os.path.basename(url) or "file"
         filename = filename or "file"
 
@@ -320,19 +323,21 @@ class SlackSender:
         * Other remote URL → blocked (SSRF).
         """
         if url.startswith("data:"):
-            with materialize_data_url(
+            async with materialize_data_url(
                 url,
                 self._channel.media_dir,
                 filename_hint=filename,
-            ) as local_path:
-                if not local_path:
+            ) as media:
+                if media is None:
                     return None
                 return await self._upload_file_external(
                     client,
                     channel_id,
-                    local_path,
-                    filename,
-                    title=title,
+                    media.path,
+                    media.filename or filename,
+                    title=(media.filename or filename)
+                    if title == filename
+                    else title,
                     thread_ts=thread_ts,
                 )
 

@@ -1142,6 +1142,7 @@ class WeChatChannel(BaseChannel):
         file_path: str,
         content_type: ContentType,
         send_meta: Optional[Dict[str, Any]] = None,
+        filename: Optional[str] = None,
     ) -> None:
         """Send a media file (image/file/video) to WeChat.
 
@@ -1159,16 +1160,16 @@ class WeChatChannel(BaseChannel):
             return
 
         try:
-            with materialize_data_url(
+            async with materialize_data_url(
                 file_path,
                 self._media_dir,
-                filename_hint=getattr(file_path, "name", "media"),
+                filename_hint=filename,
             ) as materialized:
-                if not materialized:
+                if materialized is None or not materialized.path:
                     return
                 # Convert URL to local path if it's a file:// URL
-                local_path = file_url_to_local_path(materialized)
-                local_path = local_path or materialized
+                local_path = file_url_to_local_path(materialized.path)
+                local_path = local_path or materialized.path
 
                 # Check if file exists
                 path_obj = Path(local_path)
@@ -1188,7 +1189,7 @@ class WeChatChannel(BaseChannel):
                         context_token,
                     )
                 elif content_type == ContentType.FILE:
-                    filename = path_obj.name
+                    filename = materialized.filename or path_obj.name
                     resp = await self._client.send_file(
                         to_user_id,
                         str(path_obj),
@@ -1425,6 +1426,10 @@ class WeChatChannel(BaseChannel):
                         file_url,
                         ContentType.FILE,
                         send_meta=m,
+                        filename=getattr(p, "filename", None)
+                        or (
+                            p.get("filename") if isinstance(p, dict) else None
+                        ),
                     )
             elif t == ContentType.VIDEO:
                 # Send video

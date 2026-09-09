@@ -836,10 +836,40 @@ class WecomChannel(BaseChannel):
             )
         return ack.get("body") or {}
 
+    @staticmethod
+    async def _read_data_url_file(
+        path: str,
+        media_type: str,
+    ) -> tuple[bytes, str]:
+        """Keep the temporary file alive until its worker releases it."""
+
+        def read_file() -> tuple[bytes, str]:
+            if media_type == "image":
+                return compress_image_for_wecom(path)
+            local = Path(path)
+            return local.read_bytes(), local.name
+
+        task = asyncio.create_task(asyncio.to_thread(read_file))
+        cancelled = False
+        # Shield every wait so repeated cancellation cannot release the path.
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                cancelled = True
+            except Exception:
+                break
+        try:
+            return task.result()
+        finally:
+            if cancelled:
+                raise asyncio.CancelledError
+
     async def _upload_media(  # pylint: disable=too-many-locals
         self,
         path: str,
         media_type: str,
+        filename_hint: Optional[str] = None,
     ) -> Optional[str]:
         """Upload a local file via WebSocket chunks; return media_id.
 
@@ -851,21 +881,37 @@ class WecomChannel(BaseChannel):
         """
         if not self._client or not self._upload_lock:
             return None
-        filename_hint = getattr(path, "name", "") or "media"
-        with materialize_data_url(
+        async with materialize_data_url(
             path,
             self._media_dir,
             filename_hint=filename_hint,
         ) as materialized:
+            if materialized is None:
+                return None
             # Strip file:// prefix
-            local = file_url_to_local_path(materialized) or materialized
+            local = (
+                file_url_to_local_path(materialized.path) or materialized.path
+            )
             p = Path(local)
             if not p.is_file():
                 logger.warning(f"wecom upload: file not found: {local[:80]}")
                 return None
 
             # Compress image if needed (WeCom has 2MB limit)
-            if media_type == "image":
+            if materialized.filename is not None:
+                data, filename = await self._read_data_url_file(
+                    local,
+                    media_type,
+                )
+                if media_type == "image":
+                    filename = str(
+                        Path(materialized.filename).with_suffix(
+                            Path(filename).suffix,
+                        ),
+                    )
+                else:
+                    filename = materialized.filename
+            elif media_type == "image":
                 data, filename = compress_image_for_wecom(local)
             else:
                 data = p.read_bytes()
@@ -977,7 +1023,14 @@ class WecomChannel(BaseChannel):
         if not raw_path:
             return
 
-        media_id = await self._upload_media(raw_path, media_type)
+        if raw_path.startswith("data:"):
+            media_id = await self._upload_media(
+                raw_path,
+                media_type,
+                filename_hint=getattr(part, "filename", None),
+            )
+        else:
+            media_id = await self._upload_media(raw_path, media_type)
         if not media_id:
             logger.warning("wecom: upload failed, skipping media part")
             return

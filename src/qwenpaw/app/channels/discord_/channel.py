@@ -666,14 +666,21 @@ class DiscordChannel(BaseChannel):
             return
 
         if url.startswith("data:"):
-            with materialize_data_url(
+            async with materialize_data_url(
                 url,
                 self._media_dir,
                 filename_hint=getattr(part, "filename", "image"),
-            ) as local_path:
-                if not local_path:
+            ) as media:
+                if media is None:
                     return
-                await target.send(file=discord.File(local_path))
+                attachment = discord.File(
+                    media.path,
+                    filename=media.filename,
+                )
+                try:
+                    await target.send(file=attachment)
+                finally:
+                    attachment.close()
             return
 
         temp_path = None

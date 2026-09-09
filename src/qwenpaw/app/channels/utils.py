@@ -8,22 +8,23 @@ from __future__ import annotations
 
 import os
 import re
+import asyncio
 import base64
 import binascii
 import logging
 import mimetypes
 import tempfile
-from contextlib import contextmanager
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Iterator, List, Optional, Tuple
+from pathlib import Path, PureWindowsPath
+from typing import AsyncIterator, List, Optional, Tuple
 from urllib.parse import urlparse
 from urllib.request import url2pathname
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_DATA_URL_MAX_BYTES = 50 * 1024 * 1024
-_SAFE_MEDIA_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
+_UNSAFE_MEDIA_NAME_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 _DEFAULT_MEDIA_SUFFIXES = {
     "image/jpeg": ".jpg",
     "image/png": ".png",
@@ -54,6 +55,14 @@ class DataUrlMedia:
         return len(self.data)
 
 
+@dataclass(frozen=True)
+class MaterializedMedia:
+    """Upload path and optional display name for an owned temporary file."""
+
+    path: str
+    filename: Optional[str] = None
+
+
 def parse_data_url(
     value: str,
     *,
@@ -64,11 +73,11 @@ def parse_data_url(
         return None
 
     try:
-        header, encoded = value[5:].split(",", 1)
+        header, encoded = value.split(",", 1)
     except ValueError as exc:
         raise MediaDataError("data URL is missing a payload") from exc
 
-    header_parts = [part.strip().lower() for part in header.split(";")]
+    header_parts = [part.strip().lower() for part in header[5:].split(";")]
     media_type = header_parts[0] or "application/octet-stream"
     if "base64" not in header_parts[1:]:
         raise MediaDataError("data URL is not Base64 encoded")
@@ -98,47 +107,100 @@ def parse_data_url(
     return DataUrlMedia(data=data, media_type=media_type, suffix=suffix)
 
 
-def _safe_media_stem(filename_hint: str) -> str:
-    """Return a portable filename stem for a generated media file."""
-    stem = Path(filename_hint or "media").stem
-    stem = _SAFE_MEDIA_NAME_RE.sub("_", stem).strip("._")
-    return (stem or "media")[:64]
+async def parse_data_url_async(
+    value: str,
+    *,
+    max_bytes: int = DEFAULT_DATA_URL_MAX_BYTES,
+) -> Optional[DataUrlMedia]:
+    """Decode data references in a worker; pass other references through."""
+    if not isinstance(value, str) or not value.startswith("data:"):
+        return None
+    return await asyncio.to_thread(
+        parse_data_url,
+        value,
+        max_bytes=max_bytes,
+    )
 
 
-@contextmanager
-def materialize_data_url(
+def data_url_filename(filename_hint: Optional[str], suffix: str) -> str:
+    """Choose a display basename independently of the temporary path."""
+    name = PureWindowsPath(filename_hint or "").name
+    name = _UNSAFE_MEDIA_NAME_RE.sub("_", name).strip(" .")
+    if not name:
+        return f"file{suffix}"
+    return name if Path(name).suffix else f"{name}{suffix}"
+
+
+def _materialize_data_url(
     value: str,
     directory: Path,
-    *,
-    filename_hint: str = "",
-    max_bytes: int = DEFAULT_DATA_URL_MAX_BYTES,
-) -> Iterator[str]:
-    """Yield a local path for a data URL and remove it after use."""
+    filename_hint: Optional[str],
+    max_bytes: int,
+) -> Optional[MaterializedMedia]:
+    """Decode and write one owned temporary file in a worker thread."""
     try:
         media = parse_data_url(value, max_bytes=max_bytes)
     except MediaDataError as exc:
         logger.warning(f"media data URL rejected: {exc}")
-        yield ""
-        return
+        return None
     if media is None:
-        yield value
-        return
+        return None
 
     directory.mkdir(parents=True, exist_ok=True)
     fd, path = tempfile.mkstemp(
-        prefix=f"outbound_{_safe_media_stem(filename_hint)}_",
+        prefix="outbound_",
         suffix=media.suffix,
         dir=str(directory),
     )
     try:
         with os.fdopen(fd, "wb") as media_file:
             media_file.write(media.data)
-        yield path
+        return MaterializedMedia(
+            path=path,
+            filename=data_url_filename(filename_hint, media.suffix),
+        )
+    except BaseException:
+        _remove_media_file(path)
+        raise
+
+
+def _remove_media_file(path: str) -> None:
+    """Remove an owned temporary upload file, tolerating OS errors."""
+    try:
+        Path(path).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+@asynccontextmanager
+async def materialize_data_url(
+    value: str,
+    directory: Path,
+    *,
+    filename_hint: Optional[str] = None,
+    max_bytes: int = DEFAULT_DATA_URL_MAX_BYTES,
+) -> AsyncIterator[Optional[MaterializedMedia]]:
+    """Prepare media off-loop and clean up only owned temporary files."""
+    if not isinstance(value, str) or not value.startswith("data:"):
+        yield MaterializedMedia(path=value)
+        return
+
+    task = asyncio.create_task(
+        asyncio.to_thread(
+            _materialize_data_url,
+            value,
+            directory,
+            filename_hint,
+            max_bytes,
+        ),
+    )
+    try:
+        yield await asyncio.shield(task)
     finally:
-        try:
-            Path(path).unlink(missing_ok=True)
-        except OSError:
-            pass
+        # A cancelled sender must wait for creation before removing the file.
+        materialized = await task
+        if materialized is not None:
+            await asyncio.to_thread(_remove_media_file, materialized.path)
 
 
 _FENCE_RE = re.compile(r"^(`{3,}|~{3,})")
