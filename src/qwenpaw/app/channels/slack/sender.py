@@ -31,6 +31,7 @@ from .constants import (
 )
 from .format import chunk_slack_text, markdown_to_slack_mrkdwn
 from .utils import is_slack_host, with_retry
+from ..utils import materialize_data_url
 
 if TYPE_CHECKING:
     from slack_sdk.web.async_client import AsyncWebClient
@@ -318,6 +319,23 @@ class SlackSender:
         * Remote URL on Slack's domain → ``files.uploadV2``.
         * Other remote URL → blocked (SSRF).
         """
+        if url.startswith("data:"):
+            with materialize_data_url(
+                url,
+                self._channel.media_dir,
+                filename_hint=filename,
+            ) as local_path:
+                if not local_path:
+                    return None
+                return await self._upload_file_external(
+                    client,
+                    channel_id,
+                    local_path,
+                    filename,
+                    title=title,
+                    thread_ts=thread_ts,
+                )
+
         local_path = _resolve_local_file_path(url)
         if local_path:
             return await self._upload_file_external(

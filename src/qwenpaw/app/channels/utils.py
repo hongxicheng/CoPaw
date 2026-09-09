@@ -8,9 +8,138 @@ from __future__ import annotations
 
 import os
 import re
-from typing import List, Optional, Tuple
+import base64
+import binascii
+import logging
+import mimetypes
+import tempfile
+from contextlib import contextmanager
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterator, List, Optional, Tuple
 from urllib.parse import urlparse
 from urllib.request import url2pathname
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_DATA_URL_MAX_BYTES = 50 * 1024 * 1024
+_SAFE_MEDIA_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
+_DEFAULT_MEDIA_SUFFIXES = {
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/gif": ".gif",
+    "image/webp": ".webp",
+    "audio/mpeg": ".mp3",
+    "audio/wav": ".wav",
+    "audio/ogg": ".ogg",
+    "video/mp4": ".mp4",
+}
+
+
+class MediaDataError(ValueError):
+    """Raised when a data URL cannot be safely decoded."""
+
+
+@dataclass(frozen=True)
+class DataUrlMedia:
+    """Decoded media data and its normalized MIME metadata."""
+
+    data: bytes
+    media_type: str
+    suffix: str
+
+    @property
+    def size(self) -> int:
+        """Return the decoded byte count."""
+        return len(self.data)
+
+
+def parse_data_url(
+    value: str,
+    *,
+    max_bytes: int = DEFAULT_DATA_URL_MAX_BYTES,
+) -> Optional[DataUrlMedia]:
+    """Decode a Base64 data URL, or return None for other references."""
+    if not isinstance(value, str) or not value.startswith("data:"):
+        return None
+
+    try:
+        header, encoded = value[5:].split(",", 1)
+    except ValueError as exc:
+        raise MediaDataError("data URL is missing a payload") from exc
+
+    header_parts = [part.strip().lower() for part in header.split(";")]
+    media_type = header_parts[0] or "application/octet-stream"
+    if "base64" not in header_parts[1:]:
+        raise MediaDataError("data URL is not Base64 encoded")
+
+    compact = "".join(encoded.split())
+    if not compact:
+        raise MediaDataError("data URL has an empty Base64 payload")
+    estimated_size = (len(compact) * 3) // 4
+    estimated_size -= compact.endswith("=")
+    estimated_size -= compact.endswith("==")
+    if estimated_size > max_bytes:
+        raise MediaDataError(
+            f"data URL exceeds the {max_bytes} byte size limit",
+        )
+
+    try:
+        data = base64.b64decode(compact, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise MediaDataError("data URL contains invalid Base64") from exc
+    if len(data) > max_bytes:
+        raise MediaDataError(
+            f"data URL exceeds the {max_bytes} byte size limit",
+        )
+
+    suffix = mimetypes.guess_extension(media_type, strict=False)
+    suffix = suffix or _DEFAULT_MEDIA_SUFFIXES.get(media_type, ".bin")
+    return DataUrlMedia(data=data, media_type=media_type, suffix=suffix)
+
+
+def _safe_media_stem(filename_hint: str) -> str:
+    """Return a portable filename stem for a generated media file."""
+    stem = Path(filename_hint or "media").stem
+    stem = _SAFE_MEDIA_NAME_RE.sub("_", stem).strip("._")
+    return (stem or "media")[:64]
+
+
+@contextmanager
+def materialize_data_url(
+    value: str,
+    directory: Path,
+    *,
+    filename_hint: str = "",
+    max_bytes: int = DEFAULT_DATA_URL_MAX_BYTES,
+) -> Iterator[str]:
+    """Yield a local path for a data URL and remove it after use."""
+    try:
+        media = parse_data_url(value, max_bytes=max_bytes)
+    except MediaDataError as exc:
+        logger.warning(f"media data URL rejected: {exc}")
+        yield ""
+        return
+    if media is None:
+        yield value
+        return
+
+    directory.mkdir(parents=True, exist_ok=True)
+    fd, path = tempfile.mkstemp(
+        prefix=f"outbound_{_safe_media_stem(filename_hint)}_",
+        suffix=media.suffix,
+        dir=str(directory),
+    )
+    try:
+        with os.fdopen(fd, "wb") as media_file:
+            media_file.write(media.data)
+        yield path
+    finally:
+        try:
+            Path(path).unlink(missing_ok=True)
+        except OSError:
+            pass
+
 
 _FENCE_RE = re.compile(r"^(`{3,}|~{3,})")
 

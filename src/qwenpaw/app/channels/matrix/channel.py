@@ -72,6 +72,7 @@ from qwenpaw.schemas import (
 from ....app.channels.renderer import ChannelDisplayConfig
 from ....app.channels.base import BaseChannel
 from ....app.channels.utils import file_url_to_local_path
+from ....app.channels.utils import parse_data_url
 from ....constant import WORKING_DIR
 
 logger = logging.getLogger("qwenpaw.channels.matrix")
@@ -2375,6 +2376,24 @@ class MatrixChannel(BaseChannel):
         if not self._client:
             return None
         try:
+            data_media = parse_data_url(file_ref)
+            if data_media is not None:
+                data = data_media.data
+                mime_type = data_media.media_type
+                filename = f"file{data_media.suffix}"
+                resp, _ = await self._client.upload(
+                    io.BytesIO(data),
+                    content_type=mime_type,
+                    filename=filename,
+                    filesize=len(data),
+                )
+                if isinstance(resp, UploadResponse):
+                    return resp.content_uri
+                logger.warning(
+                    f"MatrixChannel: data URL upload failed: {resp}",
+                )
+                return None
+
             # file_ref may be a file:// URI or a plain path
             path = Path(file_url_to_local_path(file_ref) or file_ref)
             if not path.exists():

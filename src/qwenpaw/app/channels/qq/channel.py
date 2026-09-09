@@ -45,7 +45,12 @@ from ..base import (
     OutgoingContentPart,
     ProcessHandler,
 )
-from ..utils import file_url_to_local_path, split_text
+from ..utils import (
+    file_url_to_local_path,
+    materialize_data_url,
+    parse_data_url,
+    split_text,
+)
 
 if TYPE_CHECKING:
     import concurrent.futures
@@ -2249,6 +2254,7 @@ class QQChannel(BaseChannel):
                 message_type,
             )
 
+    # pylint: disable=too-many-return-statements
     async def _send_media_c2c_or_group(
         self,
         *,
@@ -2301,6 +2307,16 @@ class QQChannel(BaseChannel):
                     local_path,
                 )
                 return
+        elif url and url.startswith("data:"):
+            try:
+                data_media = parse_data_url(url)
+            except ValueError as exc:
+                logger.warning(f"qq: invalid media data URL: {exc}")
+                return
+            if data_media is None:
+                return
+            file_data = base64.b64encode(data_media.data).decode("ascii")
+            display_filename = f"file{data_media.suffix}"
         elif url:
             display_filename = Path(url.split("?")[0]).name
 
@@ -2379,7 +2395,22 @@ class QQChannel(BaseChannel):
             return
 
         try:
-            if url:
+            if url and url.startswith("data:"):
+                with materialize_data_url(
+                    url,
+                    self._media_dir,
+                    filename_hint="image",
+                ) as materialized_path:
+                    if not materialized_path:
+                        return
+                    await _send_guild_image_file_async(
+                        self._http,
+                        token,
+                        path,
+                        materialized_path,
+                        msg_id,
+                    )
+            elif url:
                 await _send_guild_image_async(
                     self._http,
                     token,

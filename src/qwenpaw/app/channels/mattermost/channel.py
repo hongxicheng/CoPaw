@@ -29,7 +29,7 @@ from ..base import (
     OutgoingContentPart,
     ProcessHandler,
 )
-from ..utils import file_url_to_local_path
+from ..utils import file_url_to_local_path, materialize_data_url
 
 logger = logging.getLogger(__name__)
 
@@ -1030,18 +1030,25 @@ class MattermostChannel(BaseChannel):
 
         if not local_path:
             return
-        local_path = file_url_to_local_path(local_path) or local_path
-
-        file_id = await self._upload_file(mm_channel_id, local_path)
-        if file_id:
-            await self._post_message(mm_channel_id, "", root_id, [file_id])
-        else:
-            # Fallback: send file path as plain text
-            await self._post_message(
-                mm_channel_id,
-                f"[Attachment: {local_path}]",
-                root_id,
-            )
+        with materialize_data_url(
+            str(local_path),
+            self._media_dir,
+            filename_hint=getattr(part, "filename", "media"),
+        ) as materialized:
+            if not materialized:
+                return
+            local_path = file_url_to_local_path(materialized)
+            local_path = local_path or materialized
+            file_id = await self._upload_file(mm_channel_id, local_path)
+            if file_id:
+                await self._post_message(mm_channel_id, "", root_id, [file_id])
+            else:
+                # Fallback: send file path as plain text
+                await self._post_message(
+                    mm_channel_id,
+                    f"[Attachment: {local_path}]",
+                    root_id,
+                )
 
     # ------------------------------------------------------------------
     # BaseChannel interface

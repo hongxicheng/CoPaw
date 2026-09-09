@@ -1199,6 +1199,28 @@ class TestWecomChannelMediaUpload:
         assert media_id == "media_456"
 
     @pytest.mark.asyncio
+    async def test_upload_media_data_url_success(
+        self,
+        wecom_channel,
+        mock_ws_client,
+    ):
+        """_upload_media should decode a Base64 data URL before upload."""
+        wecom_channel._client = mock_ws_client
+        wecom_channel._upload_lock = MagicMock()
+        wecom_channel._send_ws_cmd = AsyncMock(
+            side_effect=[
+                {"upload_id": "upload_data_url"},
+                {},
+                {"media_id": "media_data_url"},
+            ],
+        )
+
+        data_url = "data:image/png;base64,dGVzdCBpbWFnZSBkYXRh"
+        media_id = await wecom_channel._upload_media(data_url, "image")
+
+        assert media_id == "media_data_url"
+
+    @pytest.mark.asyncio
     async def test_upload_media_no_client(self, wecom_channel, tmp_path):
         """_upload_media should return None if no client."""
         test_file = tmp_path / "test.jpg"

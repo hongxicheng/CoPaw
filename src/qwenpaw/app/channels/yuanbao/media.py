@@ -23,6 +23,8 @@ from urllib.parse import parse_qs, quote, unquote, urlparse
 
 import aiohttp
 
+from ..utils import parse_data_url
+
 logger = logging.getLogger(__name__)
 
 UPLOAD_INFO_PATH = "/api/resource/genUploadInfo"
@@ -297,9 +299,17 @@ async def download_and_upload_media(
     file_data: bytes
     filename: str
 
+    data_media = parse_data_url(media_path)
+    if data_media is not None:
+        file_data = data_media.data
+        filename = f"file{data_media.suffix}"
+        logger.info(
+            f"yuanbao media: decoded data URL ({len(file_data)} bytes)",
+        )
     # Resolve local file (file:// URI or absolute path)
-    local_path = _resolve_local_path(media_path)
-    if local_path and os.path.isfile(local_path):
+    else:
+        local_path = _resolve_local_path(media_path)
+    if data_media is None and local_path and os.path.isfile(local_path):
         file_data = Path(local_path).read_bytes()
         filename = os.path.basename(local_path)
         logger.info(
@@ -307,7 +317,7 @@ async def download_and_upload_media(
             filename,
             len(file_data),
         )
-    elif media_path.startswith(("http://", "https://")):
+    elif data_media is None and media_path.startswith(("http://", "https://")):
         async with session.get(media_path) as resp:
             if resp.status != 200:
                 raise RuntimeError(f"Failed to download media: {resp.status}")

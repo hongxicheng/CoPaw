@@ -47,7 +47,11 @@ from ..base import (
 )
 from .cards import WecomCardHandler
 from .utils import compress_image_for_wecom, format_markdown_tables
-from ..utils import file_url_to_local_path, split_text
+from ..utils import (
+    file_url_to_local_path,
+    materialize_data_url,
+    split_text,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -847,91 +851,96 @@ class WecomChannel(BaseChannel):
         """
         if not self._client or not self._upload_lock:
             return None
-        # Strip file:// prefix
-        local = file_url_to_local_path(path) or path
-        p = Path(local)
-        if not p.is_file():
-            logger.warning("wecom upload: file not found: %s", local[:80])
-            return None
+        filename_hint = getattr(path, "name", "") or "media"
+        with materialize_data_url(
+            path,
+            self._media_dir,
+            filename_hint=filename_hint,
+        ) as materialized:
+            # Strip file:// prefix
+            local = file_url_to_local_path(materialized) or materialized
+            p = Path(local)
+            if not p.is_file():
+                logger.warning(f"wecom upload: file not found: {local[:80]}")
+                return None
 
-        # Compress image if needed (WeCom has 2MB limit)
-        if media_type == "image":
-            data, filename = compress_image_for_wecom(local)
-        else:
-            data = p.read_bytes()
-            filename = p.name
+            # Compress image if needed (WeCom has 2MB limit)
+            if media_type == "image":
+                data, filename = compress_image_for_wecom(local)
+            else:
+                data = p.read_bytes()
+                filename = p.name
 
-        total_size = len(data)
-        md5 = hashlib.md5(data).hexdigest()
+            total_size = len(data)
+            md5 = hashlib.md5(data).hexdigest()
 
-        # Split into chunks
-        chunks: List[bytes] = [
-            data[i : i + _UPLOAD_CHUNK_SIZE]
-            for i in range(0, total_size, _UPLOAD_CHUNK_SIZE)
-        ]
-        total_chunks = len(chunks)
+            # Split into chunks
+            chunks: List[bytes] = [
+                data[i : i + _UPLOAD_CHUNK_SIZE]
+                for i in range(0, total_size, _UPLOAD_CHUNK_SIZE)
+            ]
+            total_chunks = len(chunks)
 
-        async with self._upload_lock:
-            try:
-                # Step 1: init
-                init_body = await self._send_ws_cmd(
-                    _UPLOAD_CMD_INIT,
-                    {
-                        "type": media_type,
-                        "filename": filename,
-                        "total_size": total_size,
-                        "total_chunks": total_chunks,
-                        "md5": md5,
-                    },
-                )
-                upload_id = init_body.get("upload_id", "")
-                if not upload_id:
-                    raise ChannelError(
-                        channel_name="wecom",
-                        message="wecom upload: empty upload_id",
-                    )
-                logger.debug(
-                    "wecom upload init: upload_id=%s chunks=%d",
-                    upload_id[:20],
-                    total_chunks,
-                )
-
-                # Step 2: chunks
-                for idx, chunk in enumerate(chunks):
-                    await self._send_ws_cmd(
-                        _UPLOAD_CMD_CHUNK,
+            async with self._upload_lock:
+                try:
+                    # Step 1: init
+                    init_body = await self._send_ws_cmd(
+                        _UPLOAD_CMD_INIT,
                         {
-                            "upload_id": upload_id,
-                            "chunk_index": idx,
-                            "base64_data": base64.b64encode(chunk).decode(),
+                            "type": media_type,
+                            "filename": filename,
+                            "total_size": total_size,
+                            "total_chunks": total_chunks,
+                            "md5": md5,
                         },
                     )
-
-                # Step 3: finish
-                finish_body = await self._send_ws_cmd(
-                    _UPLOAD_CMD_FINISH,
-                    {"upload_id": upload_id},
-                )
-                media_id = finish_body.get("media_id", "")
-                if not media_id:
-                    raise ChannelError(
-                        channel_name="wecom",
-                        message="wecom upload: empty media_id",
+                    upload_id = init_body.get("upload_id", "")
+                    if not upload_id:
+                        raise ChannelError(
+                            channel_name="wecom",
+                            message="wecom upload: empty upload_id",
+                        )
+                    logger.debug(
+                        f"wecom upload init: upload_id={upload_id[:20]} "
+                        f"chunks={total_chunks}",
                     )
-                logger.info(
-                    "wecom upload done: media_id=%s type=%s",
-                    media_id[:20],
-                    media_type,
-                )
-                return media_id
-            except Exception as e:
-                logger.exception(
-                    "wecom _upload_media failed path=%s error=%s",
-                    local[:60],
-                    str(e)[:100],
-                )
 
-                return None
+                    # Step 2: chunks
+                    for idx, chunk in enumerate(chunks):
+                        await self._send_ws_cmd(
+                            _UPLOAD_CMD_CHUNK,
+                            {
+                                "upload_id": upload_id,
+                                "chunk_index": idx,
+                                "base64_data": (
+                                    base64.b64encode(chunk).decode()
+                                ),
+                            },
+                        )
+
+                    # Step 3: finish
+                    finish_body = await self._send_ws_cmd(
+                        _UPLOAD_CMD_FINISH,
+                        {"upload_id": upload_id},
+                    )
+                    media_id = finish_body.get("media_id", "")
+                    if not media_id:
+                        raise ChannelError(
+                            channel_name="wecom",
+                            message="wecom upload: empty media_id",
+                        )
+                    logger.info(
+                        f"wecom upload done: media_id={media_id[:20]} "
+                        f"type={media_type}",
+                    )
+                    return media_id
+                except Exception as e:
+                    logger.exception(
+                        f"wecom _upload_media failed path={local[:60]} "
+                        f"error={str(e)[:100]}",
+                    )
+
+                    return None
 
     async def _send_media_part(
         self,

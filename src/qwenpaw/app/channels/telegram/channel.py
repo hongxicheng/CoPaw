@@ -35,7 +35,7 @@ from qwenpaw.schemas import (
 from ....config.config import TelegramConfig as TelegramChannelConfig
 from ....constant import WORKING_DIR
 from .format_html import markdown_to_telegram_html
-from ..utils import file_url_to_local_path
+from ..utils import file_url_to_local_path, materialize_data_url
 from ..renderer import ChannelDisplayConfig
 from ..base import (
     BaseChannel,
@@ -1218,6 +1218,25 @@ class TelegramChannel(BaseChannel):
     ) -> None:
         """Send media from URL or local file path."""
         if not value:
+            return
+        if isinstance(value, str) and value.startswith("data:"):
+            with materialize_data_url(
+                value,
+                self._media_dir,
+                filename_hint=payload_name,
+            ) as local_path:
+                if not local_path:
+                    raise _MediaFileUnavailableError(
+                        "Could not decode media data URL.",
+                    )
+                await self._send_media_value(
+                    bot=bot,
+                    chat_id=chat_id,
+                    value=f"file://{local_path}",
+                    method_name=method_name,
+                    payload_name=payload_name,
+                    message_thread_id=message_thread_id,
+                )
             return
         if isinstance(value, str) and value.startswith("file://"):
             raw_path = file_url_to_local_path(value)
